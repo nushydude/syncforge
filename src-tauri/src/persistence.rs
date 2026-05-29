@@ -19,6 +19,12 @@ pub enum PersistenceError {
 
 pub type Result<T> = std::result::Result<T, PersistenceError>;
 
+/// Maximum snapshot rows retained per folder pair (newest by `captured_at`).
+const SNAPSHOT_RETAIN_COUNT: usize = 3;
+
+/// Default cap for history list queries (newest runs first).
+const HISTORY_RUNS_LIMIT: i64 = 100;
+
 pub struct Database {
     conn: Connection,
 }
@@ -29,7 +35,11 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;",
+        )?;
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
@@ -303,7 +313,8 @@ impl Database {
 
     pub fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
         let entries_json = serde_json::to_string(&snapshot.entries)?;
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO snapshots (id, pair_id, captured_at, entries_json)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET
@@ -311,6 +322,24 @@ impl Database {
                 captured_at = excluded.captured_at,
                 entries_json = excluded.entries_json",
             params![snapshot.id, snapshot.pair_id, snapshot.captured_at, entries_json],
+        )?;
+        Self::prune_snapshots_for_pair(&tx, &snapshot.pair_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn prune_snapshots_for_pair(conn: &Connection, pair_id: &str) -> Result<()> {
+        let retain = SNAPSHOT_RETAIN_COUNT as i64;
+        conn.execute(
+            "DELETE FROM snapshots
+             WHERE pair_id = ?1
+               AND id NOT IN (
+                 SELECT id FROM snapshots
+                 WHERE pair_id = ?1
+                 ORDER BY captured_at DESC
+                 LIMIT ?2
+               )",
+            params![pair_id, retain],
         )?;
         Ok(())
     }
@@ -357,20 +386,33 @@ impl Database {
         Ok(())
     }
 
+    /// Convenience wrapper around [`Self::insert_run_items`].
+    #[allow(dead_code)]
     pub fn insert_run_item(&self, item: &RunItem) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO run_items (id, run_id, path, action, status, message, bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                item.id,
-                item.run_id,
-                item.path,
-                item.action,
-                item.status,
-                item.message,
-                item.bytes.map(|b| b as i64),
-            ],
-        )?;
+        self.insert_run_items(std::slice::from_ref(item))
+    }
+
+    pub fn insert_run_items(&self, items: &[RunItem]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for item in items {
+            tx.execute(
+                "INSERT INTO run_items (id, run_id, path, action, status, message, bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    item.id,
+                    item.run_id,
+                    item.path,
+                    item.action,
+                    item.status,
+                    item.message,
+                    item.bytes.map(|b| b as i64),
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -380,17 +422,23 @@ impl Database {
         match pair_id {
             Some(id) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT summary_json FROM runs WHERE pair_id = ?1 ORDER BY started_at DESC",
+                    "SELECT summary_json FROM runs
+                     WHERE pair_id = ?1
+                     ORDER BY started_at DESC
+                     LIMIT ?2",
                 )?;
-                let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+                let rows =
+                    stmt.query_map(params![id, HISTORY_RUNS_LIMIT], |row| row.get::<_, String>(0))?;
                 for json in rows {
                     reports.push(serde_json::from_str(&json?)?);
                 }
             }
             None => {
-                let mut stmt =
-                    self.conn.prepare("SELECT summary_json FROM runs ORDER BY started_at DESC")?;
-                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT summary_json FROM runs ORDER BY started_at DESC LIMIT ?1")?;
+                let rows =
+                    stmt.query_map(params![HISTORY_RUNS_LIMIT], |row| row.get::<_, String>(0))?;
                 for json in rows {
                     reports.push(serde_json::from_str(&json?)?);
                 }
@@ -537,6 +585,151 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = Database::open(&path).expect("open db");
         (dir, db)
+    }
+
+    fn snapshot_count_for_pair(db: &Database, pair_id: &str) -> i64 {
+        db.conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshots WHERE pair_id = ?1",
+                params![pair_id],
+                |row| row.get(0),
+            )
+            .expect("count snapshots")
+    }
+
+    #[test]
+    fn open_sets_wal_and_busy_timeout() {
+        let (_dir, db) = temp_db();
+        let journal_mode: String =
+            db.conn.query_row("PRAGMA journal_mode", [], |row| row.get(0)).expect("journal_mode");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        let busy_timeout: i64 =
+            db.conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0)).expect("busy_timeout");
+        assert_eq!(busy_timeout, 5000);
+    }
+
+    #[test]
+    fn save_snapshot_prunes_older_rows_for_pair() {
+        let (_dir, db) = temp_db();
+        let pair = FolderPair {
+            id: new_pair_id(),
+            name: "Prune".into(),
+            left_path: "/a".into(),
+            right_path: "/b".into(),
+            mode: SyncMode::Echo,
+            filters: Filters::default(),
+            conflict_policy: ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        db.save_pair(&pair).expect("save pair");
+
+        for captured_at in 1..=5_i64 {
+            db.save_snapshot(&Snapshot {
+                id: Uuid::new_v4().to_string(),
+                pair_id: pair.id.clone(),
+                captured_at,
+                entries: vec![],
+            })
+            .expect("save snapshot");
+        }
+
+        assert_eq!(snapshot_count_for_pair(&db, &pair.id), SNAPSHOT_RETAIN_COUNT as i64);
+        let latest = db.latest_snapshot(&pair.id).expect("latest").expect("snapshot");
+        assert_eq!(latest.captured_at, 5);
+    }
+
+    #[test]
+    fn two_snapshots_for_same_pair_keeps_both_under_retain_limit() {
+        let (_dir, db) = temp_db();
+        let pair = FolderPair {
+            id: new_pair_id(),
+            name: "Pair".into(),
+            left_path: "/a".into(),
+            right_path: "/b".into(),
+            mode: SyncMode::Echo,
+            filters: Filters::default(),
+            conflict_policy: ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        db.save_pair(&pair).expect("save pair");
+
+        db.save_snapshot(&Snapshot {
+            id: Uuid::new_v4().to_string(),
+            pair_id: pair.id.clone(),
+            captured_at: 1,
+            entries: vec![],
+        })
+        .expect("first snapshot");
+        db.save_snapshot(&Snapshot {
+            id: Uuid::new_v4().to_string(),
+            pair_id: pair.id.clone(),
+            captured_at: 2,
+            entries: vec![],
+        })
+        .expect("second snapshot");
+
+        assert_eq!(snapshot_count_for_pair(&db, &pair.id), 2);
+        let latest = db.latest_snapshot(&pair.id).expect("latest").expect("snapshot");
+        assert_eq!(latest.captured_at, 2);
+    }
+
+    #[test]
+    fn insert_run_items_batches_in_one_transaction() {
+        let (_dir, db) = temp_db();
+        let pair_id = new_pair_id();
+        db.save_pair(&FolderPair {
+            id: pair_id.clone(),
+            name: "Batch".into(),
+            left_path: "/a".into(),
+            right_path: "/b".into(),
+            mode: SyncMode::Echo,
+            filters: Filters::default(),
+            conflict_policy: ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 2,
+        })
+        .expect("save pair");
+        let run_id = Uuid::new_v4().to_string();
+        db.save_run(&RunReport {
+            run_id: run_id.clone(),
+            pair_id,
+            started_at: 1,
+            finished_at: None,
+            status: RunStatus::Running,
+            files_copied: 0,
+            files_deleted: 0,
+            bytes_transferred: 0,
+            errors: vec![],
+        })
+        .expect("save run");
+        let items: Vec<RunItem> = (0..3)
+            .map(|i| RunItem {
+                id: Uuid::new_v4().to_string(),
+                run_id: run_id.clone(),
+                path: format!("file{i}.txt"),
+                action: "copyLeftToRight".into(),
+                status: "completed".into(),
+                message: None,
+                bytes: Some(i as u64),
+            })
+            .collect();
+        db.insert_run_items(&items).expect("insert batch");
+        let loaded = db.list_run_items(&run_id).expect("list");
+        assert_eq!(loaded.len(), 3);
     }
 
     #[test]
