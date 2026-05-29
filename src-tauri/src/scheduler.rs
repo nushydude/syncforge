@@ -122,6 +122,7 @@ fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: String, pai
                 verify_hashes: false,
                 use_recycle_bin: true,
                 conflict_resolutions: Default::default(),
+                stop_on_error: true,
             };
 
             let report = run_pair_impl(
