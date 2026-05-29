@@ -8,18 +8,8 @@ use crate::diff::{build_sync_plan, DiffOptions};
 use crate::models::{FolderPair, SyncPlan};
 use crate::path_normalization;
 use crate::persistence::Database;
-use crate::scanner::scan_directory;
+use crate::scanner::{assert_destructive_scan_allowed, scan_directory, ScanIntegrity};
 use crate::state::AppState;
-
-fn scan_warnings_for_side(label: &str, skipped: u32) -> Option<String> {
-    if skipped == 0 {
-        None
-    } else {
-        Some(format!(
-            "{label}: skipped {skipped} path(s) (permission denied or unreadable)"
-        ))
-    }
-}
 
 /// Core preview logic shared by the Tauri command and integration tests.
 ///
@@ -38,13 +28,9 @@ pub(crate) fn preview_pair_impl(db: &Database, pair: &FolderPair) -> Result<Sync
     let right_scan = scan_directory(Path::new(&right_path), &pair.filters)
         .map_err(|e| format!("scan right failed: {e}"))?;
 
-    let mut scan_warnings = Vec::new();
-    if let Some(w) = scan_warnings_for_side("left", left_scan.skipped_entries) {
-        scan_warnings.push(w);
-    }
-    if let Some(w) = scan_warnings_for_side("right", right_scan.skipped_entries) {
-        scan_warnings.push(w);
-    }
+    assert_destructive_scan_allowed(pair.mode, &left_scan, &right_scan)?;
+
+    let scan = ScanIntegrity::from_sides(&left_scan, &right_scan);
 
     let snapshot = db.latest_snapshot(&pair.id).map_err(|e| e.to_string())?;
     let snapshot_entries = snapshot.as_ref().map(|s| s.entries.as_slice());
@@ -56,7 +42,7 @@ pub(crate) fn preview_pair_impl(db: &Database, pair: &FolderPair) -> Result<Sync
         &left_scan.entries,
         &right_scan.entries,
         snapshot_entries,
-        scan_warnings,
+        scan,
         DiffOptions {
             left_root: Some(Path::new(&left_path).to_path_buf()),
             right_root: Some(Path::new(&right_path).to_path_buf()),
@@ -73,9 +59,7 @@ pub fn preview_pair(pair: FolderPair, state: State<'_, Arc<AppState>>) -> Result
 
 #[cfg(test)]
 mod tests {
-    use crate::models::{
-        ConflictPolicy, FileEntry, Filters, FolderPair, Snapshot, SyncMode,
-    };
+    use crate::models::{ConflictPolicy, FileEntry, Filters, FolderPair, Snapshot, SyncMode};
     use crate::persistence::{new_pair_id, Database};
     use std::fs;
     use tempfile::TempDir;
@@ -273,10 +257,7 @@ mod tests {
         save_echo_pair(&db, &id, &left_dir, &right_dir);
 
         let mut draft = db.get_pair(&id).expect("get").expect("pair");
-        draft.filters = Filters {
-            include: vec![],
-            exclude: vec!["*.tmp".into()],
-        };
+        draft.filters = Filters { include: vec![], exclude: vec!["*.tmp".into()] };
 
         let plan = super::preview_pair_impl(&db, &draft).expect("preview");
         assert!(plan.actions.iter().any(|a| {
@@ -294,11 +275,9 @@ mod tests {
             )
         }));
 
-        let persisted = super::preview_pair_impl(
-            &db,
-            &db.get_pair(&id).expect("get").expect("pair"),
-        )
-        .expect("preview");
+        let persisted =
+            super::preview_pair_impl(&db, &db.get_pair(&id).expect("get").expect("pair"))
+                .expect("preview");
         assert!(persisted.actions.iter().any(|a| {
             matches!(
                 a,
@@ -308,4 +287,32 @@ mod tests {
         }));
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn preview_echo_refuses_when_scan_skips_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = TempDir::new().expect("tempdir");
+        let db = Database::open(&data_dir.path().join("test.db")).expect("db");
+
+        let left_dir = data_dir.path().join("left");
+        let right_dir = data_dir.path().join("right");
+        fs::create_dir_all(&left_dir).expect("mkdir left");
+        fs::create_dir_all(&right_dir).expect("mkdir right");
+        fs::write(left_dir.join("visible.txt"), "ok").expect("write");
+        let secret = left_dir.join("secret.txt");
+        fs::write(&secret, "hidden").expect("write");
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).expect("chmod");
+        fs::write(right_dir.join("orphan.txt"), "gone").expect("write");
+
+        let id = new_pair_id();
+        save_echo_pair(&db, &id, &left_dir, &right_dir);
+        let pair = db.get_pair(&id).expect("get").expect("pair");
+
+        let err = super::preview_pair_impl(&db, &pair).expect_err("preview must fail");
+        assert!(err.contains("Cannot run Echo sync"));
+        assert!(err.contains("skipped"));
+
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("restore");
+    }
 }

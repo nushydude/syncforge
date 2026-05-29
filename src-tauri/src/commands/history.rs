@@ -35,8 +35,6 @@ pub fn get_run_detail(
     let Some(report) = db.get_run(&run_id).map_err(|e| e.to_string())? else {
         return Ok(None);
     };
-    let items = db
-        .list_run_items(&run_id)
-        .map_err(|e| e.to_string())?;
+    let items = db.list_run_items(&run_id).map_err(|e| e.to_string())?;
     Ok(Some(RunDetail { report, items }))
 }
