@@ -1,3 +1,4 @@
+import { ConflictDialog } from "../conflicts/ConflictDialog";
 import { PreviewTable } from "../preview/PreviewTable";
 import { RunProgress } from "../run/RunProgress";
 import { usePairsStore } from "../../hooks/usePairsStore";
@@ -10,7 +11,13 @@ import {
   saveEditing,
   updateEditing,
 } from "../../store/pairsStore";
-import { runSelectedPair } from "../../store/runStore";
+import {
+  cancelConflictResolution,
+  confirmConflictResolutionAndRun,
+  runSelectedPair,
+  setConflictResolution,
+} from "../../store/runStore";
+import { ConflictPolicySelector } from "./ConflictPolicySelector";
 import { FilterEditor } from "./FilterEditor";
 import { ModeSelector } from "./ModeSelector";
 
@@ -25,7 +32,11 @@ export function PairEditor() {
     previewLoading,
     previewError,
   } = usePairsStore();
-  const { running: runInProgress } = useSyncProgress();
+  const {
+    running: runInProgress,
+    pendingConflicts,
+    conflictResolutions,
+  } = useSyncProgress();
 
   if (!editing) {
     return null;
@@ -116,6 +127,12 @@ export function PairEditor() {
         disabled={saving}
       />
 
+      <ConflictPolicySelector
+        value={editing.conflictPolicy}
+        onChange={(conflictPolicy) => updateEditing({ conflictPolicy })}
+        disabled={saving}
+      />
+
       <FilterEditor
         filters={editing.filters}
         onChange={(filters) => updateEditing({ filters })}
@@ -194,6 +211,16 @@ export function PairEditor() {
       </div>
       {!isNew && selectedId && (
         <p className="pair-id-hint">Pair ID: {selectedId}</p>
+      )}
+
+      {pendingConflicts && pendingConflicts.pair.id === editing.id && (
+        <ConflictDialog
+          conflicts={pendingConflicts.conflicts}
+          resolutions={conflictResolutions}
+          onChoose={setConflictResolution}
+          onConfirm={() => void confirmConflictResolutionAndRun()}
+          onCancel={cancelConflictResolution}
+        />
       )}
     </form>
   );

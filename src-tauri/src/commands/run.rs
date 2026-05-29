@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -5,7 +6,7 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::engine::{run_pair_impl, RunOptions};
-use crate::models::{FolderPair, RunReport};
+use crate::models::{ConflictResolution, FolderPair, RunReport};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -15,6 +16,8 @@ pub struct RunPairOptions {
     pub verify_hashes: bool,
     #[serde(default = "default_recycle_bin")]
     pub use_recycle_bin: bool,
+    #[serde(default)]
+    pub conflict_resolutions: HashMap<String, ConflictResolution>,
 }
 
 fn default_recycle_bin() -> bool {
@@ -40,6 +43,7 @@ pub async fn run_pair(
     let run_options = RunOptions {
         verify_hashes: options.verify_hashes,
         use_recycle_bin: options.use_recycle_bin,
+        conflict_resolutions: options.conflict_resolutions,
     };
 
     let db = Arc::clone(&state.db);

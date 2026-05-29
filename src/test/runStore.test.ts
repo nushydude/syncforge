@@ -1,14 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import * as previewApi from '../api/preview';
 import * as runApi from '../api/run';
 import type { FolderPair, RunReport } from '../types';
 import {
+  confirmConflictResolutionAndRun,
   getRunState,
   resetRunStoreForTests,
   runSelectedPair,
+  setConflictResolution,
 } from '../store/runStore';
 
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
+}));
+
+vi.mock('../api/preview', () => ({
+  previewPair: vi.fn(),
 }));
 
 vi.mock('../api/run', () => ({
@@ -66,5 +73,83 @@ describe('runStore', () => {
     const report = await runSelectedPair({ ...samplePair, id: '' });
     expect(report).toBeNull();
     expect(runApi.runPair).not.toHaveBeenCalled();
+  });
+
+  it('opens conflict dialog when ask policy finds conflicts', async () => {
+    vi.mocked(previewApi.previewPair).mockResolvedValue({
+      pairId: 'pair-1',
+      scannedLeft: 1,
+      scannedRight: 1,
+      actions: [
+        {
+          kind: 'conflict',
+          path: 'both.txt',
+          left: {
+            relativePath: 'both.txt',
+            size: 1,
+            modifiedSecs: 1,
+            isDir: false,
+          },
+          right: {
+            relativePath: 'both.txt',
+            size: 2,
+            modifiedSecs: 2,
+            isDir: false,
+          },
+        },
+      ],
+    });
+
+    const report = await runSelectedPair({
+      ...samplePair,
+      mode: 'synchronize',
+      conflictPolicy: 'ask',
+    });
+    expect(report).toBeNull();
+    expect(runApi.runPair).not.toHaveBeenCalled();
+    expect(getRunState().pendingConflicts?.conflicts).toHaveLength(1);
+  });
+
+  it('runs with user conflict resolutions after confirm', async () => {
+    vi.mocked(previewApi.previewPair).mockResolvedValue({
+      pairId: 'pair-1',
+      scannedLeft: 1,
+      scannedRight: 1,
+      actions: [
+        {
+          kind: 'conflict',
+          path: 'both.txt',
+          left: {
+            relativePath: 'both.txt',
+            size: 1,
+            modifiedSecs: 1,
+            isDir: false,
+          },
+          right: {
+            relativePath: 'both.txt',
+            size: 2,
+            modifiedSecs: 2,
+            isDir: false,
+          },
+        },
+      ],
+    });
+    vi.mocked(runApi.runPair).mockResolvedValue(sampleReport);
+
+    await runSelectedPair({
+      ...samplePair,
+      mode: 'synchronize',
+      conflictPolicy: 'ask',
+    });
+    setConflictResolution('both.txt', 'left');
+    const report = await confirmConflictResolutionAndRun();
+
+    expect(report).toEqual(sampleReport);
+    expect(runApi.runPair).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'pair-1' }),
+      expect.objectContaining({
+        conflictResolutions: { 'both.txt': 'left' },
+      }),
+    );
   });
 });

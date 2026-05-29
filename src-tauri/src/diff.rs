@@ -1,6 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 
-use crate::models::{ConflictPolicy, FileEntry, SyncAction, SyncMode, SyncPlan};
+use crate::models::{
+    ConflictPolicy, ConflictResolution, FileEntry, SyncAction, SyncMode, SyncPlan,
+};
 
 pub fn build_sync_plan(
     pair_id: &str,
@@ -137,9 +139,14 @@ fn plan_synchronize(
             });
         }
         (Some(l), None) if !l.is_dir => {
-            actions.push(SyncAction::CopyLeftToRight {
-                path: path.to_string(),
-            });
+            plan_one_sided_file(
+                actions,
+                path,
+                l,
+                true,
+                snapshot,
+                conflict_policy,
+            );
         }
         (None, Some(r)) if r.is_dir => {
             actions.push(SyncAction::CreateDirLeft {
@@ -147,9 +154,14 @@ fn plan_synchronize(
             });
         }
         (None, Some(r)) if !r.is_dir => {
-            actions.push(SyncAction::CopyRightToLeft {
-                path: path.to_string(),
-            });
+            plan_one_sided_file(
+                actions,
+                path,
+                r,
+                false,
+                snapshot,
+                conflict_policy,
+            );
         }
         (Some(l), Some(r)) if l.is_dir && r.is_dir => {}
         (Some(l), Some(r)) if !l.is_dir && !r.is_dir => {
@@ -176,6 +188,53 @@ fn plan_synchronize(
         }
         _ => {}
     }
+}
+
+/// File exists on one side only. Uses snapshot to tell new file vs delete vs modify+delete conflict.
+fn plan_one_sided_file(
+    actions: &mut Vec<SyncAction>,
+    path: &str,
+    present: &FileEntry,
+    present_is_left: bool,
+    snapshot: Option<&FileEntry>,
+    conflict_policy: ConflictPolicy,
+) {
+    match snapshot {
+        None => {
+            if present_is_left {
+                actions.push(SyncAction::CopyLeftToRight {
+                    path: path.to_string(),
+                });
+            } else {
+                actions.push(SyncAction::CopyRightToLeft {
+                    path: path.to_string(),
+                });
+            }
+        }
+        Some(snap) if entries_match(snap, present) => {
+            if present_is_left {
+                actions.push(SyncAction::DeleteRight {
+                    path: path.to_string(),
+                });
+            } else {
+                actions.push(SyncAction::DeleteLeft {
+                    path: path.to_string(),
+                });
+            }
+        }
+        Some(snap) => {
+            let (left, right) = if present_is_left {
+                (present.clone(), snap.clone())
+            } else {
+                (snap.clone(), present.clone())
+            };
+            apply_conflict_policy(actions, path, &left, &right, conflict_policy);
+        }
+    }
+}
+
+fn entries_match(a: &FileEntry, b: &FileEntry) -> bool {
+    !entries_differ(a, b)
 }
 
 fn snapshot_changed_both(
@@ -354,6 +413,43 @@ fn entries_differ(a: &FileEntry, b: &FileEntry) -> bool {
     a.is_dir != b.is_dir || a.size != b.size || a.modified_secs != b.modified_secs
 }
 
+pub fn resolve_conflict_action(
+    resolution: ConflictResolution,
+    path: &str,
+    _left: &FileEntry,
+    _right: &FileEntry,
+) -> SyncAction {
+    match resolution {
+        ConflictResolution::Left => SyncAction::CopyLeftToRight {
+            path: path.to_string(),
+        },
+        ConflictResolution::Right => SyncAction::CopyRightToLeft {
+            path: path.to_string(),
+        },
+        ConflictResolution::KeepBoth => SyncAction::Skip {
+            path: path.to_string(),
+            reason: "keep both (user choice)".into(),
+        },
+        ConflictResolution::Skip => SyncAction::Skip {
+            path: path.to_string(),
+            reason: "skipped by user".into(),
+        },
+    }
+}
+
+pub fn apply_conflict_resolutions(
+    actions: &mut [SyncAction],
+    resolutions: &std::collections::HashMap<String, ConflictResolution>,
+) {
+    for action in actions.iter_mut() {
+        if let SyncAction::Conflict { path, left, right } = action {
+            if let Some(resolution) = resolutions.get(path) {
+                *action = resolve_conflict_action(*resolution, path, left, right);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +519,12 @@ mod tests {
         plan.actions
             .iter()
             .any(|a| matches!(a, SyncAction::Conflict { path: p, .. } if p == path))
+    }
+
+    fn has_delete_left(plan: &SyncPlan, path: &str) -> bool {
+        plan.actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::DeleteLeft { path: p } if p == path))
     }
 
     fn plan(
@@ -604,6 +706,100 @@ mod tests {
         );
         assert!(paths(&plan).contains(&"sub"));
         assert!(has_copy_ltr(&plan, "sub/nested.txt"));
+    }
+
+    #[test]
+    fn synchronize_snapshot_delete_on_right_when_left_unchanged() {
+        let snap = file("gone.txt", 1, 1);
+        let plan = plan(
+            SyncMode::Synchronize,
+            ConflictPolicy::NewerWins,
+            &[file("gone.txt", 1, 1)],
+            &[],
+            Some(&[snap]),
+        );
+        assert!(has_delete_right(&plan, "gone.txt"));
+        assert!(!has_copy_ltr(&plan, "gone.txt"));
+    }
+
+    #[test]
+    fn synchronize_snapshot_delete_on_left_when_right_unchanged() {
+        let snap = file("gone.txt", 1, 1);
+        let plan = plan(
+            SyncMode::Synchronize,
+            ConflictPolicy::NewerWins,
+            &[],
+            &[file("gone.txt", 1, 1)],
+            Some(&[snap]),
+        );
+        assert!(has_delete_left(&plan, "gone.txt"));
+    }
+
+    #[test]
+    fn synchronize_without_snapshot_treats_one_sided_as_new_file() {
+        let plan = plan(
+            SyncMode::Synchronize,
+            ConflictPolicy::NewerWins,
+            &[file("new.txt", 1, 1)],
+            &[],
+            None,
+        );
+        assert!(has_copy_ltr(&plan, "new.txt"));
+        assert!(!has_delete_right(&plan, "new.txt"));
+    }
+
+    #[test]
+    fn synchronize_one_sided_modify_and_delete_reports_conflict_when_ask() {
+        let snap = file("doc.txt", 1, 1);
+        let plan = plan(
+            SyncMode::Synchronize,
+            ConflictPolicy::Ask,
+            &[file("doc.txt", 9, 9)],
+            &[],
+            Some(&[snap]),
+        );
+        assert!(has_conflict(&plan, "doc.txt"));
+    }
+
+    #[test]
+    fn synchronize_keep_both_policy_skips_true_conflict() {
+        let snap = file("both.txt", 1, 1);
+        let plan = plan(
+            SyncMode::Synchronize,
+            ConflictPolicy::KeepBoth,
+            &[file("both.txt", 10, 100)],
+            &[file("both.txt", 20, 200)],
+            Some(&[snap]),
+        );
+        assert!(plan.actions.iter().any(|a| {
+            matches!(
+                a,
+                SyncAction::Skip { path, reason }
+                    if path == "both.txt" && reason.contains("keep both")
+            )
+        }));
+    }
+
+    #[test]
+    fn apply_conflict_resolutions_replaces_conflict_actions() {
+        use super::apply_conflict_resolutions;
+        use crate::models::ConflictResolution;
+        use std::collections::HashMap;
+
+        let left = file("x.txt", 1, 1);
+        let right = file("x.txt", 2, 2);
+        let mut actions = vec![SyncAction::Conflict {
+            path: "x.txt".into(),
+            left: left.clone(),
+            right: right.clone(),
+        }];
+        let mut resolutions = HashMap::new();
+        resolutions.insert("x.txt".into(), ConflictResolution::Right);
+        apply_conflict_resolutions(&mut actions, &resolutions);
+        assert!(matches!(
+            actions[0],
+            SyncAction::CopyRightToLeft { ref path } if path == "x.txt"
+        ));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,10 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
-use crate::diff::build_sync_plan;
+use crate::diff::{apply_conflict_resolutions, build_sync_plan};
 use crate::hashing;
 use crate::models::{
-    FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot, SyncAction,
+    ConflictResolution, FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot,
+    SyncAction,
 };
 use crate::path_normalization;
 use crate::persistence::Database;
@@ -22,6 +24,7 @@ const TEMP_SUFFIX: &str = ".syncforge.tmp";
 pub struct RunOptions {
     pub verify_hashes: bool,
     pub use_recycle_bin: bool,
+    pub conflict_resolutions: HashMap<String, ConflictResolution>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -270,7 +273,7 @@ where
         ));
     }
 
-    let plan = build_sync_plan(
+    let mut plan = build_sync_plan(
         &pair.id,
         pair.mode,
         pair.conflict_policy,
@@ -279,6 +282,10 @@ where
         snapshot_entries,
         scan_warnings,
     );
+
+    if !options.conflict_resolutions.is_empty() {
+        apply_conflict_resolutions(&mut plan.actions, &options.conflict_resolutions);
+    }
 
     let executable: Vec<&SyncAction> = plan
         .actions
@@ -688,6 +695,7 @@ mod tests {
             RunOptions {
                 verify_hashes: true,
                 use_recycle_bin: false,
+                conflict_resolutions: HashMap::new(),
             },
             &cancel,
             |p| events.push(p.phase.clone()),
@@ -746,6 +754,7 @@ mod tests {
             RunOptions {
                 verify_hashes: false,
                 use_recycle_bin: false,
+                conflict_resolutions: HashMap::new(),
             },
             &cancel,
             |p| {
@@ -798,6 +807,7 @@ mod tests {
             RunOptions {
                 verify_hashes: false,
                 use_recycle_bin: false,
+                conflict_resolutions: HashMap::new(),
             },
             &cancel,
             |_| {},
