@@ -12,6 +12,7 @@ use crate::diff::{apply_conflict_resolutions, build_sync_plan, DiffOptions};
 use crate::hashing;
 use crate::models::{
     ConflictResolution, FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot, SyncAction,
+    SyncPlan,
 };
 use crate::path_normalization;
 use crate::persistence::Database;
@@ -30,6 +31,8 @@ pub struct RunOptions {
     pub content_hash_compare: bool,
     /// Maximum file size (bytes) eligible for content hashing during planning.
     pub content_hash_max_bytes: u64,
+    /// Precomputed plan from preview; skips the initial left/right directory scan when set.
+    pub plan: Option<SyncPlan>,
 }
 
 impl Default for RunOptions {
@@ -41,6 +44,7 @@ impl Default for RunOptions {
             stop_on_error: true,
             content_hash_compare: true,
             content_hash_max_bytes: 50 * 1024 * 1024,
+            plan: None,
         }
     }
 }
@@ -274,6 +278,16 @@ fn run_pair_impl_inner<F>(
 where
     F: FnMut(SyncProgress),
 {
+    let RunOptions {
+        verify_hashes,
+        use_recycle_bin,
+        conflict_resolutions,
+        stop_on_error,
+        content_hash_compare,
+        content_hash_max_bytes,
+        plan: provided_plan,
+    } = options;
+
     let mut progress =
         |phase: &str, current: u32, total: u32, path: Option<&str>, message: Option<&str>| {
             emit(SyncProgress {
@@ -294,36 +308,43 @@ where
         return finish_cancelled(db, pair, left_root, right_root, report, emit);
     }
 
-    let left_scan =
-        scan_directory(left_root, &pair.filters).map_err(|e| format!("scan left failed: {e}"))?;
-    let right_scan =
-        scan_directory(right_root, &pair.filters).map_err(|e| format!("scan right failed: {e}"))?;
+    let mut plan = if let Some(plan) = provided_plan {
+        if plan.pair_id != pair.id {
+            return Err("plan pair id does not match run pair".into());
+        }
+        plan
+    } else {
+        let left_scan =
+            scan_directory(left_root, &pair.filters).map_err(|e| format!("scan left failed: {e}"))?;
+        let right_scan = scan_directory(right_root, &pair.filters)
+            .map_err(|e| format!("scan right failed: {e}"))?;
 
-    assert_destructive_scan_allowed(pair.mode, &left_scan, &right_scan)?;
+        assert_destructive_scan_allowed(pair.mode, &left_scan, &right_scan)?;
 
-    let snapshot = with_db(db, |db| db.latest_snapshot(&pair.id).map_err(|e| e.to_string()))?;
-    let snapshot_entries = snapshot.as_ref().map(|s| s.entries.as_slice());
+        let snapshot = with_db(db, |db| db.latest_snapshot(&pair.id).map_err(|e| e.to_string()))?;
+        let snapshot_entries = snapshot.as_ref().map(|s| s.entries.as_slice());
 
-    let scan = ScanIntegrity::from_sides(&left_scan, &right_scan);
+        let scan = ScanIntegrity::from_sides(&left_scan, &right_scan);
 
-    let mut plan = build_sync_plan(
-        &pair.id,
-        pair.mode,
-        pair.conflict_policy,
-        &left_scan.entries,
-        &right_scan.entries,
-        snapshot_entries,
-        scan,
-        DiffOptions {
-            left_root: Some(left_root.to_path_buf()),
-            right_root: Some(right_root.to_path_buf()),
-            content_hash_compare: options.content_hash_compare,
-            content_hash_max_bytes: options.content_hash_max_bytes,
-        },
-    );
+        build_sync_plan(
+            &pair.id,
+            pair.mode,
+            pair.conflict_policy,
+            &left_scan.entries,
+            &right_scan.entries,
+            snapshot_entries,
+            scan,
+            DiffOptions {
+                left_root: Some(left_root.to_path_buf()),
+                right_root: Some(right_root.to_path_buf()),
+                content_hash_compare,
+                content_hash_max_bytes,
+            },
+        )
+    };
 
-    if !options.conflict_resolutions.is_empty() {
-        apply_conflict_resolutions(&mut plan.actions, &options.conflict_resolutions);
+    if !conflict_resolutions.is_empty() {
+        apply_conflict_resolutions(&mut plan.actions, &conflict_resolutions);
     }
 
     let executable: Vec<&SyncAction> =
@@ -348,8 +369,8 @@ where
             action,
             left_root,
             right_root,
-            options.verify_hashes,
-            options.use_recycle_bin,
+            verify_hashes,
+            use_recycle_bin,
         );
 
         match result {
@@ -382,7 +403,7 @@ where
                     bytes: None,
                 };
                 with_db(db, |db| db.insert_run_item(&run_item).map_err(|e| e.to_string()))?;
-                if !is_conflict && options.stop_on_error {
+                if !is_conflict && stop_on_error {
                     stopped_on_error = true;
                     break;
                 }
@@ -655,6 +676,80 @@ mod tests {
         let merged = build_snapshot_entries(&left, &right);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].size, 2);
+    }
+
+    #[test]
+    fn run_pair_impl_skips_initial_scan_when_plan_provided() {
+        use crate::commands::preview::preview_pair_impl;
+        use crate::scanner::with_scan_counting;
+
+        let data_dir = TempDir::new().expect("tempdir");
+        let db = Mutex::new(
+            crate::persistence::Database::open(&data_dir.path().join("test.db")).expect("db"),
+        );
+
+        let left_dir = data_dir.path().join("left");
+        let right_dir = data_dir.path().join("right");
+        fs::create_dir_all(&left_dir).expect("mkdir");
+        fs::create_dir_all(&right_dir).expect("mkdir");
+        fs::write(left_dir.join("only.txt"), "data").expect("write");
+
+        let pair = crate::models::FolderPair {
+            id: crate::persistence::new_pair_id(),
+            name: "PlanReuse".into(),
+            left_path: left_dir.to_string_lossy().into_owned(),
+            right_path: right_dir.to_string_lossy().into_owned(),
+            mode: crate::models::SyncMode::Echo,
+            filters: crate::models::Filters::default(),
+            conflict_policy: crate::models::ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        db.lock().expect("lock").save_pair(&pair).expect("save pair");
+
+        let cancel = AtomicBool::new(false);
+
+        let (plan, preview_scans) =
+            with_scan_counting(|| preview_pair_impl(&pair, None).expect("preview"));
+        assert_eq!(preview_scans, 2, "preview should scan left and right once each");
+
+        let (_, run_scans) = with_scan_counting(|| {
+            run_pair_impl(
+                &db,
+                &pair,
+                RunOptions {
+                    plan: Some(plan),
+                    use_recycle_bin: false,
+                    ..Default::default()
+                },
+                &cancel,
+                |_| {},
+            )
+            .expect("run with plan")
+        });
+        assert_eq!(
+            run_scans, 2,
+            "run with provided plan should only post-run scan left and right"
+        );
+
+        let (_, full_run_scans) = with_scan_counting(|| {
+            run_pair_impl(
+                &db,
+                &pair,
+                RunOptions { use_recycle_bin: false, ..Default::default() },
+                &cancel,
+                |_| {},
+            )
+            .expect("run without plan")
+        });
+        assert_eq!(
+            full_run_scans, 4,
+            "manual run without plan should pre-scan and post-scan both sides"
+        );
     }
 
     #[test]

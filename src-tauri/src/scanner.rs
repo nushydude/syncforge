@@ -117,8 +117,52 @@ impl ScanIntegrity {
     }
 }
 
+#[cfg(test)]
+mod scan_test_hooks {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    thread_local! {
+        static COUNT_SCANS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    static SCAN_INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn record_scan_invocation() {
+        if COUNT_SCANS.with(|c| c.get()) {
+            SCAN_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn scan_invocation_count() -> usize {
+        SCAN_INVOCATIONS.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_scan_invocations() {
+        SCAN_INVOCATIONS.store(0, Ordering::Relaxed);
+    }
+
+    /// Runs `f` on the current thread while counting [`super::scan_directory`] calls.
+    pub fn with_scan_counting<F, R>(f: F) -> (R, usize)
+    where
+        F: FnOnce() -> R,
+    {
+        reset_scan_invocations();
+        COUNT_SCANS.with(|c| c.set(true));
+        let result = f();
+        COUNT_SCANS.with(|c| c.set(false));
+        (result, scan_invocation_count())
+    }
+}
+
+#[cfg(test)]
+pub use scan_test_hooks::with_scan_counting;
+
 /// Scans `root` in parallel and returns filtered entries keyed by relative path.
 pub fn scan_directory(root: &Path, filters: &Filters) -> ScanResult {
+    #[cfg(test)]
+    scan_test_hooks::record_scan_invocation();
+
     let root = root.canonicalize().map_err(|_| ScanError::NotFound(root.display().to_string()))?;
 
     if !root.is_dir() {
