@@ -6,6 +6,7 @@ mod models;
 mod notifications;
 mod path_normalization;
 mod persistence;
+mod run_coordinator;
 mod scanner;
 mod scheduler;
 mod state;

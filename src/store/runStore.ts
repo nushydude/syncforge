@@ -18,6 +18,7 @@ export interface PendingConflicts {
 
 export interface RunStoreState {
   running: boolean;
+  runningPairId: string | null;
   progress: SyncProgress | null;
   lastReport: RunReport | null;
   error: string | null;
@@ -30,6 +31,7 @@ type Listener = () => void;
 
 let state: RunStoreState = {
   running: false,
+  runningPairId: null,
   progress: null,
   lastReport: null,
   error: null,
@@ -97,6 +99,7 @@ async function executeRun(
   state = {
     ...state,
     running: true,
+    runningPairId: pair.id,
     progress: null,
     lastReport: null,
     error: null,
@@ -115,6 +118,7 @@ async function executeRun(
     state = {
       ...state,
       running: false,
+      runningPairId: null,
       lastReport: report,
       progress: state.progress
         ? { ...state.progress, report, phase: report.status }
@@ -126,6 +130,7 @@ async function executeRun(
     state = {
       ...state,
       running: false,
+      runningPairId: null,
       error: e instanceof Error ? e.message : String(e),
     };
     emit();
@@ -194,11 +199,11 @@ export async function confirmConflictResolutionAndRun(): Promise<RunReport | nul
 }
 
 export async function cancelActiveRun(): Promise<void> {
-  if (!state.running) {
+  if (!state.running || !state.runningPairId) {
     return;
   }
   try {
-    await runApi.cancelRun();
+    await runApi.cancelRun(state.runningPairId);
   } catch (e) {
     state = {
       ...state,
@@ -214,6 +219,7 @@ export function resetRunStoreForTests(): void {
   unlistenWatchSkipped = null;
   state = {
     running: false,
+    runningPairId: null,
     progress: null,
     lastReport: null,
     error: null,
