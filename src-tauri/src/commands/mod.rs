@@ -2,6 +2,7 @@ pub mod dialog;
 pub mod pairs;
 pub mod preview;
 pub mod run;
+pub mod schedule;
 
 #[tauri::command]
 pub fn greet(name: &str) -> String {

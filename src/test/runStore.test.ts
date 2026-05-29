@@ -48,6 +48,8 @@ const samplePair: FolderPair = {
   conflictPolicy: 'newerWins',
   enabled: true,
   watchEnabled: false,
+  scheduleEnabled: false,
+  scheduleCron: null,
   createdAt: 1,
   updatedAt: 2,
 };

@@ -13,6 +13,18 @@ export function deletePair(id: string): Promise<void> {
   return invoke("delete_pair", { id });
 }
 
+export function setSchedule(
+  pairId: string,
+  enabled: boolean,
+  cron: string | null,
+): Promise<FolderPair> {
+  return invoke<FolderPair>("set_schedule", {
+    pairId,
+    enabled,
+    cron,
+  });
+}
+
 export function pickFolder(): Promise<string | null> {
   return invoke<string | null>("pick_folder");
 }

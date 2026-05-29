@@ -24,6 +24,8 @@ export interface FolderPair {
   conflictPolicy: ConflictPolicy;
   enabled: boolean;
   watchEnabled: boolean;
+  scheduleEnabled: boolean;
+  scheduleCron?: string | null;
   createdAt: number;
   updatedAt: number;
 }

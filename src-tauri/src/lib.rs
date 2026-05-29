@@ -3,9 +3,11 @@ mod diff;
 mod engine;
 mod hashing;
 mod models;
+mod notifications;
 mod path_normalization;
 mod persistence;
 mod scanner;
+mod scheduler;
 mod state;
 mod watcher;
 
@@ -18,6 +20,7 @@ use tauri::{
     Manager, Window, WindowEvent,
 };
 use watcher::refresh_watch_service;
+use scheduler::refresh_schedule_service;
 
 /// When the user minimizes the window, hide it and leave the app in the tray.
 fn minimize_to_tray(window: &Window) {
@@ -32,6 +35,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -84,6 +89,13 @@ pub fn run() {
                 .build(app)?;
 
             refresh_watch_service(app.handle(), &app_state)?;
+            refresh_schedule_service(app.handle(), &app_state)?;
+
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let _ = app.handle().autolaunch().enable();
+            }
 
             Ok(())
         })
@@ -113,6 +125,7 @@ pub fn run() {
             commands::preview::preview_pair,
             commands::run::run_pair,
             commands::run::cancel_run,
+            commands::schedule::set_schedule,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

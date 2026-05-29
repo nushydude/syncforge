@@ -17,6 +17,7 @@ vi.mock("../api/pairs", () => ({
   listPairs: vi.fn(),
   savePair: vi.fn(),
   deletePair: vi.fn(),
+  setSchedule: vi.fn(),
   pickFolder: vi.fn(),
   pathExists: vi.fn(),
   pathsEqual: vi.fn(),
@@ -36,6 +37,8 @@ const samplePair: FolderPair = {
   conflictPolicy: "newerWins",
   enabled: true,
   watchEnabled: false,
+  scheduleEnabled: false,
+  scheduleCron: null,
   createdAt: 1,
   updatedAt: 2,
 };
@@ -119,6 +122,12 @@ describe("pairsStore", () => {
       name: "Backup",
       watchEnabled: true,
     });
+    vi.mocked(pairsApi.setSchedule).mockResolvedValue({
+      ...samplePair,
+      id: "new-id",
+      name: "Backup",
+      watchEnabled: true,
+    });
 
     const ok = await saveEditing();
     expect(ok).toBe(true);
@@ -135,6 +144,11 @@ describe("pairsStore", () => {
     vi.mocked(pairsApi.pathExists).mockResolvedValue(true);
     vi.mocked(pairsApi.pathsEqual).mockResolvedValue(false);
     vi.mocked(pairsApi.savePair).mockResolvedValue({
+      ...samplePair,
+      id: "new-id",
+      name: "Backup",
+    });
+    vi.mocked(pairsApi.setSchedule).mockResolvedValue({
       ...samplePair,
       id: "new-id",
       name: "Backup",
