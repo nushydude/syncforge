@@ -1,3 +1,4 @@
+import type { ConflictChoice } from './pair';
 import type { RunReport } from './history';
 
 export type SyncProgressPhase =
@@ -21,4 +22,5 @@ export interface SyncProgress {
 export interface RunPairOptions {
   verifyHashes?: boolean;
   useRecycleBin?: boolean;
+  conflictResolutions?: Record<string, ConflictChoice>;
 }

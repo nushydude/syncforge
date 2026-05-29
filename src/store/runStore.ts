@@ -1,13 +1,27 @@
 import { listen } from '@tauri-apps/api/event';
+import * as previewApi from '../api/preview';
 import * as runApi from '../api/run';
-import type { FolderPair, RunReport, SyncProgress } from '../types';
+import { listConflictActions, type ConflictAction } from '../lib/conflictPolicy';
+import type {
+  ConflictChoice,
+  FolderPair,
+  RunReport,
+  SyncProgress,
+} from '../types';
 import { defaultAppSettings } from '../types';
+
+export interface PendingConflicts {
+  pair: FolderPair;
+  conflicts: ConflictAction[];
+}
 
 export interface RunStoreState {
   running: boolean;
   progress: SyncProgress | null;
   lastReport: RunReport | null;
   error: string | null;
+  pendingConflicts: PendingConflicts | null;
+  conflictResolutions: Record<string, ConflictChoice>;
 }
 
 type Listener = () => void;
@@ -17,6 +31,8 @@ let state: RunStoreState = {
   progress: null,
   lastReport: null,
   error: null,
+  pendingConflicts: null,
+  conflictResolutions: {},
 };
 
 const listeners = new Set<Listener>();
@@ -50,11 +66,10 @@ async function ensureProgressListener(): Promise<void> {
   });
 }
 
-export async function runSelectedPair(pair: FolderPair): Promise<RunReport | null> {
-  if (!pair.id || state.running) {
-    return null;
-  }
-
+async function executeRun(
+  pair: FolderPair,
+  conflictResolutions: Record<string, ConflictChoice>,
+): Promise<RunReport | null> {
   const settings = defaultAppSettings();
   state = {
     ...state,
@@ -62,6 +77,8 @@ export async function runSelectedPair(pair: FolderPair): Promise<RunReport | nul
     progress: null,
     lastReport: null,
     error: null,
+    pendingConflicts: null,
+    conflictResolutions: {},
   };
   emit();
 
@@ -70,6 +87,7 @@ export async function runSelectedPair(pair: FolderPair): Promise<RunReport | nul
     const report = await runApi.runPair(pair, {
       verifyHashes: settings.verifyHashesAfterCopy,
       useRecycleBin: settings.moveDeletesToRecycleBin,
+      conflictResolutions,
     });
     state = {
       ...state,
@@ -90,6 +108,66 @@ export async function runSelectedPair(pair: FolderPair): Promise<RunReport | nul
     emit();
     return null;
   }
+}
+
+export async function runSelectedPair(pair: FolderPair): Promise<RunReport | null> {
+  if (!pair.id || state.running) {
+    return null;
+  }
+
+  if (pair.conflictPolicy === 'ask') {
+    try {
+      const plan = await previewApi.previewPair(pair);
+      const conflicts = listConflictActions(plan);
+      if (conflicts.length > 0) {
+        state = {
+          ...state,
+          pendingConflicts: { pair, conflicts },
+          conflictResolutions: {},
+          error: null,
+        };
+        emit();
+        return null;
+      }
+    } catch (e) {
+      state = {
+        ...state,
+        error: e instanceof Error ? e.message : String(e),
+      };
+      emit();
+      return null;
+    }
+  }
+
+  return executeRun(pair, {});
+}
+
+export function setConflictResolution(
+  path: string,
+  choice: ConflictChoice,
+): void {
+  state = {
+    ...state,
+    conflictResolutions: { ...state.conflictResolutions, [path]: choice },
+  };
+  emit();
+}
+
+export function cancelConflictResolution(): void {
+  state = {
+    ...state,
+    pendingConflicts: null,
+    conflictResolutions: {},
+  };
+  emit();
+}
+
+export async function confirmConflictResolutionAndRun(): Promise<RunReport | null> {
+  const pending = state.pendingConflicts;
+  if (!pending) {
+    return null;
+  }
+  return executeRun(pending.pair, state.conflictResolutions);
 }
 
 export async function cancelActiveRun(): Promise<void> {
@@ -114,6 +192,8 @@ export function resetRunStoreForTests(): void {
     progress: null,
     lastReport: null,
     error: null,
+    pendingConflicts: null,
+    conflictResolutions: {},
   };
   emit();
 }

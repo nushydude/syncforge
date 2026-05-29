@@ -7,6 +7,8 @@ export type ConflictPolicy =
   | 'keepBoth'
   | 'ask';
 
+export type ConflictChoice = 'left' | 'right' | 'keepBoth' | 'skip';
+
 export interface Filters {
   include: string[];
   exclude: string[];

@@ -191,6 +191,7 @@ body {
 }
 
 .mode-selector,
+.conflict-policy-selector,
 .filter-editor {
   border: 1px solid #e2e8f0;
   border-radius: 0.5rem;
@@ -199,19 +200,22 @@ body {
 }
 
 .mode-selector legend,
+.conflict-policy-selector legend,
 .filter-editor legend {
   font-weight: 600;
   font-size: 0.875rem;
   padding: 0 0.25rem;
 }
 
-.mode-options {
+.mode-options,
+.conflict-policy-options {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
 }
 
-.mode-option {
+.mode-option,
+.conflict-policy-option {
   display: grid;
   grid-template-columns: auto 1fr;
   gap: 0.25rem 0.5rem;
@@ -219,11 +223,13 @@ body {
   font-weight: 400;
 }
 
-.mode-label {
+.mode-label,
+.conflict-policy-label {
   font-weight: 500;
 }
 
-.mode-hint {
+.mode-hint,
+.conflict-policy-hint {
   grid-column: 2;
   font-size: 0.8rem;
   color: #64748b;
@@ -501,4 +507,113 @@ button:disabled {
   margin: 0.5rem 0 0;
   font-size: 0.875rem;
   color: #334155;
+}
+
+.conflict-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.conflict-dialog {
+  width: min(640px, 100%);
+  max-height: min(80vh, 720px);
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border-radius: 0.5rem;
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.2);
+}
+
+.conflict-dialog-header {
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.conflict-dialog-header h3 {
+  margin: 0 0 0.35rem;
+}
+
+.conflict-dialog-header p {
+  margin: 0;
+  font-size: 0.875rem;
+  color: #64748b;
+}
+
+.conflict-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.75rem 1.25rem;
+  overflow-y: auto;
+}
+
+.conflict-item {
+  padding: 0.75rem 0;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.conflict-item:last-child {
+  border-bottom: none;
+}
+
+.conflict-item-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.conflict-path {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.9rem;
+  word-break: break-all;
+}
+
+.conflict-kind {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #c2410c;
+  white-space: nowrap;
+}
+
+.conflict-sides {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  font-size: 0.85rem;
+  color: #475569;
+  margin-bottom: 0.5rem;
+}
+
+.conflict-sides strong {
+  display: block;
+  color: #0f172a;
+  margin-bottom: 0.15rem;
+}
+
+.conflict-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+}
+
+.conflict-choice {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.875rem;
+}
+
+.conflict-dialog-actions {
+  display: flex;
+  gap: 0.5rem;
+  padding: 1rem 1.25rem;
+  border-top: 1px solid #e2e8f0;
 }

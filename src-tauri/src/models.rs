@@ -121,6 +121,16 @@ pub enum ConflictPolicy {
     Ask,
 }
 
+/// Per-path resolution when the user is prompted for a conflict (`ask` policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConflictResolution {
+    Left,
+    Right,
+    KeepBoth,
+    Skip,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
