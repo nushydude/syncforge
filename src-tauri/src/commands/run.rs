@@ -42,18 +42,22 @@ pub async fn run_pair(
         use_recycle_bin: options.use_recycle_bin,
     };
 
-    let result = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
+    let db = Arc::clone(&state.db);
+    let app_emit = app.clone();
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
         run_pair_impl(
-            &db,
+            db.as_ref(),
             &pair,
             run_options,
             &cancel,
             |progress| {
-                let _ = app.emit("sync://progress", &progress);
+                let _ = app_emit.emit("sync://progress", &progress);
             },
         )
-    };
+    })
+    .await
+    .map_err(|e| format!("sync run task failed: {e}"))?;
 
     {
         let mut guard = state.cancel_flag.lock().map_err(|e| e.to_string())?;

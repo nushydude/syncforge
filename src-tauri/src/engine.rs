@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
@@ -140,8 +141,16 @@ fn build_snapshot_entries(left: &[FileEntry], right: &[FileEntry]) -> Vec<FileEn
     map.into_values().collect()
 }
 
+fn with_db<T, F>(db: &Mutex<Database>, f: F) -> Result<T, String>
+where
+    F: FnOnce(&Database) -> Result<T, String>,
+{
+    let guard = db.lock().map_err(|e| e.to_string())?;
+    f(&guard)
+}
+
 pub fn run_pair_impl<F>(
-    db: &Database,
+    db: &Mutex<Database>,
     pair: &FolderPair,
     options: RunOptions,
     cancel: &AtomicBool,
@@ -171,11 +180,46 @@ where
         errors: vec![],
     };
 
-    db.save_run(&report).map_err(|e| e.to_string())?;
+    with_db(db, |db| db.save_run(&report).map_err(|e| e.to_string()))?;
 
+    let result = run_pair_impl_inner(
+        db,
+        pair,
+        options,
+        cancel,
+        &mut report,
+        &mut emit,
+        &run_id,
+        &left_root,
+        &right_root,
+    );
+
+    if let Err(ref error) = result {
+        if report.finished_at.is_none() {
+            finish_failed(db, &mut report, &mut emit, error)?;
+        }
+    }
+
+    result
+}
+
+fn run_pair_impl_inner<F>(
+    db: &Mutex<Database>,
+    pair: &FolderPair,
+    options: RunOptions,
+    cancel: &AtomicBool,
+    report: &mut RunReport,
+    emit: &mut F,
+    run_id: &str,
+    left_root: &Path,
+    right_root: &Path,
+) -> Result<RunReport, String>
+where
+    F: FnMut(SyncProgress),
+{
     let mut progress = |phase: &str, current: u32, total: u32, path: Option<&str>, message: Option<&str>| {
         emit(SyncProgress {
-            run_id: run_id.clone(),
+            run_id: run_id.to_string(),
             pair_id: pair.id.clone(),
             phase: phase.into(),
             current,
@@ -189,17 +233,15 @@ where
     progress("scanning", 0, 0, None, Some("Scanning folders"));
 
     if cancel.load(Ordering::Relaxed) {
-        return finish_cancelled(db, &mut report, &mut emit);
+        return finish_cancelled(db, report, emit);
     }
 
-    let left_scan = scan_directory(&left_root, &pair.filters)
+    let left_scan = scan_directory(left_root, &pair.filters)
         .map_err(|e| format!("scan left failed: {e}"))?;
-    let right_scan = scan_directory(&right_root, &pair.filters)
+    let right_scan = scan_directory(right_root, &pair.filters)
         .map_err(|e| format!("scan right failed: {e}"))?;
 
-    let snapshot = db
-        .latest_snapshot(&pair.id)
-        .map_err(|e| e.to_string())?;
+    let snapshot = with_db(db, |db| db.latest_snapshot(&pair.id).map_err(|e| e.to_string()))?;
     let snapshot_entries = snapshot.as_ref().map(|s| s.entries.as_slice());
 
     let mut scan_warnings = Vec::new();
@@ -237,7 +279,7 @@ where
 
     for (index, action) in executable.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            return finish_cancelled(db, &mut report, &mut emit);
+            return finish_cancelled(db, report, emit);
         }
 
         let current = index as u32 + 1;
@@ -248,8 +290,8 @@ where
         let kind = action_kind(action);
         let result = execute_action(
             action,
-            &left_root,
-            &right_root,
+            left_root,
+            right_root,
             options.verify_hashes,
             options.use_recycle_bin,
         );
@@ -261,7 +303,7 @@ where
                 report.bytes_transferred += stats.bytes;
                 let run_item = RunItem {
                     id: item_id,
-                    run_id: run_id.clone(),
+                    run_id: run_id.to_string(),
                     path: path.to_string(),
                     action: kind.to_string(),
                     status: "completed".into(),
@@ -272,15 +314,14 @@ where
                         None
                     },
                 };
-                db.insert_run_item(&run_item)
-                    .map_err(|e| e.to_string())?;
+                with_db(db, |db| db.insert_run_item(&run_item).map_err(|e| e.to_string()))?;
             }
             Err(e) => {
                 let msg = e.to_string();
                 report.errors.push(format!("{path}: {msg}"));
                 let run_item = RunItem {
                     id: item_id,
-                    run_id: run_id.clone(),
+                    run_id: run_id.to_string(),
                     path: path.to_string(),
                     action: kind.to_string(),
                     status: if matches!(action, SyncAction::Conflict { .. }) {
@@ -291,21 +332,20 @@ where
                     message: Some(msg),
                     bytes: None,
                 };
-                db.insert_run_item(&run_item)
-                    .map_err(|e| e.to_string())?;
+                with_db(db, |db| db.insert_run_item(&run_item).map_err(|e| e.to_string()))?;
             }
         }
     }
 
     if cancel.load(Ordering::Relaxed) {
-        return finish_cancelled(db, &mut report, &mut emit);
+        return finish_cancelled(db, report, emit);
     }
 
     progress("scanning", total, total, None, Some("Capturing snapshot"));
 
-    let left_after = scan_directory(&left_root, &pair.filters)
+    let left_after = scan_directory(left_root, &pair.filters)
         .map_err(|e| format!("post-run scan left failed: {e}"))?;
-    let right_after = scan_directory(&right_root, &pair.filters)
+    let right_after = scan_directory(right_root, &pair.filters)
         .map_err(|e| format!("post-run scan right failed: {e}"))?;
 
     let snapshot = Snapshot {
@@ -314,7 +354,7 @@ where
         captured_at: now_millis(),
         entries: build_snapshot_entries(&left_after.entries, &right_after.entries),
     };
-    db.save_snapshot(&snapshot).map_err(|e| e.to_string())?;
+    with_db(db, |db| db.save_snapshot(&snapshot).map_err(|e| e.to_string()))?;
 
     report.status = if report.errors.is_empty() {
         RunStatus::Completed
@@ -322,10 +362,10 @@ where
         RunStatus::Failed
     };
     report.finished_at = Some(now_millis());
-    db.save_run(&report).map_err(|e| e.to_string())?;
+    with_db(db, |db| db.save_run(report).map_err(|e| e.to_string()))?;
 
     emit(SyncProgress {
-        run_id: run_id.clone(),
+        run_id: run_id.to_string(),
         pair_id: pair.id.clone(),
         phase: if report.status == RunStatus::Completed {
             "completed".into()
@@ -339,7 +379,7 @@ where
         report: Some(report.clone()),
     });
 
-    Ok(report)
+    Ok(report.clone())
 }
 
 struct ActionStats {
@@ -430,8 +470,36 @@ fn action_path(action: &SyncAction) -> &str {
     }
 }
 
+fn finish_failed<F>(
+    db: &Mutex<Database>,
+    report: &mut RunReport,
+    emit: &mut F,
+    error: &str,
+) -> Result<(), String>
+where
+    F: FnMut(SyncProgress),
+{
+    if !report.errors.iter().any(|e| e == error) {
+        report.errors.push(error.to_string());
+    }
+    report.status = RunStatus::Failed;
+    report.finished_at = Some(now_millis());
+    with_db(db, |db| db.save_run(report).map_err(|e| e.to_string()))?;
+    emit(SyncProgress {
+        run_id: report.run_id.clone(),
+        pair_id: report.pair_id.clone(),
+        phase: "failed".into(),
+        current: 0,
+        total: 0,
+        path: None,
+        message: Some(error.to_string()),
+        report: Some(report.clone()),
+    });
+    Ok(())
+}
+
 fn finish_cancelled<F>(
-    db: &Database,
+    db: &Mutex<Database>,
     report: &mut RunReport,
     emit: &mut F,
 ) -> Result<RunReport, String>
@@ -440,7 +508,7 @@ where
 {
     report.status = RunStatus::Cancelled;
     report.finished_at = Some(now_millis());
-    db.save_run(report).map_err(|e| e.to_string())?;
+    with_db(db, |db| db.save_run(report).map_err(|e| e.to_string()))?;
     emit(SyncProgress {
         run_id: report.run_id.clone(),
         pair_id: report.pair_id.clone(),
@@ -524,7 +592,9 @@ mod tests {
     #[test]
     fn run_pair_impl_echo_integration() {
         let data_dir = TempDir::new().expect("tempdir");
-        let db = crate::persistence::Database::open(&data_dir.path().join("test.db")).expect("db");
+        let db = Mutex::new(
+            crate::persistence::Database::open(&data_dir.path().join("test.db")).expect("db"),
+        );
 
         let left_dir = data_dir.path().join("left");
         let right_dir = data_dir.path().join("right");
@@ -545,7 +615,10 @@ mod tests {
             created_at: 1,
             updated_at: 2,
         };
-        db.save_pair(&pair).expect("save pair");
+        db.lock()
+            .expect("lock")
+            .save_pair(&pair)
+            .expect("save pair");
 
         let cancel = AtomicBool::new(false);
         let mut events = Vec::new();
@@ -564,7 +637,114 @@ mod tests {
         assert_eq!(report.status, RunStatus::Completed);
         assert!(right_dir.join("sync.txt").exists());
         assert!(!right_dir.join("orphan.txt").exists());
-        assert!(db.latest_snapshot(&pair.id).expect("snapshot").is_some());
+        assert!(
+            db.lock()
+                .expect("lock")
+                .latest_snapshot(&pair.id)
+                .expect("snapshot")
+                .is_some()
+        );
         assert!(events.contains(&"completed".to_string()));
+    }
+
+    #[test]
+    fn run_pair_impl_finalizes_run_on_scan_failure() {
+        let data_dir = TempDir::new().expect("tempdir");
+        let db = Mutex::new(
+            crate::persistence::Database::open(&data_dir.path().join("test.db")).expect("db"),
+        );
+
+        let right_dir = data_dir.path().join("right");
+        fs::create_dir_all(&right_dir).expect("mkdir");
+
+        let pair = crate::models::FolderPair {
+            id: crate::persistence::new_pair_id(),
+            name: "Broken".into(),
+            left_path: data_dir
+                .path()
+                .join("missing-left")
+                .to_string_lossy()
+                .into_owned(),
+            right_path: right_dir.to_string_lossy().into_owned(),
+            mode: crate::models::SyncMode::Echo,
+            filters: crate::models::Filters::default(),
+            conflict_policy: crate::models::ConflictPolicy::NewerWins,
+            enabled: true,
+            created_at: 1,
+            updated_at: 2,
+        };
+        db.lock()
+            .expect("lock")
+            .save_pair(&pair)
+            .expect("save pair");
+
+        let cancel = AtomicBool::new(false);
+        let mut failed_report: Option<RunReport> = None;
+        let err = run_pair_impl(
+            &db,
+            &pair,
+            RunOptions {
+                verify_hashes: false,
+                use_recycle_bin: false,
+            },
+            &cancel,
+            |p| {
+                if p.phase == "failed" {
+                    failed_report = p.report.clone();
+                }
+            },
+        )
+        .expect_err("scan should fail");
+
+        assert!(err.contains("scan left failed"));
+        let report = failed_report.expect("failed progress event");
+        assert_eq!(report.status, RunStatus::Failed);
+        assert!(report.finished_at.is_some());
+    }
+
+    #[test]
+    fn run_pair_impl_finalizes_run_on_cancel() {
+        let data_dir = TempDir::new().expect("tempdir");
+        let db = Mutex::new(
+            crate::persistence::Database::open(&data_dir.path().join("test.db")).expect("db"),
+        );
+
+        let left_dir = data_dir.path().join("left");
+        let right_dir = data_dir.path().join("right");
+        fs::create_dir_all(&left_dir).expect("mkdir");
+        fs::create_dir_all(&right_dir).expect("mkdir");
+
+        let pair = crate::models::FolderPair {
+            id: crate::persistence::new_pair_id(),
+            name: "Cancel".into(),
+            left_path: left_dir.to_string_lossy().into_owned(),
+            right_path: right_dir.to_string_lossy().into_owned(),
+            mode: crate::models::SyncMode::Echo,
+            filters: crate::models::Filters::default(),
+            conflict_policy: crate::models::ConflictPolicy::NewerWins,
+            enabled: true,
+            created_at: 1,
+            updated_at: 2,
+        };
+        db.lock()
+            .expect("lock")
+            .save_pair(&pair)
+            .expect("save pair");
+
+        let cancel = AtomicBool::new(true);
+        let report = run_pair_impl(
+            &db,
+            &pair,
+            RunOptions {
+                verify_hashes: false,
+                use_recycle_bin: false,
+            },
+            &cancel,
+            |_| {},
+        )
+        .expect("cancelled run returns report");
+
+        assert_eq!(report.status, RunStatus::Cancelled);
+        assert!(report.finished_at.is_some());
     }
 }
