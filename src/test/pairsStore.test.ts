@@ -35,6 +35,7 @@ const samplePair: FolderPair = {
   filters: { include: ["*.txt"], exclude: [] },
   conflictPolicy: "newerWins",
   enabled: true,
+  watchEnabled: false,
   createdAt: 1,
   updatedAt: 2,
 };
@@ -88,6 +89,40 @@ describe("pairsStore", () => {
     expect(ok).toBe(false);
     expect(pairsApi.savePair).not.toHaveBeenCalled();
     expect(getPairsState().validationErrors.length).toBeGreaterThan(0);
+  });
+
+  it("warns when watch is enabled but folder paths are missing on disk", async () => {
+    vi.mocked(pairsApi.listPairs).mockResolvedValue([
+      { ...samplePair, watchEnabled: true },
+    ]);
+    vi.mocked(pairsApi.pathExists).mockResolvedValue(false);
+    await loadPairs();
+    selectPair("pair-1");
+    await vi.waitFor(() => {
+      expect(getPairsState().watchWarning).toContain("inactive");
+    });
+  });
+
+  it("clears watch warning after save when both paths exist", async () => {
+    startNewPair();
+    updateEditing({
+      name: "Backup",
+      leftPath: "C:\\left",
+      rightPath: "D:\\right",
+      watchEnabled: true,
+    });
+    vi.mocked(pairsApi.pathExists).mockResolvedValue(true);
+    vi.mocked(pairsApi.pathsEqual).mockResolvedValue(false);
+    vi.mocked(pairsApi.savePair).mockResolvedValue({
+      ...samplePair,
+      id: "new-id",
+      name: "Backup",
+      watchEnabled: true,
+    });
+
+    const ok = await saveEditing();
+    expect(ok).toBe(true);
+    expect(getPairsState().watchWarning).toBeNull();
   });
 
   it("saves a valid pair", async () => {

@@ -23,6 +23,7 @@ export interface FolderPair {
   filters: Filters;
   conflictPolicy: ConflictPolicy;
   enabled: boolean;
+  watchEnabled: boolean;
   createdAt: number;
   updatedAt: number;
 }

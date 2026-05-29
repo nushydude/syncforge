@@ -7,6 +7,7 @@ import type {
   FolderPair,
   RunReport,
   SyncProgress,
+  WatchSkippedNotice,
 } from '../types';
 import { defaultAppSettings } from '../types';
 
@@ -22,6 +23,7 @@ export interface RunStoreState {
   error: string | null;
   pendingConflicts: PendingConflicts | null;
   conflictResolutions: Record<string, ConflictChoice>;
+  watchSkipped: WatchSkippedNotice | null;
 }
 
 type Listener = () => void;
@@ -33,10 +35,12 @@ let state: RunStoreState = {
   error: null,
   pendingConflicts: null,
   conflictResolutions: {},
+  watchSkipped: null,
 };
 
 const listeners = new Set<Listener>();
 let unlistenProgress: (() => void) | null = null;
+let unlistenWatchSkipped: (() => void) | null = null;
 
 function emit() {
   listeners.forEach((l) => l());
@@ -64,6 +68,25 @@ async function ensureProgressListener(): Promise<void> {
     };
     emit();
   });
+}
+
+/** Subscribes to backend watch-auto-sync skip events (conflicts, errors). */
+export async function ensureWatchSkippedListener(): Promise<void> {
+  if (unlistenWatchSkipped) {
+    return;
+  }
+  unlistenWatchSkipped = await listen<WatchSkippedNotice>(
+    'sync://watch-skipped',
+    (event) => {
+      state = { ...state, watchSkipped: event.payload };
+      emit();
+    },
+  );
+}
+
+export function dismissWatchSkipped(): void {
+  state = { ...state, watchSkipped: null };
+  emit();
 }
 
 async function executeRun(
@@ -187,6 +210,8 @@ export async function cancelActiveRun(): Promise<void> {
 
 /** Test helper — reset module state between Vitest cases. */
 export function resetRunStoreForTests(): void {
+  unlistenProgress = null;
+  unlistenWatchSkipped = null;
   state = {
     running: false,
     progress: null,
@@ -194,6 +219,7 @@ export function resetRunStoreForTests(): void {
     error: null,
     pendingConflicts: null,
     conflictResolutions: {},
+    watchSkipped: null,
   };
   emit();
 }

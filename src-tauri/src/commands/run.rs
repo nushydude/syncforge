@@ -8,6 +8,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::engine::{run_pair_impl, RunOptions};
 use crate::models::{ConflictResolution, FolderPair, RunReport};
 use crate::state::AppState;
+use crate::watcher::release_sync_slot;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,7 +30,7 @@ pub async fn run_pair(
     pair: FolderPair,
     options: RunPairOptions,
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<RunReport, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     {
@@ -48,13 +49,14 @@ pub async fn run_pair(
 
     let db = Arc::clone(&state.db);
     let app_emit = app.clone();
+    let cancel_for_run = Arc::clone(&cancel);
 
     let result = tauri::async_runtime::spawn_blocking(move || {
         run_pair_impl(
             db.as_ref(),
             &pair,
             run_options,
-            &cancel,
+            &cancel_for_run,
             |progress| {
                 let _ = app_emit.emit("sync://progress", &progress);
             },
@@ -63,10 +65,7 @@ pub async fn run_pair(
     .await
     .map_err(|e| format!("sync run task failed: {e}"))?;
 
-    {
-        let mut guard = state.cancel_flag.lock().map_err(|e| e.to_string())?;
-        *guard = None;
-    }
+    release_sync_slot(app, &state, &cancel);
 
     result
 }

@@ -1,11 +1,14 @@
-use tauri::State;
+use std::sync::Arc;
+
+use tauri::{AppHandle, State};
 
 use crate::models::FolderPair;
 use crate::persistence::{new_pair_id, PersistenceError};
 use crate::state::AppState;
+use crate::watcher::refresh_watch_service;
 
 #[tauri::command]
-pub fn list_pairs(state: State<'_, AppState>) -> Result<Vec<FolderPair>, String> {
+pub fn list_pairs(state: State<'_, Arc<AppState>>) -> Result<Vec<FolderPair>, String> {
     state
         .db
         .lock()
@@ -15,7 +18,11 @@ pub fn list_pairs(state: State<'_, AppState>) -> Result<Vec<FolderPair>, String>
 }
 
 #[tauri::command]
-pub fn save_pair(pair: FolderPair, state: State<'_, AppState>) -> Result<FolderPair, String> {
+pub fn save_pair(
+    pair: FolderPair,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<FolderPair, String> {
     let mut pair = pair;
     if pair.id.trim().is_empty() {
         pair.id = new_pair_id();
@@ -26,16 +33,23 @@ pub fn save_pair(pair: FolderPair, state: State<'_, AppState>) -> Result<FolderP
     }
     pair.updated_at = now;
 
-    state
+    let saved = state
         .db
         .lock()
         .map_err(|e| e.to_string())?
         .save_pair(&pair)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    refresh_watch_service(&app, &state)?;
+    Ok(saved)
 }
 
 #[tauri::command]
-pub fn delete_pair(id: String, state: State<'_, AppState>) -> Result<(), String> {
+pub fn delete_pair(
+    id: String,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     state
         .db
         .lock()
@@ -47,7 +61,10 @@ pub fn delete_pair(id: String, state: State<'_, AppState>) -> Result<(), String>
             } else {
                 e.to_string()
             }
-        })
+        })?;
+
+    refresh_watch_service(&app, &state)?;
+    Ok(())
 }
 
 fn current_millis() -> i64 {

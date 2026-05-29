@@ -31,6 +31,7 @@ export function PairEditor() {
     previewPlan,
     previewLoading,
     previewError,
+    watchWarning,
   } = usePairsStore();
   const {
     running: runInProgress,
@@ -148,6 +149,21 @@ export function PairEditor() {
         />
         Enabled
       </label>
+
+      <label className="field checkbox-field">
+        <input
+          type="checkbox"
+          checked={editing.watchEnabled}
+          onChange={(e) => updateEditing({ watchEnabled: e.target.checked })}
+          disabled={saving || !editing.enabled}
+        />
+        Watch for changes (auto-sync)
+      </label>
+      {watchWarning && (
+        <p className="form-warning" role="status">
+          {watchWarning}
+        </p>
+      )}
 
       {!isNew && (
         <PreviewTable

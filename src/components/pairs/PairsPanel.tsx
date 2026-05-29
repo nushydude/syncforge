@@ -1,21 +1,45 @@
 import { useEffect } from "react";
 import { usePairsStore } from "../../hooks/usePairsStore";
+import { useSyncProgress } from "../../hooks/useSyncProgress";
 import { loadPairs, startNewPair } from "../../store/pairsStore";
+import {
+  dismissWatchSkipped,
+  ensureWatchSkippedListener,
+} from "../../store/runStore";
 import { PairEditor } from "./PairEditor";
 import { PairList } from "./PairList";
 
 export function PairsPanel() {
   const { pairs, editing, loading } = usePairsStore();
+  const { watchSkipped } = useSyncProgress();
 
   useEffect(() => {
     void loadPairs();
+    void ensureWatchSkippedListener();
   }, []);
 
   const showEmpty =
     !loading && pairs.length === 0 && editing === null;
 
+  const skippedPairName =
+    watchSkipped &&
+    pairs.find((p) => p.id === watchSkipped.pairId)?.name;
+
   return (
-    <div className="pairs-panel">
+    <>
+      {watchSkipped && (
+        <div className="watch-skipped-banner" role="alert">
+          <p>
+            Watch auto-sync skipped
+            {skippedPairName ? ` for “${skippedPairName}”` : ""}:{" "}
+            {watchSkipped.reason}
+          </p>
+          <button type="button" onClick={dismissWatchSkipped}>
+            Dismiss
+          </button>
+        </div>
+      )}
+      <div className="pairs-panel">
       <PairList />
       <section className="pairs-main">
         {showEmpty ? (
@@ -40,6 +64,7 @@ export function PairsPanel() {
           </div>
         )}
       </section>
-    </div>
+      </div>
+    </>
   );
 }

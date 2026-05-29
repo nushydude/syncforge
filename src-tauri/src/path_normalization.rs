@@ -34,6 +34,39 @@ pub fn normalize_path(path: &str) -> String {
     }
 }
 
+/// Returns true when `path` is the same as or nested under `root`.
+///
+/// Both arguments are normalized the same way as sync paths (`to_long_path`), including
+/// `\\?\` vs conventional Windows paths and UNC extended prefixes.
+pub fn path_is_within_root(path: &str, root: &str) -> bool {
+    if paths_equal(path, root) {
+        return true;
+    }
+
+    let path_norm = to_long_path(path);
+    let root_norm = to_long_path(root);
+
+    #[cfg(windows)]
+    {
+        let path_lower = path_norm.to_ascii_lowercase();
+        let mut root_lower = root_norm.to_ascii_lowercase();
+        if !root_lower.ends_with('\\') {
+            root_lower.push('\\');
+        }
+        return path_lower.starts_with(&root_lower);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let root_prefix = if root_norm.ends_with('/') {
+            root_norm
+        } else {
+            format!("{root_norm}/")
+        };
+        path_norm.starts_with(&root_prefix)
+    }
+}
+
 /// Compares two paths after normalization (case-insensitive on Windows).
 pub fn paths_equal(a: &str, b: &str) -> bool {
     let na = normalize_path(a);
@@ -154,5 +187,37 @@ mod tests {
     fn to_long_path_preserves_already_extended() {
         let extended = r"\\?\C:\already";
         assert_eq!(to_long_path(extended), extended);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_is_within_root_matches_conventional_under_extended_unc() {
+        let root = r"\\?\UNC\server\share\sync";
+        let event = r"\\server\share\sync\file.txt";
+        assert!(path_is_within_root(event, root));
+        assert!(!path_is_within_root(
+            r"\\server\share\other\file.txt",
+            root
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_is_within_root_is_case_insensitive() {
+        assert!(path_is_within_root(
+            r"C:\Users\Docs\file.txt",
+            r"c:\users\docs"
+        ));
+        assert!(!path_is_within_root(
+            r"C:\Users\Documents\file.txt",
+            r"c:\users\docs"
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn path_is_within_root_respects_directory_boundary() {
+        assert!(path_is_within_root("/tmp/a/b", "/tmp/a"));
+        assert!(!path_is_within_root("/tmp/ab", "/tmp/a"));
     }
 }
