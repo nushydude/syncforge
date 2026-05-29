@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use crate::persistence::{Database, PersistenceError};
+use crate::scheduler::ScheduleService;
 use crate::watcher::WatchService;
 
 pub struct AppState {
@@ -12,6 +13,7 @@ pub struct AppState {
     /// Pair ids whose debounced watch sync could not start while a run was active.
     pub pending_watch_syncs: Mutex<HashSet<String>>,
     pub watch_service: Mutex<Option<WatchService>>,
+    pub schedule_service: Mutex<Option<ScheduleService>>,
 }
 
 impl AppState {
@@ -23,6 +25,7 @@ impl AppState {
             cancel_flag: Mutex::new(None),
             pending_watch_syncs: Mutex::new(HashSet::new()),
             watch_service: Mutex::new(None),
+            schedule_service: Mutex::new(None),
         })
     }
 }

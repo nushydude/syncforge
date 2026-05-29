@@ -32,6 +32,8 @@ export function PairEditor() {
     previewLoading,
     previewError,
     watchWarning,
+    scheduleError,
+    scheduleDescription,
   } = usePairsStore();
   const {
     running: runInProgress,
@@ -164,6 +166,53 @@ export function PairEditor() {
           {watchWarning}
         </p>
       )}
+
+      <fieldset className="schedule-fieldset">
+        <legend>Scheduled sync</legend>
+        <label className="field checkbox-field">
+          <input
+            type="checkbox"
+            checked={editing.scheduleEnabled}
+            onChange={(e) =>
+              updateEditing({
+                scheduleEnabled: e.target.checked,
+                scheduleCron: e.target.checked
+                  ? editing.scheduleCron ?? "0 9 * * *"
+                  : null,
+              })
+            }
+            disabled={saving || !editing.enabled}
+          />
+          Enable scheduled sync
+        </label>
+        {editing.scheduleEnabled && (
+          <>
+            <label className="field">
+              Cron expression
+              <input
+                type="text"
+                value={editing.scheduleCron ?? ""}
+                onChange={(e) =>
+                  updateEditing({ scheduleCron: e.target.value })
+                }
+                placeholder="0 9 * * * (minute hour day month weekday)"
+                disabled={saving}
+                spellCheck={false}
+              />
+            </label>
+            {scheduleDescription && (
+              <p className="schedule-description" role="status">
+                {scheduleDescription}
+              </p>
+            )}
+            {scheduleError && (
+              <p className="form-error" role="alert">
+                {scheduleError}
+              </p>
+            )}
+          </>
+        )}
+      </fieldset>
 
       {!isNew && (
         <PreviewTable

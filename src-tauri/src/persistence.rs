@@ -59,6 +59,8 @@ impl Database {
                     conflict_policy TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     watch_enabled INTEGER NOT NULL DEFAULT 0,
+                    schedule_enabled INTEGER NOT NULL DEFAULT 0,
+                    schedule_cron TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
@@ -97,9 +99,10 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_run_items_run_id ON run_items(run_id);
                 ",
             )?;
-        } else {
-            self.migrate_watch_enabled()?;
         }
+
+        self.migrate_watch_enabled()?;
+        self.migrate_schedule_fields()?;
 
         Ok(())
     }
@@ -125,10 +128,48 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_schedule_fields(&self) -> Result<()> {
+        let has_enabled: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pairs') WHERE name = 'schedule_enabled'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_enabled {
+            self.conn.execute(
+                "ALTER TABLE pairs ADD COLUMN schedule_enabled INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+
+        let has_cron: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pairs') WHERE name = 'schedule_cron'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_cron {
+            self.conn.execute(
+                "ALTER TABLE pairs ADD COLUMN schedule_cron TEXT",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
     pub fn list_pairs(&self) -> Result<Vec<FolderPair>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, left_path, right_path, mode, filters_json, conflict_policy,
-                    enabled, watch_enabled, created_at, updated_at
+                    enabled, watch_enabled, schedule_enabled, schedule_cron, created_at, updated_at
              FROM pairs
              ORDER BY name COLLATE NOCASE",
         )?;
@@ -144,7 +185,9 @@ impl Database {
                 row.get::<_, i64>(7)?,
                 row.get::<_, i64>(8)?,
                 row.get::<_, i64>(9)?,
-                row.get::<_, i64>(10)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
             ))
         })?;
 
@@ -159,6 +202,8 @@ impl Database {
                 conflict_policy,
                 enabled,
                 watch_enabled,
+                schedule_enabled,
+                schedule_cron,
                 created_at,
                 updated_at,
             ) = row?;
@@ -172,6 +217,8 @@ impl Database {
                 conflict_policy,
                 enabled,
                 watch_enabled,
+                schedule_enabled,
+                schedule_cron,
                 created_at,
                 updated_at,
             )?)
@@ -187,8 +234,8 @@ impl Database {
         self.conn.execute(
             "INSERT INTO pairs (
                 id, name, left_path, right_path, mode, filters_json, conflict_policy,
-                enabled, watch_enabled, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                enabled, watch_enabled, schedule_enabled, schedule_cron, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 left_path = excluded.left_path,
@@ -198,6 +245,8 @@ impl Database {
                 conflict_policy = excluded.conflict_policy,
                 enabled = excluded.enabled,
                 watch_enabled = excluded.watch_enabled,
+                schedule_enabled = excluded.schedule_enabled,
+                schedule_cron = excluded.schedule_cron,
                 updated_at = excluded.updated_at",
             params![
                 pair.id,
@@ -209,6 +258,8 @@ impl Database {
                 conflict_policy,
                 pair.enabled as i64,
                 pair.watch_enabled as i64,
+                pair.schedule_enabled as i64,
+                pair.schedule_cron,
                 pair.created_at,
                 pair.updated_at,
             ],
@@ -231,7 +282,7 @@ impl Database {
     pub fn get_pair(&self, id: &str) -> Result<Option<FolderPair>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, left_path, right_path, mode, filters_json, conflict_policy,
-                    enabled, watch_enabled, created_at, updated_at
+                    enabled, watch_enabled, schedule_enabled, schedule_cron, created_at, updated_at
              FROM pairs WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id])?;
@@ -248,6 +299,8 @@ impl Database {
                 row.get(8)?,
                 row.get(9)?,
                 row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
             )?;
             return Ok(Some(pair));
         }
@@ -353,6 +406,8 @@ fn row_to_pair(
     conflict_policy: String,
     enabled: i64,
     watch_enabled: i64,
+    schedule_enabled: i64,
+    schedule_cron: Option<String>,
     created_at: i64,
     updated_at: i64,
 ) -> Result<FolderPair> {
@@ -366,6 +421,8 @@ fn row_to_pair(
         conflict_policy: str_to_conflict_policy(&conflict_policy)?,
         enabled: enabled != 0,
         watch_enabled: watch_enabled != 0,
+        schedule_enabled: schedule_enabled != 0,
+        schedule_cron,
         created_at,
         updated_at,
     })
@@ -447,6 +504,8 @@ mod tests {
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
             watch_enabled: true,
+            schedule_enabled: false,
+            schedule_cron: None,
             created_at: 100,
             updated_at: 200,
         };
@@ -458,6 +517,37 @@ mod tests {
         db.save_pair(&pair).expect("update");
         let loaded = db.get_pair(&pair.id).expect("get").expect("pair");
         assert!(!loaded.watch_enabled);
+    }
+
+    #[test]
+    fn schedule_fields_persist() {
+        let (_dir, db) = temp_db();
+        let mut pair = FolderPair {
+            id: new_pair_id(),
+            name: "Scheduled".into(),
+            left_path: r"C:\left".into(),
+            right_path: r"D:\right".into(),
+            mode: SyncMode::Synchronize,
+            filters: Filters::default(),
+            conflict_policy: ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: true,
+            schedule_cron: Some("0 9 * * *".into()),
+            created_at: 100,
+            updated_at: 200,
+        };
+        db.save_pair(&pair).expect("save");
+        let loaded = db.get_pair(&pair.id).expect("get").expect("pair");
+        assert!(loaded.schedule_enabled);
+        assert_eq!(loaded.schedule_cron.as_deref(), Some("0 9 * * *"));
+
+        pair.schedule_enabled = false;
+        pair.schedule_cron = None;
+        db.save_pair(&pair).expect("update");
+        let loaded = db.get_pair(&pair.id).expect("get").expect("pair");
+        assert!(!loaded.schedule_enabled);
+        assert!(loaded.schedule_cron.is_none());
     }
 
     #[test]
@@ -473,6 +563,8 @@ mod tests {
             conflict_policy: ConflictPolicy::Ask,
             enabled: true,
             watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
             created_at: 100,
             updated_at: 200,
         };
@@ -499,6 +591,8 @@ mod tests {
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
             watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
             created_at: 1,
             updated_at: 2,
         };
@@ -557,6 +651,8 @@ mod tests {
             conflict_policy: ConflictPolicy::Ask,
             enabled: true,
             watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
             created_at: 1,
             updated_at: 2,
         };

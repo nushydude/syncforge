@@ -1,6 +1,7 @@
 import * as pairsApi from "../api/pairs";
 import * as previewApi from "../api/preview";
 import { validatePairForm } from "../lib/pairValidation";
+import { validateCronExpression, describeCronExpression } from "../lib/scheduleParsing";
 import type { ConflictPolicy, FolderPair, SyncMode, SyncPlan } from "../types";
 import { defaultFilters } from "../types";
 
@@ -16,6 +17,8 @@ export interface PairsStoreState {
   previewLoading: boolean;
   previewError: string | null;
   watchWarning: string | null;
+  scheduleError: string | null;
+  scheduleDescription: string | null;
 }
 
 type Listener = () => void;
@@ -34,6 +37,8 @@ function emptyPair(): FolderPair {
     conflictPolicy: defaultConflictPolicy,
     enabled: true,
     watchEnabled: false,
+    scheduleEnabled: false,
+    scheduleCron: null,
     createdAt: 0,
     updatedAt: 0,
   };
@@ -51,6 +56,8 @@ let state: PairsStoreState = {
   previewLoading: false,
   previewError: null,
   watchWarning: null,
+  scheduleError: null,
+  scheduleDescription: null,
 };
 
 const WATCH_INACTIVE_MSG =
@@ -69,6 +76,24 @@ export function getPairsState(): PairsStoreState {
 export function subscribePairs(listener: Listener): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
+}
+
+async function refreshScheduleDescription(pair: FolderPair | null): Promise<void> {
+  if (!pair?.scheduleEnabled || !pair.scheduleCron?.trim()) {
+    state = { ...state, scheduleDescription: null, scheduleError: null };
+    emit();
+    return;
+  }
+
+  const validation = validateCronExpression(pair.scheduleCron);
+  state = {
+    ...state,
+    scheduleError: validation.valid ? null : validation.error ?? "Invalid cron expression",
+    scheduleDescription: validation.valid
+      ? describeCronExpression(pair.scheduleCron)
+      : null,
+  };
+  emit();
 }
 
 async function refreshWatchWarning(pair: FolderPair | null): Promise<void> {
@@ -134,9 +159,12 @@ export function selectPair(id: string): void {
     previewPlan: null,
     previewError: null,
     watchWarning: null,
+    scheduleError: null,
+    scheduleDescription: null,
   };
   emit();
   void refreshWatchWarning(state.editing);
+  void refreshScheduleDescription(state.editing);
 }
 
 export function startNewPair(): void {
@@ -147,6 +175,8 @@ export function startNewPair(): void {
     validationErrors: [],
     error: null,
     watchWarning: null,
+    scheduleError: null,
+    scheduleDescription: null,
   };
   emit();
 }
@@ -160,6 +190,8 @@ export function cancelEdit(): void {
     previewPlan: null,
     previewError: null,
     watchWarning: null,
+    scheduleError: null,
+    scheduleDescription: null,
   };
   emit();
 }
@@ -210,6 +242,9 @@ export function updateEditing(patch: Partial<FolderPair>): void {
   ) {
     void refreshWatchWarning(editing);
   }
+  if ("scheduleEnabled" in patch || "scheduleCron" in patch) {
+    void refreshScheduleDescription(editing);
+  }
 }
 
 export async function pickFolderForSide(
@@ -248,6 +283,17 @@ async function validateEditing(): Promise<boolean> {
     { name, leftPath, rightPath },
     { leftExists, rightExists, pathsEqual },
   );
+
+  if (state.editing.scheduleEnabled) {
+    const cron = state.editing.scheduleCron?.trim() ?? "";
+    const cronValidation = validateCronExpression(cron);
+    if (!cronValidation.valid) {
+      validationErrors.push(
+        cronValidation.error ?? "Invalid schedule cron expression",
+      );
+    }
+  }
+
   state = { ...state, validationErrors };
   emit();
   return validationErrors.length === 0;
@@ -270,20 +316,26 @@ export async function saveEditing(): Promise<boolean> {
 
   try {
     const saved = await pairsApi.savePair(editing);
-    const exists = state.pairs.some((p) => p.id === saved.id);
+    const scheduled = await pairsApi.setSchedule(
+      saved.id,
+      editing.scheduleEnabled,
+      editing.scheduleEnabled ? editing.scheduleCron?.trim() ?? null : null,
+    );
+    const exists = state.pairs.some((p) => p.id === scheduled.id);
     const pairs = exists
-      ? state.pairs.map((p) => (p.id === saved.id ? saved : p))
-      : [...state.pairs, saved];
+      ? state.pairs.map((p) => (p.id === scheduled.id ? scheduled : p))
+      : [...state.pairs, scheduled];
     state = {
       ...state,
       pairs,
-      selectedId: saved.id,
-      editing: { ...saved, filters: { ...saved.filters } },
+      selectedId: scheduled.id,
+      editing: { ...scheduled, filters: { ...scheduled.filters } },
       saving: false,
       validationErrors: [],
     };
     emit();
     await refreshWatchWarning(state.editing);
+    await refreshScheduleDescription(state.editing);
     return true;
   } catch (e) {
     state = {
@@ -341,6 +393,8 @@ export function resetPairsStoreForTests(): void {
     previewLoading: false,
     previewError: null,
     watchWarning: null,
+    scheduleError: null,
+    scheduleDescription: null,
   };
   emit();
 }

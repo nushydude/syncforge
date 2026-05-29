@@ -13,6 +13,10 @@ pub struct FolderPair {
     pub enabled: bool,
     #[serde(default)]
     pub watch_enabled: bool,
+    #[serde(default)]
+    pub schedule_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_cron: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -174,6 +178,8 @@ mod tests {
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
             watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_100_000,
         }

@@ -5,6 +5,7 @@ use tauri::{AppHandle, State};
 use crate::models::FolderPair;
 use crate::persistence::{new_pair_id, PersistenceError};
 use crate::state::AppState;
+use crate::scheduler::refresh_schedule_service;
 use crate::watcher::refresh_watch_service;
 
 #[tauri::command]
@@ -41,6 +42,7 @@ pub fn save_pair(
         .map_err(|e| e.to_string())?;
 
     refresh_watch_service(&app, &state)?;
+    refresh_schedule_service(&app, &state)?;
     Ok(saved)
 }
 
@@ -64,6 +66,7 @@ pub fn delete_pair(
         })?;
 
     refresh_watch_service(&app, &state)?;
+    refresh_schedule_service(&app, &state)?;
     Ok(())
 }
 

@@ -6,7 +6,8 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::engine::{run_pair_impl, RunOptions};
-use crate::models::{ConflictResolution, FolderPair, RunReport};
+use crate::models::{ConflictResolution, FolderPair, RunReport, RunStatus};
+use crate::notifications::notify_sync_report;
 use crate::state::AppState;
 use crate::watcher::release_sync_slot;
 
@@ -47,6 +48,7 @@ pub async fn run_pair(
         conflict_resolutions: options.conflict_resolutions,
     };
 
+    let pair_name = pair.name.clone();
     let db = Arc::clone(&state.db);
     let app_emit = app.clone();
     let cancel_for_run = Arc::clone(&cancel);
@@ -65,7 +67,13 @@ pub async fn run_pair(
     .await
     .map_err(|e| format!("sync run task failed: {e}"))?;
 
-    release_sync_slot(app, &state, &cancel);
+    release_sync_slot(app.clone(), &state, &cancel);
+
+    if let Ok(ref report) = result {
+        if report.status == RunStatus::Completed || report.status == RunStatus::Failed {
+            notify_sync_report(&app, &pair_name, report);
+        }
+    }
 
     result
 }

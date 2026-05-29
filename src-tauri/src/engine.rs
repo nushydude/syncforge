@@ -680,6 +680,8 @@ mod tests {
             conflict_policy: crate::models::ConflictPolicy::NewerWins,
             enabled: true,
             watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
             created_at: 1,
             updated_at: 2,
         };
@@ -740,6 +742,8 @@ mod tests {
             conflict_policy: crate::models::ConflictPolicy::NewerWins,
             enabled: true,
             watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
             created_at: 1,
             updated_at: 2,
         };
@@ -795,6 +799,8 @@ mod tests {
             conflict_policy: crate::models::ConflictPolicy::NewerWins,
             enabled: true,
             watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
             created_at: 1,
             updated_at: 2,
         };
