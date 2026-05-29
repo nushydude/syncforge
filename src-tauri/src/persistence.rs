@@ -157,10 +157,7 @@ impl Database {
             .unwrap_or(false);
 
         if !has_cron {
-            self.conn.execute(
-                "ALTER TABLE pairs ADD COLUMN schedule_cron TEXT",
-                [],
-            )?;
+            self.conn.execute("ALTER TABLE pairs ADD COLUMN schedule_cron TEXT", [])?;
         }
 
         Ok(())
@@ -265,14 +262,11 @@ impl Database {
             ],
         )?;
 
-        self.get_pair(&pair.id)?
-            .ok_or_else(|| PersistenceError::PairNotFound(pair.id.clone()))
+        self.get_pair(&pair.id)?.ok_or_else(|| PersistenceError::PairNotFound(pair.id.clone()))
     }
 
     pub fn delete_pair(&self, id: &str) -> Result<()> {
-        let changed = self
-            .conn
-            .execute("DELETE FROM pairs WHERE id = ?1", params![id])?;
+        let changed = self.conn.execute("DELETE FROM pairs WHERE id = ?1", params![id])?;
         if changed == 0 {
             return Err(PersistenceError::PairNotFound(id.to_string()));
         }
@@ -316,12 +310,7 @@ impl Database {
                 pair_id = excluded.pair_id,
                 captured_at = excluded.captured_at,
                 entries_json = excluded.entries_json",
-            params![
-                snapshot.id,
-                snapshot.pair_id,
-                snapshot.captured_at,
-                entries_json
-            ],
+            params![snapshot.id, snapshot.pair_id, snapshot.captured_at, entries_json],
         )?;
         Ok(())
     }
@@ -399,9 +388,8 @@ impl Database {
                 }
             }
             None => {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT summary_json FROM runs ORDER BY started_at DESC")?;
+                let mut stmt =
+                    self.conn.prepare("SELECT summary_json FROM runs ORDER BY started_at DESC")?;
                 let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
                 for json in rows {
                     reports.push(serde_json::from_str(&json?)?);
@@ -412,9 +400,7 @@ impl Database {
     }
 
     pub fn get_run(&self, run_id: &str) -> Result<Option<RunReport>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT summary_json FROM runs WHERE id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT summary_json FROM runs WHERE id = ?1")?;
         let mut rows = stmt.query(params![run_id])?;
         if let Some(row) = rows.next()? {
             let json: String = row.get(0)?;
@@ -503,9 +489,9 @@ fn str_to_sync_mode(value: &str) -> Result<SyncMode> {
         "synchronize" => Ok(SyncMode::Synchronize),
         "echo" => Ok(SyncMode::Echo),
         "contribute" => Ok(SyncMode::Contribute),
-        other => Err(PersistenceError::Database(rusqlite::Error::InvalidParameterName(
-            other.into(),
-        ))),
+        other => {
+            Err(PersistenceError::Database(rusqlite::Error::InvalidParameterName(other.into())))
+        }
     }
 }
 
@@ -526,9 +512,9 @@ fn str_to_conflict_policy(value: &str) -> Result<ConflictPolicy> {
         "right" => Ok(ConflictPolicy::Right),
         "keepBoth" => Ok(ConflictPolicy::KeepBoth),
         "ask" => Ok(ConflictPolicy::Ask),
-        other => Err(PersistenceError::Database(rusqlite::Error::InvalidParameterName(
-            other.into(),
-        ))),
+        other => {
+            Err(PersistenceError::Database(rusqlite::Error::InvalidParameterName(other.into())))
+        }
     }
 }
 
@@ -721,7 +707,8 @@ mod tests {
         };
         db.save_pair(&pair).expect("save pair");
 
-        let legacy_json = r#"[{"relativePath":"old.txt","size":3,"modifiedSecs":42,"isDir":false}]"#;
+        let legacy_json =
+            r#"[{"relativePath":"old.txt","size":3,"modifiedSecs":42,"isDir":false}]"#;
         db.conn
             .execute(
                 "INSERT INTO snapshots (id, pair_id, captured_at, entries_json) VALUES (?1, ?2, ?3, ?4)",
@@ -826,9 +813,7 @@ mod tests {
         let detail = db.get_run(&run_a_new.run_id).expect("get run").expect("run");
         assert_eq!(detail.status, RunStatus::Failed);
 
-        let items = db
-            .list_run_items(&run_a_new.run_id)
-            .expect("list items");
+        let items = db.list_run_items(&run_a_new.run_id).expect("list items");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].path, "notes.txt");
     }

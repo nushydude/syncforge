@@ -34,15 +34,11 @@ pub struct DebounceScheduler {
 
 impl DebounceScheduler {
     pub fn new(delay: Duration) -> Self {
-        Self {
-            delay,
-            deadlines: HashMap::new(),
-        }
+        Self { delay, deadlines: HashMap::new() }
     }
 
     pub fn touch(&mut self, pair_id: &str, now: Instant) {
-        self.deadlines
-            .insert(pair_id.to_string(), now + self.delay);
+        self.deadlines.insert(pair_id.to_string(), now + self.delay);
     }
 
     /// Returns pair ids whose debounce period has elapsed and removes them.
@@ -90,11 +86,7 @@ fn build_roots(pairs: &[FolderPair]) -> Vec<WatchedRoots> {
             let left = PathBuf::from(path_normalization::to_long_path(&pair.left_path));
             let right = PathBuf::from(path_normalization::to_long_path(&pair.right_path));
             if left.exists() && right.exists() {
-                Some(WatchedRoots {
-                    pair_id: pair.id.clone(),
-                    left,
-                    right,
-                })
+                Some(WatchedRoots { pair_id: pair.id.clone(), left, right })
             } else {
                 None
             }
@@ -103,9 +95,7 @@ fn build_roots(pairs: &[FolderPair]) -> Vec<WatchedRoots> {
 }
 
 fn plan_has_conflicts(actions: &[SyncAction]) -> bool {
-    actions
-        .iter()
-        .any(|a| matches!(a, SyncAction::Conflict { .. }))
+    actions.iter().any(|a| matches!(a, SyncAction::Conflict { .. }))
 }
 
 pub(crate) fn enqueue_pending_watch_sync(state: &AppState, pair_id: impl Into<String>) {
@@ -115,11 +105,7 @@ pub(crate) fn enqueue_pending_watch_sync(state: &AppState, pair_id: impl Into<St
 }
 
 /// Clears the active sync slot when it matches `slot`, then starts any queued watch syncs.
-pub(crate) fn release_sync_slot(
-    app: AppHandle,
-    state: &Arc<AppState>,
-    slot: &Arc<AtomicBool>,
-) {
+pub(crate) fn release_sync_slot(app: AppHandle, state: &Arc<AppState>, slot: &Arc<AtomicBool>) {
     let pending: Vec<String> = {
         let mut flag_guard = match state.cancel_flag.lock() {
             Ok(g) => g,
@@ -192,28 +178,17 @@ fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: String) {
                 ..Default::default()
             };
 
-            run_pair_impl(
-                db.as_ref(),
-                &pair,
-                options,
-                &cancel,
-                |progress| {
-                    let _ = app_emit.emit("sync://progress", &progress);
-                },
-            )?;
+            run_pair_impl(db.as_ref(), &pair, options, &cancel, |progress| {
+                let _ = app_emit.emit("sync://progress", &progress);
+            })?;
             Ok(())
         })();
 
         release_sync_slot(app_emit.clone(), &state, &cancel);
 
         if let Err(e) = run_result {
-            let _ = app_emit.emit(
-                "sync://watch-skipped",
-                &WatchSkippedPayload {
-                    pair_id,
-                    reason: e,
-                },
-            );
+            let _ =
+                app_emit.emit("sync://watch-skipped", &WatchSkippedPayload { pair_id, reason: e });
         }
     });
 }
@@ -225,12 +200,8 @@ pub struct WatchService {
 
 impl WatchService {
     pub fn start(app: AppHandle, state: Arc<AppState>) -> Result<Self, String> {
-        let pairs = state
-            .db
-            .lock()
-            .map_err(|e| e.to_string())?
-            .list_pairs()
-            .map_err(|e| e.to_string())?;
+        let pairs =
+            state.db.lock().map_err(|e| e.to_string())?.list_pairs().map_err(|e| e.to_string())?;
         let roots = Arc::new(Mutex::new(build_roots(&pairs)));
         let (event_tx, event_rx) = mpsc::channel::<String>();
 
@@ -239,8 +210,7 @@ impl WatchService {
         let app_debounce = app.clone();
         let state_debounce = Arc::clone(&state);
         let debounce_thread = std::thread::spawn(move || {
-            let mut scheduler =
-                DebounceScheduler::new(Duration::from_millis(DEBOUNCE_MS));
+            let mut scheduler = DebounceScheduler::new(Duration::from_millis(DEBOUNCE_MS));
             loop {
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(pair_id) => scheduler.touch(&pair_id, Instant::now()),
@@ -258,10 +228,7 @@ impl WatchService {
             }
         });
 
-        Ok(Self {
-            _watcher: watcher,
-            _debounce_thread: debounce_thread,
-        })
+        Ok(Self { _watcher: watcher, _debounce_thread: debounce_thread })
     }
 
     fn build_watcher(
@@ -276,9 +243,7 @@ impl WatchService {
                 };
                 if !matches!(
                     event.kind,
-                    EventKind::Create(_)
-                        | EventKind::Modify(_)
-                        | EventKind::Remove(_)
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 ) {
                     return;
                 }
@@ -382,10 +347,7 @@ mod tests {
             left: PathBuf::from(r"\\?\UNC\server\share\left"),
             right: PathBuf::from(r"C:\Pairs\right"),
         }];
-        let ids = pairs_for_path(
-            &roots,
-            Path::new(r"\\server\share\left\sub\file.txt"),
-        );
+        let ids = pairs_for_path(&roots, Path::new(r"\\server\share\left\sub\file.txt"));
         assert_eq!(ids, vec!["pair-1".to_string()]);
 
         let ids = pairs_for_path(&roots, Path::new(r"c:\pairs\right\doc.txt"));
@@ -406,12 +368,8 @@ mod tests {
         enqueue_pending_watch_sync(&state, "pair-a");
         enqueue_pending_watch_sync(&state, "pair-b");
 
-        let mut pending = state
-            .pending_watch_syncs
-            .lock()
-            .expect("lock")
-            .drain()
-            .collect::<Vec<_>>();
+        let mut pending =
+            state.pending_watch_syncs.lock().expect("lock").drain().collect::<Vec<_>>();
         pending.sort();
         assert_eq!(pending, vec!["pair-a".to_string(), "pair-b".to_string()]);
     }

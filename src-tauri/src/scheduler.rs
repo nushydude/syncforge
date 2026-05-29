@@ -46,11 +46,7 @@ fn build_scheduled_pairs(pairs: &[FolderPair]) -> Vec<ScheduledPair> {
         if !pair.enabled || !pair.schedule_enabled {
             continue;
         }
-        let Some(cron) = pair
-            .schedule_cron
-            .as_ref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
+        let Some(cron) = pair.schedule_cron.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
         else {
             continue;
         };
@@ -71,9 +67,7 @@ fn build_scheduled_pairs(pairs: &[FolderPair]) -> Vec<ScheduledPair> {
 }
 
 fn plan_has_conflicts(actions: &[SyncAction]) -> bool {
-    actions
-        .iter()
-        .any(|a| matches!(a, SyncAction::Conflict { .. }))
+    actions.iter().any(|a| matches!(a, SyncAction::Conflict { .. }))
 }
 
 fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: String, pair_name: String) {
@@ -126,15 +120,9 @@ fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: String, pai
                 ..Default::default()
             };
 
-            let report = run_pair_impl(
-                db.as_ref(),
-                &pair,
-                options,
-                &cancel,
-                |progress| {
-                    let _ = app_emit.emit("sync://progress", &progress);
-                },
-            )?;
+            let report = run_pair_impl(db.as_ref(), &pair, options, &cancel, |progress| {
+                let _ = app_emit.emit("sync://progress", &progress);
+            })?;
 
             if report.status == RunStatus::Completed || report.status == RunStatus::Failed {
                 notify_sync_report(&app_emit, &pair_name, &report);
@@ -189,14 +177,16 @@ impl ScheduleService {
                     .collect();
 
                 for (pair_id, pair_name) in due {
-                    run_scheduled_sync(app_task.clone(), Arc::clone(&state_task), pair_id, pair_name);
+                    run_scheduled_sync(
+                        app_task.clone(),
+                        Arc::clone(&state_task),
+                        pair_id,
+                        pair_name,
+                    );
                 }
 
-                let sleep_until = scheduled
-                    .iter()
-                    .map(|entry| entry.next_run)
-                    .filter(|next| *next > now)
-                    .min();
+                let sleep_until =
+                    scheduled.iter().map(|entry| entry.next_run).filter(|next| *next > now).min();
 
                 let sleep_for = sleep_until
                     .map(|next| {

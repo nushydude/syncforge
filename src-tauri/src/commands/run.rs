@@ -62,15 +62,9 @@ pub async fn run_pair(
     let cancel_for_run = Arc::clone(&cancel);
 
     let result = tauri::async_runtime::spawn_blocking(move || {
-        run_pair_impl(
-            db.as_ref(),
-            &pair,
-            run_options,
-            &cancel_for_run,
-            |progress| {
-                let _ = app_emit.emit("sync://progress", &progress);
-            },
-        )
+        run_pair_impl(db.as_ref(), &pair, run_options, &cancel_for_run, |progress| {
+            let _ = app_emit.emit("sync://progress", &progress);
+        })
     })
     .await
     .map_err(|e| format!("sync run task failed: {e}"))?;

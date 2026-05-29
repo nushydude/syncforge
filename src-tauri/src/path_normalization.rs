@@ -58,13 +58,18 @@ pub fn path_is_within_root(path: &str, root: &str) -> bool {
 
     #[cfg(not(windows))]
     {
-        let root_prefix = if root_norm.ends_with('/') {
-            root_norm
-        } else {
-            format!("{root_norm}/")
-        };
+        let root_prefix =
+            if root_norm.ends_with('/') { root_norm } else { format!("{root_norm}/") };
         path_norm.starts_with(&root_prefix)
     }
+}
+
+/// Returns true when one folder root is the same as or nested inside the other.
+pub fn pair_roots_nested(left: &str, right: &str) -> bool {
+    if paths_equal(left, right) {
+        return true;
+    }
+    path_is_within_root(left, right) || path_is_within_root(right, left)
 }
 
 /// Compares two paths after normalization (case-insensitive on Windows).
@@ -169,10 +174,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn paths_equal_is_case_insensitive() {
-        assert!(paths_equal(
-            r"C:\Users\Docs\file.txt",
-            r"c:\users\docs\file.txt"
-        ));
+        assert!(paths_equal(r"C:\Users\Docs\file.txt", r"c:\users\docs\file.txt"));
     }
 
     #[cfg(not(windows))]
@@ -195,23 +197,14 @@ mod tests {
         let root = r"\\?\UNC\server\share\sync";
         let event = r"\\server\share\sync\file.txt";
         assert!(path_is_within_root(event, root));
-        assert!(!path_is_within_root(
-            r"\\server\share\other\file.txt",
-            root
-        ));
+        assert!(!path_is_within_root(r"\\server\share\other\file.txt", root));
     }
 
     #[cfg(windows)]
     #[test]
     fn path_is_within_root_is_case_insensitive() {
-        assert!(path_is_within_root(
-            r"C:\Users\Docs\file.txt",
-            r"c:\users\docs"
-        ));
-        assert!(!path_is_within_root(
-            r"C:\Users\Documents\file.txt",
-            r"c:\users\docs"
-        ));
+        assert!(path_is_within_root(r"C:\Users\Docs\file.txt", r"c:\users\docs"));
+        assert!(!path_is_within_root(r"C:\Users\Documents\file.txt", r"c:\users\docs"));
     }
 
     #[cfg(not(windows))]
@@ -219,5 +212,23 @@ mod tests {
     fn path_is_within_root_respects_directory_boundary() {
         assert!(path_is_within_root("/tmp/a/b", "/tmp/a"));
         assert!(!path_is_within_root("/tmp/ab", "/tmp/a"));
+    }
+
+    #[test]
+    fn pair_roots_nested_detects_subfolder() {
+        assert!(pair_roots_nested(r"C:\Users\Docs\Projects", r"C:\Users\Docs"));
+        assert!(pair_roots_nested(r"C:\Users\Docs", r"C:\Users\Docs\Projects"));
+    }
+
+    #[test]
+    fn pair_roots_nested_rejects_sibling_paths() {
+        assert!(!pair_roots_nested(r"C:\Users\Docs", r"C:\Users\Photos"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn pair_roots_nested_respects_directory_boundary() {
+        assert!(!pair_roots_nested("/tmp/ab", "/tmp/a"));
+        assert!(pair_roots_nested("/tmp/a/b", "/tmp/a"));
     }
 }

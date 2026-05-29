@@ -55,33 +55,14 @@ pub struct FileEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum SyncAction {
-    CopyLeftToRight {
-        path: String,
-    },
-    CopyRightToLeft {
-        path: String,
-    },
-    DeleteLeft {
-        path: String,
-    },
-    DeleteRight {
-        path: String,
-    },
-    CreateDirLeft {
-        path: String,
-    },
-    CreateDirRight {
-        path: String,
-    },
-    Conflict {
-        path: String,
-        left: FileEntry,
-        right: FileEntry,
-    },
-    Skip {
-        path: String,
-        reason: String,
-    },
+    CopyLeftToRight { path: String },
+    CopyRightToLeft { path: String },
+    DeleteLeft { path: String },
+    DeleteRight { path: String },
+    CreateDirLeft { path: String },
+    CreateDirRight { path: String },
+    Conflict { path: String, left: FileEntry, right: FileEntry },
+    Skip { path: String, reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,7 +73,14 @@ pub struct SyncPlan {
     pub scanned_left: u32,
     pub scanned_right: u32,
     #[serde(default)]
+    pub scan_skipped_left: u32,
+    #[serde(default)]
+    pub scan_skipped_right: u32,
+    #[serde(default)]
     pub scan_warnings: Vec<String>,
+    /// When true, destructive sync modes must not run until the user resolves scan issues.
+    #[serde(default)]
+    pub requires_attention: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,10 +162,7 @@ mod tests {
             left_path: r"C:\Users\me\Documents".into(),
             right_path: r"D:\Backup\Documents".into(),
             mode: SyncMode::Echo,
-            filters: Filters {
-                include: vec!["*.txt".into()],
-                exclude: vec!["*.tmp".into()],
-            },
+            filters: Filters { include: vec!["*.txt".into()], exclude: vec!["*.tmp".into()] },
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
             watch_enabled: false,
@@ -201,9 +186,7 @@ mod tests {
         let plan = SyncPlan {
             pair_id: "pair-1".into(),
             actions: vec![
-                SyncAction::CopyLeftToRight {
-                    path: "notes.txt".into(),
-                },
+                SyncAction::CopyLeftToRight { path: "notes.txt".into() },
                 SyncAction::Conflict {
                     path: "report.doc".into(),
                     left: FileEntry {
@@ -226,7 +209,10 @@ mod tests {
             ],
             scanned_left: 10,
             scanned_right: 12,
+            scan_skipped_left: 0,
+            scan_skipped_right: 0,
             scan_warnings: vec![],
+            requires_attention: false,
         };
         let json = serde_json::to_string(&plan).expect("serialize");
         let back: SyncPlan = serde_json::from_str(&json).expect("deserialize");

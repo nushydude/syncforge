@@ -5,6 +5,7 @@ use crate::hashing;
 use crate::models::{
     ConflictPolicy, ConflictResolution, FileEntry, SyncAction, SyncMode, SyncPlan,
 };
+use crate::scanner::ScanIntegrity;
 
 /// Options for comparing file entries during sync planning.
 #[derive(Debug, Clone)]
@@ -39,12 +40,10 @@ pub fn build_sync_plan(
     left: &[FileEntry],
     right: &[FileEntry],
     snapshot: Option<&[FileEntry]>,
-    scan_warnings: Vec<String>,
+    scan: ScanIntegrity,
     diff_options: DiffOptions,
 ) -> SyncPlan {
-    let ctx = DiffContext {
-        options: &diff_options,
-    };
+    let ctx = DiffContext { options: &diff_options };
     let left_map = entries_map(left);
     let right_map = entries_map(right);
     let snapshot_map = snapshot.map(entries_map).unwrap_or_default();
@@ -79,7 +78,10 @@ pub fn build_sync_plan(
         actions,
         scanned_left: left.len() as u32,
         scanned_right: right.len() as u32,
-        scan_warnings,
+        scan_skipped_left: scan.skipped_left,
+        scan_skipped_right: scan.skipped_right,
+        scan_warnings: scan.warnings,
+        requires_attention: scan.requires_attention,
     }
 }
 
@@ -92,29 +94,19 @@ fn plan_echo(
 ) {
     match (left, right) {
         (Some(l), None) if l.is_dir => {
-            actions.push(SyncAction::CreateDirRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CreateDirRight { path: path.to_string() });
         }
         (Some(l), None) if !l.is_dir => {
-            actions.push(SyncAction::CopyLeftToRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
         (Some(l), Some(r)) if entries_differ(l, r, ctx) && !l.is_dir => {
-            actions.push(SyncAction::CopyLeftToRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
         (Some(l), Some(r)) if l.is_dir && !r.is_dir => {
-            actions.push(SyncAction::CreateDirRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CreateDirRight { path: path.to_string() });
         }
         (None, Some(_)) => {
-            actions.push(SyncAction::DeleteRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::DeleteRight { path: path.to_string() });
         }
         _ => {}
     }
@@ -129,24 +121,16 @@ fn plan_contribute(
 ) {
     match (left, right) {
         (Some(l), None) if l.is_dir => {
-            actions.push(SyncAction::CreateDirRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CreateDirRight { path: path.to_string() });
         }
         (Some(l), None) if !l.is_dir => {
-            actions.push(SyncAction::CopyLeftToRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
         (Some(l), Some(r)) if entries_differ(l, r, ctx) && !l.is_dir => {
-            actions.push(SyncAction::CopyLeftToRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
         (Some(l), Some(r)) if l.is_dir && !r.is_dir => {
-            actions.push(SyncAction::CreateDirRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CreateDirRight { path: path.to_string() });
         }
         (None, Some(_)) => {
             actions.push(SyncAction::Skip {
@@ -169,36 +153,16 @@ fn plan_synchronize(
 ) {
     match (left, right) {
         (Some(l), None) if l.is_dir => {
-            actions.push(SyncAction::CreateDirRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CreateDirRight { path: path.to_string() });
         }
         (Some(l), None) if !l.is_dir => {
-            plan_one_sided_file(
-                actions,
-                path,
-                l,
-                true,
-                snapshot,
-                conflict_policy,
-                ctx,
-            );
+            plan_one_sided_file(actions, path, l, true, snapshot, conflict_policy, ctx);
         }
         (None, Some(r)) if r.is_dir => {
-            actions.push(SyncAction::CreateDirLeft {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CreateDirLeft { path: path.to_string() });
         }
         (None, Some(r)) if !r.is_dir => {
-            plan_one_sided_file(
-                actions,
-                path,
-                r,
-                false,
-                snapshot,
-                conflict_policy,
-                ctx,
-            );
+            plan_one_sided_file(actions, path, r, false, snapshot, conflict_policy, ctx);
         }
         (Some(l), Some(r)) if l.is_dir && r.is_dir => {}
         (Some(l), Some(r)) if !l.is_dir && !r.is_dir => {
@@ -214,14 +178,10 @@ fn plan_synchronize(
             }
         }
         (Some(l), Some(r)) if l.is_dir && !r.is_dir => {
-            actions.push(SyncAction::CreateDirRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CreateDirRight { path: path.to_string() });
         }
         (Some(l), Some(r)) if !l.is_dir && r.is_dir => {
-            actions.push(SyncAction::CreateDirLeft {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CreateDirLeft { path: path.to_string() });
         }
         _ => {}
     }
@@ -240,24 +200,16 @@ fn plan_one_sided_file(
     match snapshot {
         None => {
             if present_is_left {
-                actions.push(SyncAction::CopyLeftToRight {
-                    path: path.to_string(),
-                });
+                actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
             } else {
-                actions.push(SyncAction::CopyRightToLeft {
-                    path: path.to_string(),
-                });
+                actions.push(SyncAction::CopyRightToLeft { path: path.to_string() });
             }
         }
         Some(snap) if entries_match(snap, present, ctx) => {
             if present_is_left {
-                actions.push(SyncAction::DeleteRight {
-                    path: path.to_string(),
-                });
+                actions.push(SyncAction::DeleteRight { path: path.to_string() });
             } else {
-                actions.push(SyncAction::DeleteLeft {
-                    path: path.to_string(),
-                });
+                actions.push(SyncAction::DeleteLeft { path: path.to_string() });
             }
         }
         Some(snap) => {
@@ -306,14 +258,10 @@ fn apply_conflict_policy(
             push_newer_wins_copy(actions, path, left, right);
         }
         ConflictPolicy::Left => {
-            actions.push(SyncAction::CopyLeftToRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
         ConflictPolicy::Right => {
-            actions.push(SyncAction::CopyRightToLeft {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CopyRightToLeft { path: path.to_string() });
         }
         ConflictPolicy::KeepBoth => {
             actions.push(SyncAction::Skip {
@@ -332,20 +280,14 @@ fn push_newer_wins_copy(
 ) {
     match compare_newer(left, right) {
         Some(true) => {
-            actions.push(SyncAction::CopyLeftToRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
         Some(false) => {
-            actions.push(SyncAction::CopyRightToLeft {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CopyRightToLeft { path: path.to_string() });
         }
         None => {
             // Equal mtime (sec + nanos) and hash tie: prefer left.
-            actions.push(SyncAction::CopyLeftToRight {
-                path: path.to_string(),
-            });
+            actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
     }
 }
@@ -389,16 +331,14 @@ fn ensure_parent_dirs(
         match action {
             SyncAction::CopyLeftToRight { path } | SyncAction::CreateDirRight { path } => {
                 for parent in parent_paths(path) {
-                    if !right.contains_key(&parent) && left.get(&parent).is_some_and(|e| e.is_dir)
-                    {
+                    if !right.contains_key(&parent) && left.get(&parent).is_some_and(|e| e.is_dir) {
                         needed_right.insert(parent);
                     }
                 }
             }
             SyncAction::CopyRightToLeft { path } | SyncAction::CreateDirLeft { path } => {
                 for parent in parent_paths(path) {
-                    if !left.contains_key(&parent) && right.get(&parent).is_some_and(|e| e.is_dir)
-                    {
+                    if !left.contains_key(&parent) && right.get(&parent).is_some_and(|e| e.is_dir) {
                         needed_left.insert(parent);
                     }
                 }
@@ -459,10 +399,7 @@ fn action_path(action: &SyncAction) -> &str {
 }
 
 fn entries_map(entries: &[FileEntry]) -> HashMap<String, FileEntry> {
-    entries
-        .iter()
-        .map(|e| (e.relative_path.clone(), e.clone()))
-        .collect()
+    entries.iter().map(|e| (e.relative_path.clone(), e.clone())).collect()
 }
 
 fn collect_paths(
@@ -527,20 +464,14 @@ pub fn resolve_conflict_action(
     _right: &FileEntry,
 ) -> SyncAction {
     match resolution {
-        ConflictResolution::Left => SyncAction::CopyLeftToRight {
-            path: path.to_string(),
-        },
-        ConflictResolution::Right => SyncAction::CopyRightToLeft {
-            path: path.to_string(),
-        },
-        ConflictResolution::KeepBoth => SyncAction::Skip {
-            path: path.to_string(),
-            reason: "keep both (user choice)".into(),
-        },
-        ConflictResolution::Skip => SyncAction::Skip {
-            path: path.to_string(),
-            reason: "skipped by user".into(),
-        },
+        ConflictResolution::Left => SyncAction::CopyLeftToRight { path: path.to_string() },
+        ConflictResolution::Right => SyncAction::CopyRightToLeft { path: path.to_string() },
+        ConflictResolution::KeepBoth => {
+            SyncAction::Skip { path: path.to_string(), reason: "keep both (user choice)".into() }
+        }
+        ConflictResolution::Skip => {
+            SyncAction::Skip { path: path.to_string(), reason: "skipped by user".into() }
+        }
     }
 }
 
@@ -623,21 +554,15 @@ mod tests {
     }
 
     fn has_delete_right(plan: &SyncPlan, path: &str) -> bool {
-        plan.actions
-            .iter()
-            .any(|a| matches!(a, SyncAction::DeleteRight { path: p } if p == path))
+        plan.actions.iter().any(|a| matches!(a, SyncAction::DeleteRight { path: p } if p == path))
     }
 
     fn has_conflict(plan: &SyncPlan, path: &str) -> bool {
-        plan.actions
-            .iter()
-            .any(|a| matches!(a, SyncAction::Conflict { path: p, .. } if p == path))
+        plan.actions.iter().any(|a| matches!(a, SyncAction::Conflict { path: p, .. } if p == path))
     }
 
     fn has_delete_left(plan: &SyncPlan, path: &str) -> bool {
-        plan.actions
-            .iter()
-            .any(|a| matches!(a, SyncAction::DeleteLeft { path: p } if p == path))
+        plan.actions.iter().any(|a| matches!(a, SyncAction::DeleteLeft { path: p } if p == path))
     }
 
     fn plan(
@@ -654,7 +579,7 @@ mod tests {
             left,
             right,
             snapshot,
-            vec![],
+            ScanIntegrity::default(),
             DiffOptions::default(),
         )
     }
@@ -693,9 +618,10 @@ mod tests {
             &[file("a.txt", 1, 1), file("extra.txt", 2, 2)],
             None,
         );
-        assert!(plan.actions.iter().any(|a| {
-            matches!(a, SyncAction::Skip { path, .. } if path == "extra.txt")
-        }));
+        assert!(plan
+            .actions
+            .iter()
+            .any(|a| { matches!(a, SyncAction::Skip { path, .. } if path == "extra.txt") }));
         assert!(!has_delete_right(&plan, "extra.txt"));
     }
 
@@ -807,13 +733,8 @@ mod tests {
     #[test]
     fn identical_files_produce_no_actions_in_echo() {
         let entry = file("same.txt", 1, 1);
-        let plan = plan(
-            SyncMode::Echo,
-            ConflictPolicy::NewerWins,
-            &[entry.clone()],
-            &[entry],
-            None,
-        );
+        let plan =
+            plan(SyncMode::Echo, ConflictPolicy::NewerWins, &[entry.clone()], &[entry], None);
         assert!(plan.actions.is_empty());
     }
 
@@ -933,13 +854,18 @@ mod tests {
             &[file("a.txt", 1, 1)],
             &[file("b.txt", 1, 1)],
             None,
-            vec!["left: 2 paths skipped".into()],
+            ScanIntegrity {
+                warnings: vec!["left: 2 paths skipped".into()],
+                skipped_left: 2,
+                ..ScanIntegrity::default()
+            },
             DiffOptions::default(),
         );
         assert_eq!(plan.pair_id, "pair-99");
         assert_eq!(plan.scanned_left, 1);
         assert_eq!(plan.scanned_right, 1);
         assert_eq!(plan.scan_warnings.len(), 1);
+        assert_eq!(plan.scan_skipped_left, 2);
     }
 
     #[test]
@@ -977,7 +903,7 @@ mod tests {
             &left,
             &right,
             None,
-            vec![],
+            ScanIntegrity::default(),
             DiffOptions {
                 left_root: Some(left_root.clone()),
                 right_root: Some(right_root.clone()),
@@ -994,7 +920,7 @@ mod tests {
             &left,
             &right,
             None,
-            vec![],
+            ScanIntegrity::default(),
             DiffOptions {
                 left_root: Some(left_root),
                 right_root: Some(right_root),

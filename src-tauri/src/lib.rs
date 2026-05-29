@@ -13,6 +13,7 @@ mod watcher;
 
 use std::sync::Arc;
 
+use scheduler::refresh_schedule_service;
 use state::AppState;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -20,7 +21,6 @@ use tauri::{
     Manager, Window, WindowEvent,
 };
 use watcher::refresh_watch_service;
-use scheduler::refresh_schedule_service;
 
 /// When the user minimizes the window, hide it and leave the app in the tray.
 fn minimize_to_tray(window: &Window) {
@@ -43,8 +43,7 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             let app_state = Arc::new(
-                AppState::new(data_dir)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+                AppState::new(data_dir).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
             );
             app.manage(app_state.clone());
 
@@ -53,11 +52,7 @@ pub fn run() {
             let tray_menu = Menu::with_items(app, &[&show_i, &quit_i])?;
 
             let _tray = TrayIconBuilder::with_id("main-tray")
-                .icon(
-                    app.default_window_icon()
-                        .ok_or("missing default window icon")?
-                        .clone(),
-                )
+                .icon(app.default_window_icon().ok_or("missing default window icon")?.clone())
                 .menu(&tray_menu)
                 .tooltip("SyncForge")
                 .on_menu_event(|app, event| match event.id.as_ref() {

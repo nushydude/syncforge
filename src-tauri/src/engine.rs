@@ -11,12 +11,11 @@ use uuid::Uuid;
 use crate::diff::{apply_conflict_resolutions, build_sync_plan, DiffOptions};
 use crate::hashing;
 use crate::models::{
-    ConflictResolution, FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot,
-    SyncAction,
+    ConflictResolution, FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot, SyncAction,
 };
 use crate::path_normalization;
 use crate::persistence::Database;
-use crate::scanner::scan_directory;
+use crate::scanner::{assert_destructive_scan_allowed, scan_directory, ScanIntegrity};
 
 const TEMP_SUFFIX: &str = ".syncforge.tmp";
 
@@ -68,10 +67,8 @@ pub fn join_relative(base: &Path, relative: &str) -> PathBuf {
 }
 
 pub fn temp_copy_path(dest: &Path) -> PathBuf {
-    let name = dest
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".into());
+    let name =
+        dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
     dest.with_file_name(format!("{name}{TEMP_SUFFIX}"))
 }
 
@@ -89,10 +86,7 @@ pub fn action_kind(action: &SyncAction) -> &'static str {
 }
 
 fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 fn ensure_parent(path: &Path) -> io::Result<()> {
@@ -280,18 +274,19 @@ fn run_pair_impl_inner<F>(
 where
     F: FnMut(SyncProgress),
 {
-    let mut progress = |phase: &str, current: u32, total: u32, path: Option<&str>, message: Option<&str>| {
-        emit(SyncProgress {
-            run_id: run_id.to_string(),
-            pair_id: pair.id.clone(),
-            phase: phase.into(),
-            current,
-            total,
-            path: path.map(str::to_string),
-            message: message.map(str::to_string),
-            report: None,
-        });
-    };
+    let mut progress =
+        |phase: &str, current: u32, total: u32, path: Option<&str>, message: Option<&str>| {
+            emit(SyncProgress {
+                run_id: run_id.to_string(),
+                pair_id: pair.id.clone(),
+                phase: phase.into(),
+                current,
+                total,
+                path: path.map(str::to_string),
+                message: message.map(str::to_string),
+                report: None,
+            });
+        };
 
     progress("scanning", 0, 0, None, Some("Scanning folders"));
 
@@ -299,27 +294,17 @@ where
         return finish_cancelled(db, pair, left_root, right_root, report, emit);
     }
 
-    let left_scan = scan_directory(left_root, &pair.filters)
-        .map_err(|e| format!("scan left failed: {e}"))?;
-    let right_scan = scan_directory(right_root, &pair.filters)
-        .map_err(|e| format!("scan right failed: {e}"))?;
+    let left_scan =
+        scan_directory(left_root, &pair.filters).map_err(|e| format!("scan left failed: {e}"))?;
+    let right_scan =
+        scan_directory(right_root, &pair.filters).map_err(|e| format!("scan right failed: {e}"))?;
+
+    assert_destructive_scan_allowed(pair.mode, &left_scan, &right_scan)?;
 
     let snapshot = with_db(db, |db| db.latest_snapshot(&pair.id).map_err(|e| e.to_string()))?;
     let snapshot_entries = snapshot.as_ref().map(|s| s.entries.as_slice());
 
-    let mut scan_warnings = Vec::new();
-    if left_scan.skipped_entries > 0 {
-        scan_warnings.push(format!(
-            "left: skipped {} path(s) (permission denied or unreadable)",
-            left_scan.skipped_entries
-        ));
-    }
-    if right_scan.skipped_entries > 0 {
-        scan_warnings.push(format!(
-            "right: skipped {} path(s) (permission denied or unreadable)",
-            right_scan.skipped_entries
-        ));
-    }
+    let scan = ScanIntegrity::from_sides(&left_scan, &right_scan);
 
     let mut plan = build_sync_plan(
         &pair.id,
@@ -328,7 +313,7 @@ where
         &left_scan.entries,
         &right_scan.entries,
         snapshot_entries,
-        scan_warnings,
+        scan,
         DiffOptions {
             left_root: Some(left_root.to_path_buf()),
             right_root: Some(right_root.to_path_buf()),
@@ -341,11 +326,8 @@ where
         apply_conflict_resolutions(&mut plan.actions, &options.conflict_resolutions);
     }
 
-    let executable: Vec<&SyncAction> = plan
-        .actions
-        .iter()
-        .filter(|a| !matches!(a, SyncAction::Skip { .. }))
-        .collect();
+    let executable: Vec<&SyncAction> =
+        plan.actions.iter().filter(|a| !matches!(a, SyncAction::Skip { .. })).collect();
     let total = executable.len() as u32;
 
     progress("running", 0, total, None, Some("Applying sync actions"));
@@ -382,11 +364,7 @@ where
                     action: kind.to_string(),
                     status: "completed".into(),
                     message: None,
-                    bytes: if stats.bytes > 0 {
-                        Some(stats.bytes)
-                    } else {
-                        None
-                    },
+                    bytes: if stats.bytes > 0 { Some(stats.bytes) } else { None },
                 };
                 with_db(db, |db| db.insert_run_item(&run_item).map_err(|e| e.to_string()))?;
             }
@@ -399,11 +377,7 @@ where
                     run_id: run_id.to_string(),
                     path: path.to_string(),
                     action: kind.to_string(),
-                    status: if is_conflict {
-                        "skipped".into()
-                    } else {
-                        "failed".into()
-                    },
+                    status: if is_conflict { "skipped".into() } else { "failed".into() },
                     message: Some(msg),
                     bytes: None,
                 };
@@ -466,61 +440,37 @@ fn execute_action(
     match action {
         SyncAction::CreateDirLeft { path } => {
             create_directory(&join_relative(left_root, path)).map_err(|e| e.to_string())?;
-            Ok(ActionStats {
-                copied: 0,
-                deleted: 0,
-                bytes: 0,
-            })
+            Ok(ActionStats { copied: 0, deleted: 0, bytes: 0 })
         }
         SyncAction::CreateDirRight { path } => {
             create_directory(&join_relative(right_root, path)).map_err(|e| e.to_string())?;
-            Ok(ActionStats {
-                copied: 0,
-                deleted: 0,
-                bytes: 0,
-            })
+            Ok(ActionStats { copied: 0, deleted: 0, bytes: 0 })
         }
         SyncAction::CopyLeftToRight { path } => {
             let src = join_relative(left_root, path);
             let dest = join_relative(right_root, path);
             let bytes = safe_copy_file(&src, &dest, verify_hashes).map_err(|e| e.to_string())?;
-            Ok(ActionStats {
-                copied: 1,
-                deleted: 0,
-                bytes,
-            })
+            Ok(ActionStats { copied: 1, deleted: 0, bytes })
         }
         SyncAction::CopyRightToLeft { path } => {
             let src = join_relative(right_root, path);
             let dest = join_relative(left_root, path);
             let bytes = safe_copy_file(&src, &dest, verify_hashes).map_err(|e| e.to_string())?;
-            Ok(ActionStats {
-                copied: 1,
-                deleted: 0,
-                bytes,
-            })
+            Ok(ActionStats { copied: 1, deleted: 0, bytes })
         }
         SyncAction::DeleteLeft { path } => {
             delete_path(&join_relative(left_root, path), use_recycle_bin)
                 .map_err(|e| e.to_string())?;
-            Ok(ActionStats {
-                copied: 0,
-                deleted: 1,
-                bytes: 0,
-            })
+            Ok(ActionStats { copied: 0, deleted: 1, bytes: 0 })
         }
         SyncAction::DeleteRight { path } => {
             delete_path(&join_relative(right_root, path), use_recycle_bin)
                 .map_err(|e| e.to_string())?;
-            Ok(ActionStats {
-                copied: 0,
-                deleted: 1,
-                bytes: 0,
-            })
+            Ok(ActionStats { copied: 0, deleted: 1, bytes: 0 })
         }
-        SyncAction::Conflict { path, .. } => Err(format!(
-            "unresolved conflict at {path} (resolve in a future story)"
-        )),
+        SyncAction::Conflict { path, .. } => {
+            Err(format!("unresolved conflict at {path} (resolve in a future story)"))
+        }
         SyncAction::Skip { path, reason } => Err(format!("skipped {path}: {reason}")),
     }
 }
@@ -604,10 +554,7 @@ mod tests {
     #[test]
     fn temp_copy_path_appends_suffix() {
         let dest = PathBuf::from(r"C:\data\file.txt");
-        assert_eq!(
-            temp_copy_path(&dest),
-            PathBuf::from(r"C:\data\file.txt.syncforge.tmp")
-        );
+        assert_eq!(temp_copy_path(&dest), PathBuf::from(r"C:\data\file.txt.syncforge.tmp"));
     }
 
     #[test]
@@ -673,10 +620,7 @@ mod tests {
         commit_temp_file(&temp, &dest).expect_err("commit should fail");
 
         fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).expect("restore dest");
-        assert_eq!(
-            fs::read_to_string(&dest).expect("read dest"),
-            "original"
-        );
+        assert_eq!(fs::read_to_string(&dest).expect("read dest"), "original");
         assert!(temp.exists());
     }
 
@@ -742,21 +686,14 @@ mod tests {
             created_at: 1,
             updated_at: 2,
         };
-        db.lock()
-            .expect("lock")
-            .save_pair(&pair)
-            .expect("save pair");
+        db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
         let cancel = AtomicBool::new(false);
         let mut events = Vec::new();
         let report = run_pair_impl(
             &db,
             &pair,
-            RunOptions {
-                verify_hashes: true,
-                use_recycle_bin: false,
-                ..Default::default()
-            },
+            RunOptions { verify_hashes: true, use_recycle_bin: false, ..Default::default() },
             &cancel,
             |p| events.push(p.phase.clone()),
         )
@@ -765,13 +702,7 @@ mod tests {
         assert_eq!(report.status, RunStatus::Completed);
         assert!(right_dir.join("sync.txt").exists());
         assert!(!right_dir.join("orphan.txt").exists());
-        assert!(
-            db.lock()
-                .expect("lock")
-                .latest_snapshot(&pair.id)
-                .expect("snapshot")
-                .is_some()
-        );
+        assert!(db.lock().expect("lock").latest_snapshot(&pair.id).expect("snapshot").is_some());
         assert!(events.contains(&"completed".to_string()));
     }
 
@@ -788,11 +719,7 @@ mod tests {
         let pair = crate::models::FolderPair {
             id: crate::persistence::new_pair_id(),
             name: "Broken".into(),
-            left_path: data_dir
-                .path()
-                .join("missing-left")
-                .to_string_lossy()
-                .into_owned(),
+            left_path: data_dir.path().join("missing-left").to_string_lossy().into_owned(),
             right_path: right_dir.to_string_lossy().into_owned(),
             mode: crate::models::SyncMode::Echo,
             filters: crate::models::Filters::default(),
@@ -804,20 +731,14 @@ mod tests {
             created_at: 1,
             updated_at: 2,
         };
-        db.lock()
-            .expect("lock")
-            .save_pair(&pair)
-            .expect("save pair");
+        db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
         let cancel = AtomicBool::new(false);
         let mut failed_report: Option<RunReport> = None;
         let err = run_pair_impl(
             &db,
             &pair,
-            RunOptions {
-                use_recycle_bin: false,
-                ..Default::default()
-            },
+            RunOptions { use_recycle_bin: false, ..Default::default() },
             &cancel,
             |p| {
                 if p.phase == "failed" {
@@ -860,19 +781,13 @@ mod tests {
             created_at: 1,
             updated_at: 2,
         };
-        db.lock()
-            .expect("lock")
-            .save_pair(&pair)
-            .expect("save pair");
+        db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
         let cancel = AtomicBool::new(true);
         let report = run_pair_impl(
             &db,
             &pair,
-            RunOptions {
-                use_recycle_bin: false,
-                ..Default::default()
-            },
+            RunOptions { use_recycle_bin: false, ..Default::default() },
             &cancel,
             |_| {},
         )
@@ -911,23 +826,14 @@ mod tests {
             created_at: 1,
             updated_at: 2,
         };
-        db.lock()
-            .expect("lock")
-            .save_pair(&pair)
-            .expect("save pair");
+        db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
         let cancel = AtomicBool::new(false);
-        let report = run_pair_impl(
-            &db,
-            &pair,
-            RunOptions::default(),
-            &cancel,
-            |p| {
-                if p.phase == "running" && p.current >= 1 {
-                    cancel.store(true, Ordering::Relaxed);
-                }
-            },
-        )
+        let report = run_pair_impl(&db, &pair, RunOptions::default(), &cancel, |p| {
+            if p.phase == "running" && p.current >= 1 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        })
         .expect("cancelled run returns report");
 
         assert_eq!(report.status, RunStatus::Cancelled);
@@ -940,11 +846,8 @@ mod tests {
             .expect("snapshot")
             .expect("snapshot saved after partial cancel");
 
-        let snapshot_paths: std::collections::HashSet<_> = snapshot
-            .entries
-            .iter()
-            .map(|e| e.relative_path.as_str())
-            .collect();
+        let snapshot_paths: std::collections::HashSet<_> =
+            snapshot.entries.iter().map(|e| e.relative_path.as_str()).collect();
 
         for path in ["first.txt", "second.txt"] {
             let on_left = left_dir.join(path).exists();
@@ -988,19 +891,13 @@ mod tests {
             created_at: 1,
             updated_at: 2,
         };
-        db.lock()
-            .expect("lock")
-            .save_pair(&pair)
-            .expect("save pair");
+        db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
         let cancel = AtomicBool::new(false);
         let report = run_pair_impl(
             &db,
             &pair,
-            RunOptions {
-                stop_on_error: true,
-                ..Default::default()
-            },
+            RunOptions { stop_on_error: true, ..Default::default() },
             &cancel,
             |_| {},
         )
@@ -1013,11 +910,59 @@ mod tests {
             "second copy must not run after first non-conflict failure"
         );
 
-        let items = db
-            .lock()
-            .expect("lock")
-            .list_run_items(&report.run_id)
-            .expect("items");
+        let items = db.lock().expect("lock").list_run_items(&report.run_id).expect("items");
         assert_eq!(items.len(), 1, "only the failing action should be recorded");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_echo_refuses_when_scan_skips_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = TempDir::new().expect("tempdir");
+        let db = Mutex::new(
+            crate::persistence::Database::open(&data_dir.path().join("test.db")).expect("db"),
+        );
+
+        let left_dir = data_dir.path().join("left");
+        let right_dir = data_dir.path().join("right");
+        fs::create_dir_all(&left_dir).expect("mkdir");
+        fs::create_dir_all(&right_dir).expect("mkdir");
+        fs::write(left_dir.join("visible.txt"), "ok").expect("write");
+        let secret = left_dir.join("secret.txt");
+        fs::write(&secret, "hidden").expect("write");
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let pair = crate::models::FolderPair {
+            id: crate::persistence::new_pair_id(),
+            name: "Echo".into(),
+            left_path: left_dir.to_string_lossy().into_owned(),
+            right_path: right_dir.to_string_lossy().into_owned(),
+            mode: crate::models::SyncMode::Echo,
+            filters: crate::models::Filters::default(),
+            conflict_policy: crate::models::ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        db.lock().expect("lock").save_pair(&pair).expect("save pair");
+
+        let cancel = AtomicBool::new(false);
+        let err = run_pair_impl(
+            &db,
+            &pair,
+            RunOptions { use_recycle_bin: false, ..Default::default() },
+            &cancel,
+            |_| {},
+        )
+        .expect_err("run must fail");
+
+        assert!(err.contains("Cannot run Echo sync"));
+        assert!(err.contains("skipped"));
+
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("restore");
     }
 }
