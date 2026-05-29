@@ -51,15 +51,24 @@ function Update-State($patch) {
     $state | ConvertTo-Json -Depth 6 | Set-Content $statePath -Encoding UTF8
 }
 
-# Git: ensure on story branch from main
-git rev-parse --verify main 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    git checkout -b main 2>$null
-    git commit --allow-empty -m "chore: initialize main" 2>$null
+# Git: ensure on story branch from main (git writes to stderr; do not treat as terminating)
+function Invoke-Git {
+    param([string[]]$GitArgs)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & git @GitArgs 2>&1 | Out-Null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    return $code
 }
 
-git checkout main 2>$null
-git checkout -B $branch 2>$null
+if ((Invoke-Git @("rev-parse", "--verify", "main")) -ne 0) {
+    Invoke-Git @("checkout", "-b", "main") | Out-Null
+    Invoke-Git @("commit", "--allow-empty", "-m", "chore: initialize main") | Out-Null
+}
+
+Invoke-Git @("checkout", "main") | Out-Null
+Invoke-Git @("checkout", "-B", $branch) | Out-Null
 
 Update-State @{ status = "implementing"; branch = $branch; iteration = 0 }
 
@@ -158,8 +167,10 @@ if ($appVerdict -ne "YES") {
 }
 
 # Merge story branch into main locally
-git checkout main
-git merge --no-ff $branch -m "merge: $StoryId $($story.title)"
+Invoke-Git @("checkout", "main") | Out-Null
+if ((Invoke-Git @("merge", "--no-ff", $branch, "-m", "merge: $StoryId $($story.title)")) -ne 0) {
+    throw "git merge failed for $StoryId"
+}
 
 Update-State @{ status = "completed"; completedAt = (Get-Date -Format o) }
 Write-Host "[$StoryId] Completed and merged to main."
