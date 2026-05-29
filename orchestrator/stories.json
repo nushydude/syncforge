@@ -1,0 +1,71 @@
+{
+  "project": "SyncForge",
+  "model": "composer-2.5",
+  "maxReviewIterations": 5,
+  "workspace": "C:\\Users\\CDAND\\Projects\\syncforge",
+  "stories": [
+    {
+      "id": "S01",
+      "title": "Project scaffold",
+      "branch": "story/S01-scaffold",
+      "dependsOn": [],
+      "storyFile": "docs/stories/S01-scaffold.md"
+    },
+    {
+      "id": "S02",
+      "title": "Domain models and persistence",
+      "branch": "story/S02-models-persistence",
+      "dependsOn": ["S01"],
+      "storyFile": "docs/stories/S02-models-persistence.md"
+    },
+    {
+      "id": "S03",
+      "title": "Folder pair CRUD UI",
+      "branch": "story/S03-pair-crud",
+      "dependsOn": ["S02"],
+      "storyFile": "docs/stories/S03-pair-crud.md"
+    },
+    {
+      "id": "S04",
+      "title": "Scan, diff, and preview",
+      "branch": "story/S04-scan-diff-preview",
+      "dependsOn": ["S02"],
+      "storyFile": "docs/stories/S04-scan-diff-preview.md"
+    },
+    {
+      "id": "S05",
+      "title": "Sync run engine",
+      "branch": "story/S05-run-engine",
+      "dependsOn": ["S04"],
+      "storyFile": "docs/stories/S05-run-engine.md"
+    },
+    {
+      "id": "S06",
+      "title": "Conflict resolution",
+      "branch": "story/S06-conflicts",
+      "dependsOn": ["S05"],
+      "storyFile": "docs/stories/S06-conflicts.md"
+    },
+    {
+      "id": "S07",
+      "title": "Real-time watch and system tray",
+      "branch": "story/S07-watch-tray",
+      "dependsOn": ["S05"],
+      "storyFile": "docs/stories/S07-watch-tray.md"
+    },
+    {
+      "id": "S08",
+      "title": "Scheduling and notifications",
+      "branch": "story/S08-schedule",
+      "dependsOn": ["S07"],
+      "storyFile": "docs/stories/S08-schedule.md"
+    },
+    {
+      "id": "S09",
+      "title": "History and export",
+      "branch": "story/S09-history",
+      "dependsOn": ["S05"],
+      "storyFile": "docs/stories/S09-history.md"
+    }
+  ]
+}
