@@ -6,11 +6,11 @@ View past sync runs and export reports.
 
 ## Acceptance criteria
 
-- [ ] Commands: `get_history`, `get_run_detail`
-- [ ] `historyStore`, `HistoryView`, `RunDetail` components
-- [ ] `syncStats.ts` aggregates files/bytes/duration; tests
-- [ ] Export run to CSV and JSON from UI
-- [ ] Run list sorted by date, filterable by pair
+- [x] Commands: `get_history`, `get_run_detail`
+- [x] `historyStore`, `HistoryView`, `RunDetail` components
+- [x] `syncStats.ts` aggregates files/bytes/duration; tests
+- [x] Export run to CSV and JSON from UI
+- [x] Run list sorted by date, filterable by pair
 
 ## Depends on
 

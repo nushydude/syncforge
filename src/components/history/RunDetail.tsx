@@ -5,7 +5,6 @@ import {
   formatBytes,
   formatDuration,
   statsFromItems,
-  statsFromReport,
 } from '../../lib/syncStats';
 
 function formatTimestamp(ms: number): string {
@@ -92,8 +91,8 @@ export function RunDetail() {
         <section className="run-detail-errors">
           <h4>Errors</h4>
           <ul>
-            {report.errors.map((message) => (
-              <li key={message}>{message}</li>
+            {report.errors.map((message, index) => (
+              <li key={`${index}-${message}`}>{message}</li>
             ))}
           </ul>
         </section>
@@ -134,8 +133,8 @@ export function RunDetail() {
       </section>
 
       <p className="run-detail-summary">
-        Summary: {statsFromReport(report).filesChanged} file change(s) ·{' '}
-        {formatBytes(report.bytesTransferred)} ·{' '}
+        Summary: {stats.filesChanged} file change(s) ·{' '}
+        {formatBytes(stats.bytesTransferred)} ·{' '}
         {formatDuration(stats.durationMs)}
       </p>
     </article>
