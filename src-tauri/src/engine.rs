@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
-use crate::diff::{apply_conflict_resolutions, build_sync_plan};
+use crate::diff::{apply_conflict_resolutions, build_sync_plan, DiffOptions};
 use crate::hashing;
 use crate::models::{
     ConflictResolution, FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot,
@@ -27,6 +27,10 @@ pub struct RunOptions {
     pub conflict_resolutions: HashMap<String, ConflictResolution>,
     /// When true, the first non-conflict action failure ends the apply loop (manual default).
     pub stop_on_error: bool,
+    /// Hash file contents when metadata matches to catch same-second edits.
+    pub content_hash_compare: bool,
+    /// Maximum file size (bytes) eligible for content hashing during planning.
+    pub content_hash_max_bytes: u64,
 }
 
 impl Default for RunOptions {
@@ -36,6 +40,8 @@ impl Default for RunOptions {
             use_recycle_bin: true,
             conflict_resolutions: HashMap::new(),
             stop_on_error: true,
+            content_hash_compare: true,
+            content_hash_max_bytes: 50 * 1024 * 1024,
         }
     }
 }
@@ -323,6 +329,12 @@ where
         &right_scan.entries,
         snapshot_entries,
         scan_warnings,
+        DiffOptions {
+            left_root: Some(left_root.to_path_buf()),
+            right_root: Some(right_root.to_path_buf()),
+            content_hash_compare: options.content_hash_compare,
+            content_hash_max_bytes: options.content_hash_max_bytes,
+        },
     );
 
     if !options.conflict_resolutions.is_empty() {
@@ -684,6 +696,7 @@ mod tests {
             relative_path: "a.txt".into(),
             size: 2,
             modified_secs: 2,
+            modified_nanos: 0,
             is_dir: false,
             hash: None,
         }];
@@ -691,6 +704,7 @@ mod tests {
             relative_path: "a.txt".into(),
             size: 1,
             modified_secs: 1,
+            modified_nanos: 0,
             is_dir: false,
             hash: None,
         }];

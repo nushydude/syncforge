@@ -2,6 +2,8 @@ export interface FileEntry {
   relativePath: string;
   size: number;
   modifiedSecs: number;
+  /** Subsecond fraction of modifiedSecs (0–999_999_999). Omitted in older snapshots. */
+  modifiedNanos?: number;
   isDir: boolean;
   hash?: string;
 }

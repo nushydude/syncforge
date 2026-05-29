@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tauri::State;
 
-use crate::diff::build_sync_plan;
+use crate::diff::{build_sync_plan, DiffOptions};
 use crate::models::{FolderPair, SyncPlan};
 use crate::path_normalization;
 use crate::persistence::Database;
@@ -57,6 +57,11 @@ pub(crate) fn preview_pair_impl(db: &Database, pair: &FolderPair) -> Result<Sync
         &right_scan.entries,
         snapshot_entries,
         scan_warnings,
+        DiffOptions {
+            left_root: Some(Path::new(&left_path).to_path_buf()),
+            right_root: Some(Path::new(&right_path).to_path_buf()),
+            ..DiffOptions::default()
+        },
     ))
 }
 
@@ -234,6 +239,7 @@ mod tests {
                 relative_path: "both.txt".into(),
                 size: 1,
                 modified_secs: 1,
+                modified_nanos: 0,
                 is_dir: false,
                 hash: None,
             }],

@@ -54,7 +54,8 @@ export function entriesEqual(a: FileEntry, b: FileEntry): boolean {
   return (
     a.isDir === b.isDir &&
     a.size === b.size &&
-    a.modifiedSecs === b.modifiedSecs
+    a.modifiedSecs === b.modifiedSecs &&
+    (a.modifiedNanos ?? 0) === (b.modifiedNanos ?? 0)
   );
 }
 
@@ -153,13 +154,22 @@ export function resolveConflictAction(
       };
     case 'newerWins':
     default: {
+      const leftNanos = left.modifiedNanos ?? 0;
+      const rightNanos = right.modifiedNanos ?? 0;
       if (
         left.modifiedSecs > right.modifiedSecs ||
-        (left.modifiedSecs === right.modifiedSecs && left.size !== right.size)
+        (left.modifiedSecs === right.modifiedSecs &&
+          leftNanos > rightNanos) ||
+        (left.modifiedSecs === right.modifiedSecs &&
+          leftNanos === rightNanos &&
+          left.size !== right.size)
       ) {
         return { kind: 'copyLeftToRight', path };
       }
-      if (right.modifiedSecs > left.modifiedSecs) {
+      if (
+        right.modifiedSecs > left.modifiedSecs ||
+        (right.modifiedSecs === left.modifiedSecs && rightNanos > leftNanos)
+      ) {
         return { kind: 'copyRightToLeft', path };
       }
       return { kind: 'copyLeftToRight', path };

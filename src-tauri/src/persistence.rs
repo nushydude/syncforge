@@ -668,6 +668,7 @@ mod tests {
                 relative_path: "file.txt".into(),
                 size: 5,
                 modified_secs: 9,
+                modified_nanos: 123,
                 is_dir: false,
                 hash: None,
             }],
@@ -698,6 +699,45 @@ mod tests {
             bytes: Some(5),
         };
         db.insert_run_item(&item).expect("insert item");
+    }
+
+    #[test]
+    fn snapshot_loads_entries_without_modified_nanos() {
+        let (_dir, db) = temp_db();
+        let pair = FolderPair {
+            id: new_pair_id(),
+            name: "Legacy".into(),
+            left_path: "/a".into(),
+            right_path: "/b".into(),
+            mode: SyncMode::Echo,
+            filters: Filters::default(),
+            conflict_policy: ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        db.save_pair(&pair).expect("save pair");
+
+        let legacy_json = r#"[{"relativePath":"old.txt","size":3,"modifiedSecs":42,"isDir":false}]"#;
+        db.conn
+            .execute(
+                "INSERT INTO snapshots (id, pair_id, captured_at, entries_json) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    pair.id,
+                    10_i64,
+                    legacy_json,
+                ],
+            )
+            .expect("insert legacy snapshot");
+
+        let loaded = db.latest_snapshot(&pair.id).expect("load").expect("snapshot");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].modified_nanos, 0);
+        assert_eq!(loaded.entries[0].modified_secs, 42);
     }
 
     #[test]
