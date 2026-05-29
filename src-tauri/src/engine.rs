@@ -25,6 +25,19 @@ pub struct RunOptions {
     pub verify_hashes: bool,
     pub use_recycle_bin: bool,
     pub conflict_resolutions: HashMap<String, ConflictResolution>,
+    /// When true, the first non-conflict action failure ends the apply loop (manual default).
+    pub stop_on_error: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            verify_hashes: false,
+            use_recycle_bin: true,
+            conflict_resolutions: HashMap::new(),
+            stop_on_error: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -144,6 +157,35 @@ pub fn create_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)
 }
 
+fn actions_were_applied(report: &RunReport) -> bool {
+    report.files_copied > 0 || report.files_deleted > 0
+}
+
+/// Persist a snapshot from fresh scans so the DB matches disk after partial runs.
+///
+/// Snapshot policy: whenever one or more file operations were applied (including
+/// cancel or stop-on-error), we save a post-run snapshot. Runs that never applied
+/// anything keep the previous snapshot. Run status may still be `Failed` or
+/// `Cancelled` when a snapshot is saved.
+fn save_post_run_snapshot(
+    db: &Mutex<Database>,
+    pair: &FolderPair,
+    left_root: &Path,
+    right_root: &Path,
+) -> Result<(), String> {
+    let left_after = scan_directory(left_root, &pair.filters)
+        .map_err(|e| format!("post-run scan left failed: {e}"))?;
+    let right_after = scan_directory(right_root, &pair.filters)
+        .map_err(|e| format!("post-run scan right failed: {e}"))?;
+    let snapshot = Snapshot {
+        id: Uuid::new_v4().to_string(),
+        pair_id: pair.id.clone(),
+        captured_at: now_millis(),
+        entries: build_snapshot_entries(&left_after.entries, &right_after.entries),
+    };
+    with_db(db, |db| db.save_snapshot(&snapshot).map_err(|e| e.to_string()))
+}
+
 fn build_snapshot_entries(left: &[FileEntry], right: &[FileEntry]) -> Vec<FileEntry> {
     use std::collections::BTreeMap;
     let mut map: BTreeMap<String, FileEntry> = BTreeMap::new();
@@ -248,7 +290,7 @@ where
     progress("scanning", 0, 0, None, Some("Scanning folders"));
 
     if cancel.load(Ordering::Relaxed) {
-        return finish_cancelled(db, report, emit);
+        return finish_cancelled(db, pair, left_root, right_root, report, emit);
     }
 
     let left_scan = scan_directory(left_root, &pair.filters)
@@ -296,9 +338,10 @@ where
 
     progress("running", 0, total, None, Some("Applying sync actions"));
 
+    let mut stopped_on_error = false;
     for (index, action) in executable.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            return finish_cancelled(db, report, emit);
+            return finish_cancelled(db, pair, left_root, right_root, report, emit);
         }
 
         let current = index as u32 + 1;
@@ -338,12 +381,13 @@ where
             Err(e) => {
                 let msg = e.to_string();
                 report.errors.push(format!("{path}: {msg}"));
+                let is_conflict = matches!(action, SyncAction::Conflict { .. });
                 let run_item = RunItem {
                     id: item_id,
                     run_id: run_id.to_string(),
                     path: path.to_string(),
                     action: kind.to_string(),
-                    status: if matches!(action, SyncAction::Conflict { .. }) {
+                    status: if is_conflict {
                         "skipped".into()
                     } else {
                         "failed".into()
@@ -352,30 +396,23 @@ where
                     bytes: None,
                 };
                 with_db(db, |db| db.insert_run_item(&run_item).map_err(|e| e.to_string()))?;
+                if !is_conflict && options.stop_on_error {
+                    stopped_on_error = true;
+                    break;
+                }
             }
         }
     }
 
     if cancel.load(Ordering::Relaxed) {
-        return finish_cancelled(db, report, emit);
+        return finish_cancelled(db, pair, left_root, right_root, report, emit);
     }
 
     progress("scanning", total, total, None, Some("Capturing snapshot"));
 
-    let left_after = scan_directory(left_root, &pair.filters)
-        .map_err(|e| format!("post-run scan left failed: {e}"))?;
-    let right_after = scan_directory(right_root, &pair.filters)
-        .map_err(|e| format!("post-run scan right failed: {e}"))?;
+    save_post_run_snapshot(db, pair, left_root, right_root)?;
 
-    let snapshot = Snapshot {
-        id: Uuid::new_v4().to_string(),
-        pair_id: pair.id.clone(),
-        captured_at: now_millis(),
-        entries: build_snapshot_entries(&left_after.entries, &right_after.entries),
-    };
-    with_db(db, |db| db.save_snapshot(&snapshot).map_err(|e| e.to_string()))?;
-
-    report.status = if report.errors.is_empty() {
+    report.status = if report.errors.is_empty() && !stopped_on_error {
         RunStatus::Completed
     } else {
         RunStatus::Failed
@@ -519,12 +556,18 @@ where
 
 fn finish_cancelled<F>(
     db: &Mutex<Database>,
+    pair: &FolderPair,
+    left_root: &Path,
+    right_root: &Path,
     report: &mut RunReport,
     emit: &mut F,
 ) -> Result<RunReport, String>
 where
     F: FnMut(SyncProgress),
 {
+    if actions_were_applied(report) {
+        save_post_run_snapshot(db, pair, left_root, right_root)?;
+    }
     report.status = RunStatus::Cancelled;
     report.finished_at = Some(now_millis());
     with_db(db, |db| db.save_run(report).map_err(|e| e.to_string()))?;
@@ -698,7 +741,7 @@ mod tests {
             RunOptions {
                 verify_hashes: true,
                 use_recycle_bin: false,
-                conflict_resolutions: HashMap::new(),
+                ..Default::default()
             },
             &cancel,
             |p| events.push(p.phase.clone()),
@@ -758,9 +801,8 @@ mod tests {
             &db,
             &pair,
             RunOptions {
-                verify_hashes: false,
                 use_recycle_bin: false,
-                conflict_resolutions: HashMap::new(),
+                ..Default::default()
             },
             &cancel,
             |p| {
@@ -814,9 +856,8 @@ mod tests {
             &db,
             &pair,
             RunOptions {
-                verify_hashes: false,
                 use_recycle_bin: false,
-                conflict_resolutions: HashMap::new(),
+                ..Default::default()
             },
             &cancel,
             |_| {},
@@ -825,5 +866,144 @@ mod tests {
 
         assert_eq!(report.status, RunStatus::Cancelled);
         assert!(report.finished_at.is_some());
+    }
+
+    #[test]
+    fn cancel_mid_run_saves_snapshot_matching_disk() {
+        let data_dir = TempDir::new().expect("tempdir");
+        let db = Mutex::new(
+            crate::persistence::Database::open(&data_dir.path().join("test.db")).expect("db"),
+        );
+
+        let left_dir = data_dir.path().join("left");
+        let right_dir = data_dir.path().join("right");
+        fs::create_dir_all(&left_dir).expect("mkdir");
+        fs::create_dir_all(&right_dir).expect("mkdir");
+        fs::write(left_dir.join("first.txt"), "one").expect("write");
+        fs::write(left_dir.join("second.txt"), "two").expect("write");
+
+        let pair = crate::models::FolderPair {
+            id: crate::persistence::new_pair_id(),
+            name: "CancelMid".into(),
+            left_path: left_dir.to_string_lossy().into_owned(),
+            right_path: right_dir.to_string_lossy().into_owned(),
+            mode: crate::models::SyncMode::Echo,
+            filters: crate::models::Filters::default(),
+            conflict_policy: crate::models::ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        db.lock()
+            .expect("lock")
+            .save_pair(&pair)
+            .expect("save pair");
+
+        let cancel = AtomicBool::new(false);
+        let report = run_pair_impl(
+            &db,
+            &pair,
+            RunOptions::default(),
+            &cancel,
+            |p| {
+                if p.phase == "running" && p.current >= 1 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        )
+        .expect("cancelled run returns report");
+
+        assert_eq!(report.status, RunStatus::Cancelled);
+        assert!(actions_were_applied(&report));
+
+        let snapshot = db
+            .lock()
+            .expect("lock")
+            .latest_snapshot(&pair.id)
+            .expect("snapshot")
+            .expect("snapshot saved after partial cancel");
+
+        let snapshot_paths: std::collections::HashSet<_> = snapshot
+            .entries
+            .iter()
+            .map(|e| e.relative_path.as_str())
+            .collect();
+
+        for path in ["first.txt", "second.txt"] {
+            let on_left = left_dir.join(path).exists();
+            let on_right = right_dir.join(path).exists();
+            let in_snapshot = snapshot_paths.contains(path);
+            assert_eq!(
+                in_snapshot,
+                on_left || on_right,
+                "snapshot entry for {path} must match disk"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_on_error_does_not_apply_remaining_actions() {
+        let data_dir = TempDir::new().expect("tempdir");
+        let db = Mutex::new(
+            crate::persistence::Database::open(&data_dir.path().join("test.db")).expect("db"),
+        );
+
+        let left_dir = data_dir.path().join("left");
+        let right_dir = data_dir.path().join("right");
+        fs::create_dir_all(&left_dir).expect("mkdir");
+        fs::create_dir_all(&right_dir).expect("mkdir");
+        fs::write(left_dir.join("blocked.txt"), "blocked").expect("write");
+        fs::write(left_dir.join("ok.txt"), "ok").expect("write");
+        fs::create_dir(right_dir.join("blocked.txt")).expect("block copy target");
+
+        let pair = crate::models::FolderPair {
+            id: crate::persistence::new_pair_id(),
+            name: "StopOnError".into(),
+            left_path: left_dir.to_string_lossy().into_owned(),
+            right_path: right_dir.to_string_lossy().into_owned(),
+            mode: crate::models::SyncMode::Echo,
+            filters: crate::models::Filters::default(),
+            conflict_policy: crate::models::ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        db.lock()
+            .expect("lock")
+            .save_pair(&pair)
+            .expect("save pair");
+
+        let cancel = AtomicBool::new(false);
+        let report = run_pair_impl(
+            &db,
+            &pair,
+            RunOptions {
+                stop_on_error: true,
+                ..Default::default()
+            },
+            &cancel,
+            |_| {},
+        )
+        .expect("run returns report");
+
+        assert_eq!(report.status, RunStatus::Failed);
+        assert!(!report.errors.is_empty());
+        assert!(
+            !right_dir.join("ok.txt").exists(),
+            "second copy must not run after first non-conflict failure"
+        );
+
+        let items = db
+            .lock()
+            .expect("lock")
+            .list_run_items(&report.run_id)
+            .expect("items");
+        assert_eq!(items.len(), 1, "only the failing action should be recorded");
     }
 }

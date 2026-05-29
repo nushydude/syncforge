@@ -20,6 +20,12 @@ pub struct RunPairOptions {
     pub use_recycle_bin: bool,
     #[serde(default)]
     pub conflict_resolutions: HashMap<String, ConflictResolution>,
+    #[serde(default = "default_stop_on_error")]
+    pub stop_on_error: bool,
+}
+
+fn default_stop_on_error() -> bool {
+    true
 }
 
 fn default_recycle_bin() -> bool {
@@ -46,6 +52,7 @@ pub async fn run_pair(
         verify_hashes: options.verify_hashes,
         use_recycle_bin: options.use_recycle_bin,
         conflict_resolutions: options.conflict_resolutions,
+        stop_on_error: options.stop_on_error,
     };
 
     let pair_name = pair.name.clone();
@@ -79,7 +86,7 @@ pub async fn run_pair(
 }
 
 #[tauri::command]
-pub fn cancel_run(state: State<'_, AppState>) -> Result<(), String> {
+pub fn cancel_run(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let guard = state.cancel_flag.lock().map_err(|e| e.to_string())?;
     if let Some(flag) = guard.as_ref() {
         flag.store(true, Ordering::Relaxed);
