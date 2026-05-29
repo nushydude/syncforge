@@ -29,6 +29,7 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
@@ -481,5 +482,74 @@ mod tests {
             bytes: Some(5),
         };
         db.insert_run_item(&item).expect("insert item");
+    }
+
+    #[test]
+    fn delete_pair_cascades_snapshots_and_runs() {
+        let (_dir, db) = temp_db();
+        let pair = FolderPair {
+            id: new_pair_id(),
+            name: "Cascade".into(),
+            left_path: "/a".into(),
+            right_path: "/b".into(),
+            mode: SyncMode::Synchronize,
+            filters: Filters::default(),
+            conflict_policy: ConflictPolicy::Ask,
+            enabled: true,
+            created_at: 1,
+            updated_at: 2,
+        };
+        db.save_pair(&pair).expect("save pair");
+
+        let snapshot = Snapshot {
+            id: Uuid::new_v4().to_string(),
+            pair_id: pair.id.clone(),
+            captured_at: 10,
+            entries: vec![],
+        };
+        db.save_snapshot(&snapshot).expect("save snapshot");
+
+        let report = RunReport {
+            run_id: Uuid::new_v4().to_string(),
+            pair_id: pair.id.clone(),
+            started_at: 20,
+            finished_at: None,
+            status: RunStatus::Running,
+            files_copied: 0,
+            files_deleted: 0,
+            bytes_transferred: 0,
+            errors: vec![],
+        };
+        db.save_run(&report).expect("save run");
+
+        let item = RunItem {
+            id: Uuid::new_v4().to_string(),
+            run_id: report.run_id.clone(),
+            path: "x.txt".into(),
+            action: "copyLeftToRight".into(),
+            status: "pending".into(),
+            message: None,
+            bytes: None,
+        };
+        db.insert_run_item(&item).expect("insert item");
+
+        db.delete_pair(&pair.id).expect("delete pair");
+
+        let snapshot_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+            .expect("count snapshots");
+        let run_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .expect("count runs");
+        let run_item_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM run_items", [], |row| row.get(0))
+            .expect("count run items");
+
+        assert_eq!(snapshot_count, 0);
+        assert_eq!(run_count, 0);
+        assert_eq!(run_item_count, 0);
     }
 }
