@@ -44,6 +44,9 @@ pub struct FileEntry {
     pub relative_path: String,
     pub size: u64,
     pub modified_secs: i64,
+    /// Subsecond fraction of [`modified_secs`] (0–999_999_999). Older snapshots omit this field (defaults to 0).
+    #[serde(default)]
+    pub modified_nanos: u32,
     pub is_dir: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
@@ -207,6 +210,7 @@ mod tests {
                         relative_path: "report.doc".into(),
                         size: 1024,
                         modified_secs: 100,
+                        modified_nanos: 0,
                         is_dir: false,
                         hash: None,
                     },
@@ -214,6 +218,7 @@ mod tests {
                         relative_path: "report.doc".into(),
                         size: 2048,
                         modified_secs: 200,
+                        modified_nanos: 0,
                         is_dir: false,
                         hash: Some("abc".into()),
                     },
@@ -244,5 +249,13 @@ mod tests {
         let json = serde_json::to_string(&report).expect("serialize");
         let back: RunReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(report, back);
+    }
+
+    #[test]
+    fn file_entry_deserialize_without_modified_nanos_defaults_zero() {
+        let json = r#"{"relativePath":"f.txt","size":5,"modifiedSecs":9,"isDir":false}"#;
+        let entry: FileEntry = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(entry.modified_nanos, 0);
+        assert_eq!(entry.modified_secs, 9);
     }
 }

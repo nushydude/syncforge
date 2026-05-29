@@ -1,9 +1,20 @@
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use jwalk::WalkDir;
 
 use crate::models::{FileEntry, Filters};
+
+/// Extracts whole seconds and subsecond nanoseconds from filesystem metadata.
+pub fn metadata_modified(metadata: &std::fs::Metadata) -> (i64, u32) {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs() as i64, d.subsec_nanos()))
+        .unwrap_or((0, 0))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanOutput {
@@ -77,12 +88,7 @@ pub fn scan_directory(root: &Path, filters: &Filters) -> ScanResult {
             }
         };
 
-        let modified_secs = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let (modified_secs, modified_nanos) = metadata_modified(&metadata);
 
         entries.push(FileEntry {
             relative_path,
@@ -92,6 +98,7 @@ pub fn scan_directory(root: &Path, filters: &Filters) -> ScanResult {
                 0
             },
             modified_secs,
+            modified_nanos,
             is_dir: metadata.is_dir(),
             hash: None,
         });
@@ -221,5 +228,24 @@ mod tests {
         assert!(paths.contains(&"sub/b.txt"));
         assert!(!paths.contains(&"skip.tmp"));
         assert_eq!(output.skipped_entries, 0);
+    }
+
+    #[test]
+    fn scan_populates_modified_nanos_from_metadata() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello").expect("write");
+
+        let output = scan_directory(root, &Filters::default()).expect("scan");
+        let entry = output
+            .entries
+            .iter()
+            .find(|e| e.relative_path == "a.txt")
+            .expect("entry");
+
+        let meta = fs::metadata(root.join("a.txt")).expect("metadata");
+        let (secs, nanos) = metadata_modified(&meta);
+        assert_eq!(entry.modified_secs, secs);
+        assert_eq!(entry.modified_nanos, nanos);
     }
 }

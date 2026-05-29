@@ -53,6 +53,7 @@ pub async fn run_pair(
         use_recycle_bin: options.use_recycle_bin,
         conflict_resolutions: options.conflict_resolutions,
         stop_on_error: options.stop_on_error,
+        ..Default::default()
     };
 
     let pair_name = pair.name.clone();

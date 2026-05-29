@@ -189,6 +189,7 @@ fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: String) {
                 use_recycle_bin: true,
                 conflict_resolutions: Default::default(),
                 stop_on_error: true,
+                ..Default::default()
             };
 
             run_pair_impl(
