@@ -1,3 +1,4 @@
+pub mod dialog;
 pub mod pairs;
 
 #[tauri::command]
