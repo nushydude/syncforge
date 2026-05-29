@@ -39,3 +39,7 @@ Thumbs.db
 # Env
 .env
 .env.*
+
+# Icon source (bundled assets live in src-tauri/icons/)
+syncforge-icon-source.png
+syncforge-icon-square.png

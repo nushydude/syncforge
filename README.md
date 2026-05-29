@@ -2,44 +2,67 @@
 
 A modern desktop folder-sync tool (SyncToy replacement) built with **Tauri 2**, **React**, **TypeScript**, and **Rust**.
 
-## Prerequisites
+## Features
 
-- [Node.js](https://nodejs.org/) (LTS)
-- [pnpm](https://pnpm.io/)
-- [Rust](https://www.rust-lang.org/tools/install) (for `src-tauri`)
+- **Folder pairs** — Left/right folders with Synchronize, Echo, and Contribute modes
+- **Preview before run** — See planned copies, updates, and deletes before executing
+- **Sync engine** — Safe copies, Recycle Bin deletes, optional hash verification
+- **Conflict policies** — Newer-wins, left/right, keep-both, or prompt
+- **Real-time watch** — Auto-sync on file changes with debouncing
+- **Scheduling** — Cron-based runs with desktop notifications
+- **History** — Past runs with detail view and CSV/JSON export
+
+## Installation
+
+Download the latest Windows installer from the [Releases](https://github.com/nushydude/syncforge/releases) page.
+
+> **Windows:** New or unsigned apps may show SmartScreen (“Windows protected your PC”). Click **More info**, then **Run anyway**.
 
 ## Development
 
-```powershell
+### Prerequisites
+
+- [Node.js](https://nodejs.org/) (LTS)
+- [pnpm](https://pnpm.io/) (`corepack enable` recommended)
+- [Rust](https://www.rust-lang.org/tools/install)
+
+### Run locally
+
+```bash
+git clone https://github.com/nushydude/syncforge.git
+cd syncforge
 pnpm install
 pnpm tauri dev
 ```
 
-Other commands:
-
 | Command | Description |
 | --- | --- |
-| `pnpm test` | Run Vitest unit tests |
+| `pnpm test` | Vitest unit tests |
 | `pnpm build` | Typecheck and build the Vite frontend |
 | `pnpm lint` | ESLint |
 | `pnpm format` | Prettier write |
+| `pnpm ci:local` | Full local CI gate (frontend + Rust) |
 | `cargo build` | Build the Rust crate (from `src-tauri/`) |
 
-Stories and build order live in [`docs/stories/`](docs/stories/README.md).
+### Production build
 
-Automated multi-agent development uses the [Cursor CLI orchestrator](orchestrator/README.md):
-
-```powershell
-agent login
-.\orchestrator\Run-All.ps1
+```bash
+pnpm tauri build
 ```
+
+Installers are written under `src-tauri/target/release/bundle/`.
+
+## Releasing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md#releasing-a-new-version) for version bumps, `v*` tags, and draft GitHub releases.
 
 ## Project layout
 
-- `src/` — React UI (`main.tsx` wraps `App` in `ErrorBoundary`)
-- `src-tauri/` — Tauri/Rust backend (`src/commands/` for invoke handlers)
-- `docs/stories/` — User stories S01–S09
+- `src/` — React UI
+- `src-tauri/` — Tauri/Rust backend
+- `docs/stories/` — User stories (S01–S09)
+- `orchestrator/` — Optional Cursor CLI multi-agent build loop
 
-## Status
+## License
 
-S01 scaffold complete; feature work follows user stories S02–S09.
+See repository license file when published.
