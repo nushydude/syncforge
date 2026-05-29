@@ -384,6 +384,68 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// Past runs, newest first. When `pair_id` is set, only runs for that pair.
+    pub fn list_runs(&self, pair_id: Option<&str>) -> Result<Vec<RunReport>> {
+        let mut reports = Vec::new();
+        match pair_id {
+            Some(id) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT summary_json FROM runs WHERE pair_id = ?1 ORDER BY started_at DESC",
+                )?;
+                let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+                for json in rows {
+                    reports.push(serde_json::from_str(&json?)?);
+                }
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT summary_json FROM runs ORDER BY started_at DESC")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                for json in rows {
+                    reports.push(serde_json::from_str(&json?)?);
+                }
+            }
+        }
+        Ok(reports)
+    }
+
+    pub fn get_run(&self, run_id: &str) -> Result<Option<RunReport>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT summary_json FROM runs WHERE id = ?1")?;
+        let mut rows = stmt.query(params![run_id])?;
+        if let Some(row) = rows.next()? {
+            let json: String = row.get(0)?;
+            return Ok(Some(serde_json::from_str(&json)?));
+        }
+        Ok(None)
+    }
+
+    pub fn list_run_items(&self, run_id: &str) -> Result<Vec<RunItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, path, action, status, message, bytes
+             FROM run_items
+             WHERE run_id = ?1
+             ORDER BY path COLLATE NOCASE",
+        )?;
+        let mut items = Vec::new();
+        let mut rows = stmt.query(params![run_id])?;
+        while let Some(row) = rows.next()? {
+            let bytes: Option<i64> = row.get(6)?;
+            items.push(RunItem {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                path: row.get(2)?,
+                action: row.get(3)?,
+                status: row.get(4)?,
+                message: row.get(5)?,
+                bytes: bytes.map(|b| b as u64),
+            });
+        }
+        Ok(items)
+    }
 }
 
 impl std::convert::From<std::io::Error> for PersistenceError {
@@ -636,6 +698,99 @@ mod tests {
             bytes: Some(5),
         };
         db.insert_run_item(&item).expect("insert item");
+    }
+
+    #[test]
+    fn list_runs_and_detail_round_trip() {
+        let (_dir, db) = temp_db();
+        let pair_a = new_pair_id();
+        let pair_b = new_pair_id();
+        for id in [&pair_a, &pair_b] {
+            db.save_pair(&FolderPair {
+                id: id.clone(),
+                name: format!("Pair {id}"),
+                left_path: "/a".into(),
+                right_path: "/b".into(),
+                mode: SyncMode::Echo,
+                filters: Filters::default(),
+                conflict_policy: ConflictPolicy::NewerWins,
+                enabled: true,
+                watch_enabled: false,
+                schedule_enabled: false,
+                schedule_cron: None,
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("save pair");
+        }
+
+        let run_a_old = RunReport {
+            run_id: Uuid::new_v4().to_string(),
+            pair_id: pair_a.clone(),
+            started_at: 10,
+            finished_at: Some(20),
+            status: RunStatus::Completed,
+            files_copied: 1,
+            files_deleted: 0,
+            bytes_transferred: 5,
+            errors: vec![],
+        };
+        let run_a_new = RunReport {
+            run_id: Uuid::new_v4().to_string(),
+            pair_id: pair_a.clone(),
+            started_at: 30,
+            finished_at: Some(40),
+            status: RunStatus::Failed,
+            files_copied: 0,
+            files_deleted: 0,
+            bytes_transferred: 0,
+            errors: vec!["disk full".into()],
+        };
+        let run_b = RunReport {
+            run_id: Uuid::new_v4().to_string(),
+            pair_id: pair_b.clone(),
+            started_at: 50,
+            finished_at: Some(60),
+            status: RunStatus::Completed,
+            files_copied: 2,
+            files_deleted: 1,
+            bytes_transferred: 99,
+            errors: vec![],
+        };
+
+        for report in [&run_a_old, &run_a_new, &run_b] {
+            db.save_run(report).expect("save run");
+        }
+
+        let item = RunItem {
+            id: Uuid::new_v4().to_string(),
+            run_id: run_a_new.run_id.clone(),
+            path: "notes.txt".into(),
+            action: "copyLeftToRight".into(),
+            status: "failed".into(),
+            message: Some("disk full".into()),
+            bytes: None,
+        };
+        db.insert_run_item(&item).expect("insert item");
+
+        let all = db.list_runs(None).expect("list all");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].run_id, run_b.run_id);
+        assert_eq!(all[1].run_id, run_a_new.run_id);
+        assert_eq!(all[2].run_id, run_a_old.run_id);
+
+        let pair_a_runs = db.list_runs(Some(&pair_a)).expect("list pair a");
+        assert_eq!(pair_a_runs.len(), 2);
+        assert!(pair_a_runs.iter().all(|r| r.pair_id == pair_a));
+
+        let detail = db.get_run(&run_a_new.run_id).expect("get run").expect("run");
+        assert_eq!(detail.status, RunStatus::Failed);
+
+        let items = db
+            .list_run_items(&run_a_new.run_id)
+            .expect("list items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, "notes.txt");
     }
 
     #[test]

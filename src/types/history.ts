@@ -22,6 +22,11 @@ export interface RunItem {
   bytes?: number;
 }
 
+export interface RunDetail {
+  report: RunReport;
+  items: RunItem[];
+}
+
 export interface Snapshot {
   id: string;
   pairId: string;

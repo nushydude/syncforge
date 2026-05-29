@@ -125,6 +125,8 @@ pub fn run() {
             commands::preview::preview_pair,
             commands::run::run_pair,
             commands::run::cancel_run,
+            commands::history::get_history,
+            commands::history::get_run_detail,
             commands::schedule::set_schedule,
         ])
         .run(tauri::generate_context!())
