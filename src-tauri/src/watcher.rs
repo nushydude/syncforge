@@ -154,10 +154,14 @@ fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: String) {
                     .ok_or_else(|| "pair not found or watch disabled".to_string())?
             };
 
-            let plan = {
+            let snapshot_entries = {
                 let guard = db.lock().map_err(|e| e.to_string())?;
-                preview_pair_impl(&guard, &pair)?
+                guard
+                    .latest_snapshot(&pair.id)
+                    .map_err(|e| e.to_string())?
+                    .map(|s| s.entries)
             };
+            let plan = preview_pair_impl(&pair, snapshot_entries.as_deref())?;
 
             if pair.conflict_policy == ConflictPolicy::Ask && plan_has_conflicts(&plan.actions) {
                 let _ = app_emit.emit(

@@ -98,10 +98,14 @@ fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: String, pai
                     .ok_or_else(|| "pair not found or schedule disabled".to_string())?
             };
 
-            let plan = {
+            let snapshot_entries = {
                 let guard = db.lock().map_err(|e| e.to_string())?;
-                preview_pair_impl(&guard, &pair)?
+                guard
+                    .latest_snapshot(&pair.id)
+                    .map_err(|e| e.to_string())?
+                    .map(|s| s.entries)
             };
+            let plan = preview_pair_impl(&pair, snapshot_entries.as_deref())?;
 
             if pair.conflict_policy == ConflictPolicy::Ask && plan_has_conflicts(&plan.actions) {
                 notify_sync_error(
