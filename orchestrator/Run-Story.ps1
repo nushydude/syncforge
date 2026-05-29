@@ -35,18 +35,29 @@ function Update-State($patch) {
     } else {
         [pscustomobject]@{ stories = @(); current = $null; startedAt = (Get-Date -Format o) }
     }
-    if ($state.stories -isnot [System.Collections.IList]) {
-        $list = [System.Collections.ArrayList]@()
-        foreach ($s in @($state.stories)) { [void]$list.Add($s) }
-        $state.stories = $list
+    # JSON deserializes stories as fixed-size Object[] (still IList) — always use ArrayList
+    $list = [System.Collections.ArrayList]@()
+    foreach ($s in @($state.stories)) { [void]$list.Add($s) }
+
+    $existingIdx = -1
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        if ($list[$i].id -eq $StoryId) { $existingIdx = $i; break }
     }
-    $existing = $state.stories | Where-Object { $_.id -eq $StoryId } | Select-Object -First 1
-    if ($existing) {
-        foreach ($k in $patch.Keys) { $existing.$k = $patch[$k] }
+
+    if ($existingIdx -ge 0) {
+        $existing = $list[$existingIdx]
+        $hash = @{ id = $StoryId }
+        foreach ($prop in $existing.PSObject.Properties) {
+            if ($prop.Name -ne 'id') { $hash[$prop.Name] = $prop.Value }
+        }
+        foreach ($k in $patch.Keys) { $hash[$k] = $patch[$k] }
+        $list[$existingIdx] = [pscustomobject]$hash
     } else {
-        $obj = [pscustomobject](@{ id = $StoryId } + $patch)
-        [void]$state.stories.Add($obj)
+        $hash = @{ id = $StoryId }
+        foreach ($k in $patch.Keys) { $hash[$k] = $patch[$k] }
+        [void]$list.Add([pscustomobject]$hash)
     }
+    $state.stories = @($list.ToArray())
     $state.current = $StoryId
     $state | ConvertTo-Json -Depth 6 | Set-Content $statePath -Encoding UTF8
 }
