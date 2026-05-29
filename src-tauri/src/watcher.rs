@@ -195,8 +195,6 @@ pub fn refresh_watch_service(app: &AppHandle, state: &Arc<AppState>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run_coordinator::watch_plan_is_empty;
-    use crate::models::SyncAction;
     use crate::state::{enqueue_pending_watch_sync, AppState};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -238,14 +236,6 @@ mod tests {
         assert!(scheduler.take_ready(t0 + Duration::from_millis(150)).is_empty());
         let ready = scheduler.take_ready(t0 + Duration::from_millis(191));
         assert_eq!(ready, vec!["pair-a".to_string()]);
-    }
-
-    #[test]
-    fn empty_watch_plan_is_detected() {
-        assert!(watch_plan_is_empty(&[]));
-        assert!(!watch_plan_is_empty(&[SyncAction::CopyLeftToRight {
-            path: "a.txt".into(),
-        }]));
     }
 
     #[cfg(windows)]

@@ -200,6 +200,8 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{release_pair_run_slot, should_ignore_watch_event, try_acquire_pair_run, AppState};
+    use tempfile::TempDir;
 
     #[test]
     fn empty_watch_plan_is_detected() {
@@ -207,5 +209,22 @@ mod tests {
         assert!(!watch_plan_is_empty(&[SyncAction::CopyLeftToRight {
             path: "a.txt".into(),
         }]));
+    }
+
+    /// Simulates `run_watch_sync` acquiring, finding an empty plan, and releasing without
+    /// enqueueing a follow-up watch run (no feedback loop).
+    #[test]
+    fn empty_watch_plan_release_does_not_requeue_watch_sync() {
+        let data_dir = TempDir::new().expect("tempdir");
+        let state = AppState::new(data_dir.path().to_path_buf()).expect("app state");
+
+        let cancel = try_acquire_pair_run(&state, "pair-a").expect("acquire");
+        assert!(watch_plan_is_empty(&[]));
+
+        let pending = release_pair_run_slot(&state, "pair-a", &cancel).expect("release");
+
+        assert_eq!(pending, (false, false));
+        assert!(state.pending_watch_syncs.lock().expect("lock").is_empty());
+        assert!(should_ignore_watch_event(&state, "pair-a"));
     }
 }
