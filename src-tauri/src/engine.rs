@@ -82,6 +82,21 @@ fn ensure_parent(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Move or copy a verified temp file onto `dest` without deleting `dest` first.
+///
+/// `fs::rename` is preferred (atomic replace on Unix; fast on same volume). It fails
+/// when `dest` already exists on Windows, or when `temp` and `dest` are on different
+/// volumes. In those cases we `fs::copy` over `dest` so a failed commit leaves the
+/// original file intact.
+pub(crate) fn commit_temp_file(temp: &Path, dest: &Path) -> io::Result<()> {
+    if fs::rename(temp, dest).is_ok() {
+        return Ok(());
+    }
+    fs::copy(temp, dest)?;
+    fs::remove_file(temp)?;
+    Ok(())
+}
+
 pub fn safe_copy_file(src: &Path, dest: &Path, verify: bool) -> io::Result<u64> {
     ensure_parent(dest)?;
     let temp = temp_copy_path(dest);
@@ -100,10 +115,7 @@ pub fn safe_copy_file(src: &Path, dest: &Path, verify: bool) -> io::Result<u64> 
             ));
         }
     }
-    if dest.exists() {
-        fs::remove_file(dest)?;
-    }
-    fs::rename(&temp, dest)?;
+    commit_temp_file(&temp, dest)?;
     Ok(bytes)
 }
 
@@ -566,6 +578,54 @@ mod tests {
         fs::write(&dest, "old").expect("write dest");
         safe_copy_file(&src, &dest, false).expect("copy");
         assert_eq!(fs::read_to_string(&dest).expect("read"), "new");
+    }
+
+    /// On Windows, `rename(temp, dest)` fails when `dest` exists or paths are on
+    /// different volumes (e.g. `C:\` → `D:\`); we `fs::copy` over `dest` without
+    /// unlinking it first so a failed copy leaves the original bytes intact.
+    #[test]
+    #[cfg(windows)]
+    fn commit_temp_file_replaces_existing_via_copy_fallback() {
+        let dir = TempDir::new().expect("tempdir");
+        let dest = dir.path().join("dest.txt");
+        let temp = temp_copy_path(&dest);
+        fs::write(&dest, "old").expect("write dest");
+        fs::write(&temp, "new").expect("write temp");
+        commit_temp_file(&temp, &dest).expect("commit");
+        assert_eq!(fs::read_to_string(&dest).expect("read"), "new");
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn commit_temp_file_preserves_dest_when_replace_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("tempdir");
+        let dest = dir.path().join("dest.txt");
+        let temp = temp_copy_path(&dest);
+        fs::write(&dest, "original").expect("write dest");
+        fs::write(&temp, "replacement").expect("write temp");
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o000)).expect("chmod dest");
+
+        commit_temp_file(&temp, &dest).expect_err("commit should fail");
+
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).expect("restore dest");
+        assert_eq!(
+            fs::read_to_string(&dest).expect("read dest"),
+            "original"
+        );
+        assert!(temp.exists());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn delete_path_recycle_bin_removes_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let file = dir.path().join("to-recycle.txt");
+        fs::write(&file, "recycle-me").expect("write");
+        delete_path(&file, true).expect("recycle delete");
+        assert!(!file.exists());
     }
 
     #[test]
