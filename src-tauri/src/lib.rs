@@ -10,6 +10,7 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let data_dir = app
@@ -23,6 +24,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::greet,
+            commands::dialog::pick_folder,
+            commands::dialog::path_exists,
+            commands::dialog::paths_equal,
             commands::pairs::list_pairs,
             commands::pairs::save_pair,
             commands::pairs::delete_pair,
