@@ -15,6 +15,10 @@ You are the **implementer** for story **{{STORY_ID}}: {{STORY_TITLE}}**.
 SyncForge is a modern SyncToy replacement: Tauri 2 + React + TypeScript + Vite + Rust.
 Stack matches the lightframe reference (pnpm, Vitest, modular `src-tauri/src/`).
 
+**Stability is critical** — this app copies and deletes real user files. Prefer correctness over speed.
+Stories S10+ are performance/stability hardening from a formal audit; follow acceptance criteria exactly.
+Reference patterns: LightFrame (`folder_index`, `spawn_blocking`, request-generation guards, debounced watchers).
+
 ## Your job
 
 1. Implement everything in the story acceptance criteria.

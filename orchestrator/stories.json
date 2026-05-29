@@ -9,63 +9,144 @@
       "title": "Project scaffold",
       "branch": "story/S01-scaffold",
       "dependsOn": [],
-      "storyFile": "docs/stories/S01-scaffold.md"
+      "storyFile": "docs/stories/S01-scaffold.md",
+      "epic": "foundation"
     },
     {
       "id": "S02",
       "title": "Domain models and persistence",
       "branch": "story/S02-models-persistence",
       "dependsOn": ["S01"],
-      "storyFile": "docs/stories/S02-models-persistence.md"
+      "storyFile": "docs/stories/S02-models-persistence.md",
+      "epic": "foundation"
     },
     {
       "id": "S03",
       "title": "Folder pair CRUD UI",
       "branch": "story/S03-pair-crud",
       "dependsOn": ["S02"],
-      "storyFile": "docs/stories/S03-pair-crud.md"
+      "storyFile": "docs/stories/S03-pair-crud.md",
+      "epic": "foundation"
     },
     {
       "id": "S04",
       "title": "Scan, diff, and preview",
       "branch": "story/S04-scan-diff-preview",
       "dependsOn": ["S02"],
-      "storyFile": "docs/stories/S04-scan-diff-preview.md"
+      "storyFile": "docs/stories/S04-scan-diff-preview.md",
+      "epic": "foundation"
     },
     {
       "id": "S05",
       "title": "Sync run engine",
       "branch": "story/S05-run-engine",
       "dependsOn": ["S04"],
-      "storyFile": "docs/stories/S05-run-engine.md"
+      "storyFile": "docs/stories/S05-run-engine.md",
+      "epic": "foundation"
     },
     {
       "id": "S06",
       "title": "Conflict resolution",
       "branch": "story/S06-conflicts",
       "dependsOn": ["S05"],
-      "storyFile": "docs/stories/S06-conflicts.md"
+      "storyFile": "docs/stories/S06-conflicts.md",
+      "epic": "foundation"
     },
     {
       "id": "S07",
       "title": "Real-time watch and system tray",
       "branch": "story/S07-watch-tray",
       "dependsOn": ["S05"],
-      "storyFile": "docs/stories/S07-watch-tray.md"
+      "storyFile": "docs/stories/S07-watch-tray.md",
+      "epic": "foundation"
     },
     {
       "id": "S08",
       "title": "Scheduling and notifications",
       "branch": "story/S08-schedule",
       "dependsOn": ["S07"],
-      "storyFile": "docs/stories/S08-schedule.md"
+      "storyFile": "docs/stories/S08-schedule.md",
+      "epic": "foundation"
     },
     {
       "id": "S09",
       "title": "History and export",
       "branch": "story/S09-history",
       "dependsOn": ["S05"],
-      "storyFile": "docs/stories/S09-history.md"
+      "storyFile": "docs/stories/S09-history.md",
+      "epic": "foundation"
+    },
+    {
+      "id": "S10",
+      "title": "Engine safety (cancel, snapshot, stop-on-error)",
+      "branch": "story/S10-engine-safety",
+      "dependsOn": ["S09"],
+      "storyFile": "docs/stories/S10-engine-safety.md",
+      "epic": "perf-stability"
+    },
+    {
+      "id": "S11",
+      "title": "Precise change detection",
+      "branch": "story/S11-change-detection",
+      "dependsOn": ["S10"],
+      "storyFile": "docs/stories/S11-change-detection.md",
+      "epic": "perf-stability"
+    },
+    {
+      "id": "S12",
+      "title": "Scan integrity and destructive guards",
+      "branch": "story/S12-scan-integrity",
+      "dependsOn": ["S10"],
+      "storyFile": "docs/stories/S12-scan-integrity.md",
+      "epic": "perf-stability"
+    },
+    {
+      "id": "S13",
+      "title": "Non-blocking preview",
+      "branch": "story/S13-async-preview",
+      "dependsOn": ["S12"],
+      "storyFile": "docs/stories/S13-async-preview.md",
+      "epic": "perf-stability"
+    },
+    {
+      "id": "S14",
+      "title": "Eliminate redundant scans",
+      "branch": "story/S14-scan-deduplication",
+      "dependsOn": ["S10", "S13"],
+      "storyFile": "docs/stories/S14-scan-deduplication.md",
+      "epic": "perf-stability"
+    },
+    {
+      "id": "S15",
+      "title": "Lean persistence (WAL, snapshot prune)",
+      "branch": "story/S15-persistence-lean",
+      "dependsOn": ["S10"],
+      "storyFile": "docs/stories/S15-persistence-lean.md",
+      "epic": "perf-stability"
+    },
+    {
+      "id": "S16",
+      "title": "Per-pair concurrency and watch suppression",
+      "branch": "story/S16-concurrency",
+      "dependsOn": ["S14"],
+      "storyFile": "docs/stories/S16-concurrency.md",
+      "epic": "perf-stability"
+    },
+    {
+      "id": "S17",
+      "title": "Frontend stability (races, progress ownership)",
+      "branch": "story/S17-frontend-stability",
+      "dependsOn": ["S10"],
+      "storyFile": "docs/stories/S17-frontend-stability.md",
+      "epic": "perf-stability"
+    },
+    {
+      "id": "S18",
+      "title": "Frontend performance (selectors, virtualization)",
+      "branch": "story/S18-frontend-performance",
+      "dependsOn": ["S17"],
+      "storyFile": "docs/stories/S18-frontend-performance.md",
+      "epic": "perf-stability"
     }
   ]
 }
