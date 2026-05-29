@@ -31,6 +31,7 @@ export function PairEditor() {
     previewPlan,
     previewLoading,
     previewError,
+    watchWarning,
   } = usePairsStore();
   const {
     running: runInProgress,
@@ -158,6 +159,11 @@ export function PairEditor() {
         />
         Watch for changes (auto-sync)
       </label>
+      {watchWarning && (
+        <p className="form-warning" role="status">
+          {watchWarning}
+        </p>
+      )}
 
       {!isNew && (
         <PreviewTable

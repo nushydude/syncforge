@@ -320,6 +320,12 @@ body {
   font-size: 0.875rem;
 }
 
+.form-warning {
+  margin: 0 0 1rem;
+  color: #b45309;
+  font-size: 0.875rem;
+}
+
 .validation-errors {
   margin: 0 0 1rem;
   padding-left: 1.25rem;

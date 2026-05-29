@@ -15,6 +15,7 @@ export interface PairsStoreState {
   previewPlan: SyncPlan | null;
   previewLoading: boolean;
   previewError: string | null;
+  watchWarning: string | null;
 }
 
 type Listener = () => void;
@@ -49,7 +50,11 @@ let state: PairsStoreState = {
   previewPlan: null,
   previewLoading: false,
   previewError: null,
+  watchWarning: null,
 };
+
+const WATCH_INACTIVE_MSG =
+  "Auto-sync watch is saved but inactive until both folder paths exist on disk.";
 
 const listeners = new Set<Listener>();
 
@@ -64,6 +69,31 @@ export function getPairsState(): PairsStoreState {
 export function subscribePairs(listener: Listener): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
+}
+
+async function refreshWatchWarning(pair: FolderPair | null): Promise<void> {
+  if (!pair?.watchEnabled || !pair.enabled) {
+    state = { ...state, watchWarning: null };
+    emit();
+    return;
+  }
+  const left = pair.leftPath.trim();
+  const right = pair.rightPath.trim();
+  if (!left || !right) {
+    state = { ...state, watchWarning: WATCH_INACTIVE_MSG };
+    emit();
+    return;
+  }
+  const [leftExists, rightExists] = await Promise.all([
+    pairsApi.pathExists(left),
+    pairsApi.pathExists(right),
+  ]);
+  state = {
+    ...state,
+    watchWarning:
+      leftExists && rightExists ? null : WATCH_INACTIVE_MSG,
+  };
+  emit();
 }
 
 export async function loadPairs(): Promise<void> {
@@ -103,8 +133,10 @@ export function selectPair(id: string): void {
     error: null,
     previewPlan: null,
     previewError: null,
+    watchWarning: null,
   };
   emit();
+  void refreshWatchWarning(state.editing);
 }
 
 export function startNewPair(): void {
@@ -114,6 +146,7 @@ export function startNewPair(): void {
     editing: emptyPair(),
     validationErrors: [],
     error: null,
+    watchWarning: null,
   };
   emit();
 }
@@ -126,6 +159,7 @@ export function cancelEdit(): void {
     error: null,
     previewPlan: null,
     previewError: null,
+    watchWarning: null,
   };
   emit();
 }
@@ -161,12 +195,21 @@ export function updateEditing(patch: Partial<FolderPair>): void {
   if (!state.editing) {
     return;
   }
+  const editing = { ...state.editing, ...patch };
   state = {
     ...state,
-    editing: { ...state.editing, ...patch },
+    editing,
     validationErrors: [],
   };
   emit();
+  if (
+    "watchEnabled" in patch ||
+    "enabled" in patch ||
+    "leftPath" in patch ||
+    "rightPath" in patch
+  ) {
+    void refreshWatchWarning(editing);
+  }
 }
 
 export async function pickFolderForSide(
@@ -240,6 +283,7 @@ export async function saveEditing(): Promise<boolean> {
       validationErrors: [],
     };
     emit();
+    await refreshWatchWarning(state.editing);
     return true;
   } catch (e) {
     state = {
@@ -296,6 +340,7 @@ export function resetPairsStoreForTests(): void {
     previewPlan: null,
     previewLoading: false,
     previewError: null,
+    watchWarning: null,
   };
   emit();
 }

@@ -93,7 +93,12 @@ pub fn run() {
                 api.prevent_close();
             }
             WindowEvent::Focused(false) | WindowEvent::Resized(_) => {
-                minimize_to_tray(window);
+                // Defer so `is_minimized()` is updated (Tao has no dedicated minimize event).
+                let window = window.clone();
+                let window_for_tray = window.clone();
+                let _ = window.run_on_main_thread(move || {
+                    minimize_to_tray(&window_for_tray);
+                });
             }
             _ => {}
         })
