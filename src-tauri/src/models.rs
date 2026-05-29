@@ -82,6 +82,8 @@ pub struct SyncPlan {
     pub actions: Vec<SyncAction>,
     pub scanned_left: u32,
     pub scanned_right: u32,
+    #[serde(default)]
+    pub scan_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +202,7 @@ mod tests {
             ],
             scanned_left: 10,
             scanned_right: 12,
+            scan_warnings: vec![],
         };
         let json = serde_json::to_string(&plan).expect("serialize");
         let back: SyncPlan = serde_json::from_str(&json).expect("deserialize");
