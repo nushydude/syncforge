@@ -4,14 +4,29 @@ import * as runApi from '../api/run';
 import type { FolderPair, RunReport } from '../types';
 import {
   confirmConflictResolutionAndRun,
+  dismissWatchSkipped,
+  ensureWatchSkippedListener,
   getRunState,
   resetRunStoreForTests,
   runSelectedPair,
   setConflictResolution,
 } from '../store/runStore';
 
+const listenHandlers: Record<string, (event: { payload: unknown }) => void> =
+  {};
+
 vi.mock('@tauri-apps/api/event', () => ({
-  listen: vi.fn().mockResolvedValue(() => {}),
+  listen: vi.fn(
+    async (
+      event: string,
+      handler: (event: { payload: unknown }) => void,
+    ) => {
+      listenHandlers[event] = handler;
+      return () => {
+        delete listenHandlers[event];
+      };
+    },
+  ),
 }));
 
 vi.mock('../api/preview', () => ({
@@ -53,6 +68,9 @@ describe('runStore', () => {
   beforeEach(() => {
     resetRunStoreForTests();
     vi.clearAllMocks();
+    for (const key of Object.keys(listenHandlers)) {
+      delete listenHandlers[key];
+    }
   });
 
   it('runs a pair and stores the report', async () => {
@@ -109,6 +127,22 @@ describe('runStore', () => {
     expect(report).toBeNull();
     expect(runApi.runPair).not.toHaveBeenCalled();
     expect(getRunState().pendingConflicts?.conflicts).toHaveLength(1);
+  });
+
+  it('stores watch-skipped events from the backend', async () => {
+    await ensureWatchSkippedListener();
+    listenHandlers['sync://watch-skipped']?.({
+      payload: {
+        pairId: 'pair-1',
+        reason: 'conflicts require manual resolution',
+      },
+    });
+    expect(getRunState().watchSkipped).toEqual({
+      pairId: 'pair-1',
+      reason: 'conflicts require manual resolution',
+    });
+    dismissWatchSkipped();
+    expect(getRunState().watchSkipped).toBeNull();
   });
 
   it('runs with user conflict resolutions after confirm', async () => {

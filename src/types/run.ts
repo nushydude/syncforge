@@ -24,3 +24,9 @@ export interface RunPairOptions {
   useRecycleBin?: boolean;
   conflictResolutions?: Record<string, ConflictChoice>;
 }
+
+/** Emitted when a debounced watch run is skipped (conflicts, errors). */
+export interface WatchSkippedNotice {
+  pairId: string;
+  reason: string;
+}

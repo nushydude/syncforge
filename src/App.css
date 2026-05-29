@@ -38,6 +38,22 @@ body {
   font-size: 0.9rem;
 }
 
+.watch-skipped-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.625rem 1.5rem;
+  background: #fff7ed;
+  border-bottom: 1px solid #fed7aa;
+  color: #9a3412;
+  font-size: 0.875rem;
+}
+
+.watch-skipped-banner p {
+  margin: 0;
+}
+
 .pairs-panel {
   display: flex;
   flex: 1;

@@ -68,9 +68,14 @@ struct WatchedRoots {
 }
 
 fn pairs_for_path(roots: &[WatchedRoots], path: &Path) -> Vec<String> {
+    let path_str = path.to_string_lossy();
     let mut ids = HashSet::new();
     for root in roots {
-        if path.starts_with(&root.left) || path.starts_with(&root.right) {
+        let left = root.left.to_string_lossy();
+        let right = root.right.to_string_lossy();
+        if path_normalization::path_is_within_root(&path_str, &left)
+            || path_normalization::path_is_within_root(&path_str, &right)
+        {
             ids.insert(root.pair_id.clone());
         }
     }
@@ -337,5 +342,35 @@ mod tests {
         assert!(scheduler.take_ready(t0 + Duration::from_millis(150)).is_empty());
         let ready = scheduler.take_ready(t0 + Duration::from_millis(191));
         assert_eq!(ready, vec!["pair-a".to_string()]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pairs_for_path_resolves_conventional_event_under_extended_root() {
+        let roots = vec![WatchedRoots {
+            pair_id: "pair-1".into(),
+            left: PathBuf::from(r"\\?\UNC\server\share\left"),
+            right: PathBuf::from(r"C:\Pairs\right"),
+        }];
+        let ids = pairs_for_path(
+            &roots,
+            Path::new(r"\\server\share\left\sub\file.txt"),
+        );
+        assert_eq!(ids, vec!["pair-1".to_string()]);
+
+        let ids = pairs_for_path(&roots, Path::new(r"c:\pairs\right\doc.txt"));
+        assert_eq!(ids, vec!["pair-1".to_string()]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn pairs_for_path_resolves_nested_paths() {
+        let roots = vec![WatchedRoots {
+            pair_id: "pair-1".into(),
+            left: PathBuf::from("/var/left"),
+            right: PathBuf::from("/var/right"),
+        }];
+        let ids = pairs_for_path(&roots, Path::new("/var/left/sub/file.txt"));
+        assert_eq!(ids, vec!["pair-1".to_string()]);
     }
 }

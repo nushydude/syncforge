@@ -15,9 +15,17 @@ use state::AppState;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WindowEvent,
+    Manager, Window, WindowEvent,
 };
 use watcher::refresh_watch_service;
+
+/// When the user minimizes the window, hide it and leave the app in the tray.
+fn minimize_to_tray(window: &Window) {
+    if window.is_minimized().unwrap_or(false) {
+        let _ = window.hide();
+        let _ = window.unminimize();
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -79,11 +87,15 @@ pub fn run() {
 
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
                 let _ = window.hide();
                 api.prevent_close();
             }
+            WindowEvent::Focused(false) | WindowEvent::Resized(_) => {
+                minimize_to_tray(window);
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             commands::greet,
