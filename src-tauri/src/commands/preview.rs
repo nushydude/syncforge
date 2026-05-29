@@ -1,21 +1,23 @@
 use std::path::Path;
-
 use std::sync::Arc;
 
 use tauri::State;
 
 use crate::diff::{build_sync_plan, DiffOptions};
-use crate::models::{FolderPair, SyncPlan};
+use crate::models::{FileEntry, FolderPair, SyncPlan};
 use crate::path_normalization;
 use crate::persistence::Database;
 use crate::scanner::{assert_destructive_scan_allowed, scan_directory, ScanIntegrity};
 use crate::state::AppState;
 
-/// Core preview logic shared by the Tauri command and integration tests.
+/// Core preview logic shared by the Tauri command, watcher, scheduler, and tests.
 ///
 /// Uses `pair` for scan paths, filters, mode, and conflict policy (editor draft).
-/// Snapshot history is loaded by `pair.id` only.
-pub(crate) fn preview_pair_impl(db: &Database, pair: &FolderPair) -> Result<SyncPlan, String> {
+/// `snapshot_entries` must be loaded under a short DB lock before calling this function.
+pub(crate) fn preview_pair_impl(
+    pair: &FolderPair,
+    snapshot_entries: Option<&[FileEntry]>,
+) -> Result<SyncPlan, String> {
     if pair.id.is_empty() {
         return Err("pair id required for preview".into());
     }
@@ -31,9 +33,6 @@ pub(crate) fn preview_pair_impl(db: &Database, pair: &FolderPair) -> Result<Sync
     assert_destructive_scan_allowed(pair.mode, &left_scan, &right_scan)?;
 
     let scan = ScanIntegrity::from_sides(&left_scan, &right_scan);
-
-    let snapshot = db.latest_snapshot(&pair.id).map_err(|e| e.to_string())?;
-    let snapshot_entries = snapshot.as_ref().map(|s| s.entries.as_slice());
 
     Ok(build_sync_plan(
         &pair.id,
@@ -51,10 +50,29 @@ pub(crate) fn preview_pair_impl(db: &Database, pair: &FolderPair) -> Result<Sync
     ))
 }
 
+fn load_preview_snapshot(db: &Database, pair_id: &str) -> Result<Option<Vec<FileEntry>>, String> {
+    db.latest_snapshot(pair_id)
+        .map_err(|e| e.to_string())
+        .map(|snapshot| snapshot.map(|s| s.entries))
+}
+
 #[tauri::command]
-pub fn preview_pair(pair: FolderPair, state: State<'_, Arc<AppState>>) -> Result<SyncPlan, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    preview_pair_impl(&db, &pair)
+pub async fn preview_pair(
+    pair: FolderPair,
+    state: State<'_, Arc<AppState>>,
+) -> Result<SyncPlan, String> {
+    if pair.id.is_empty() {
+        return Err("pair id required for preview".into());
+    }
+
+    let snapshot_entries = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        load_preview_snapshot(&db, &pair.id)?
+    };
+
+    tauri::async_runtime::spawn_blocking(move || preview_pair_impl(&pair, snapshot_entries.as_deref()))
+        .await
+        .map_err(|e| format!("preview task failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -88,6 +106,11 @@ mod tests {
         .expect("save");
     }
 
+    fn preview_with_db(db: &Database, pair: &FolderPair) -> Result<crate::models::SyncPlan, String> {
+        let snapshot_entries = super::load_preview_snapshot(db, &pair.id)?;
+        super::preview_pair_impl(pair, snapshot_entries.as_deref())
+    }
+
     #[test]
     fn preview_pair_impl_echo_plan_from_temp_folders() {
         let data_dir = TempDir::new().expect("tempdir");
@@ -106,7 +129,7 @@ mod tests {
         save_echo_pair(&db, &id, &left_dir, &right_dir);
         let pair = db.get_pair(&id).expect("get").expect("pair");
 
-        let plan = super::preview_pair_impl(&db, &pair).expect("preview");
+        let plan = preview_with_db(&db, &pair).expect("preview");
         assert!(plan.actions.iter().any(|a| {
             matches!(
                 a,
@@ -138,7 +161,7 @@ mod tests {
         save_echo_pair(&db, &id, &left_dir, &right_dir);
         let pair = db.get_pair(&id).expect("get").expect("pair");
 
-        let plan = super::preview_pair_impl(&db, &pair).expect("preview");
+        let plan = preview_with_db(&db, &pair).expect("preview");
         assert!(plan.actions.iter().any(|a| {
             matches!(
                 a,
@@ -179,7 +202,7 @@ mod tests {
         .expect("save");
 
         let pair = db.get_pair(&id).expect("get").expect("pair");
-        let _plan = super::preview_pair_impl(&db, &pair).expect("preview");
+        let _plan = preview_with_db(&db, &pair).expect("preview");
 
         assert!(right_dir.join("b.txt").exists());
         assert!(!right_dir.join("a.txt").exists());
@@ -231,7 +254,7 @@ mod tests {
         .expect("snapshot");
 
         let pair = db.get_pair(&id).expect("get").expect("pair");
-        let plan = super::preview_pair_impl(&db, &pair).expect("preview");
+        let plan = preview_with_db(&db, &pair).expect("preview");
         assert!(plan.actions.iter().any(|a| {
             matches!(
                 a,
@@ -259,7 +282,7 @@ mod tests {
         let mut draft = db.get_pair(&id).expect("get").expect("pair");
         draft.filters = Filters { include: vec![], exclude: vec!["*.tmp".into()] };
 
-        let plan = super::preview_pair_impl(&db, &draft).expect("preview");
+        let plan = preview_with_db(&db, &draft).expect("preview");
         assert!(plan.actions.iter().any(|a| {
             matches!(
                 a,
@@ -275,9 +298,8 @@ mod tests {
             )
         }));
 
-        let persisted =
-            super::preview_pair_impl(&db, &db.get_pair(&id).expect("get").expect("pair"))
-                .expect("preview");
+        let persisted = preview_with_db(&db, &db.get_pair(&id).expect("get").expect("pair"))
+            .expect("preview");
         assert!(persisted.actions.iter().any(|a| {
             matches!(
                 a,
@@ -309,7 +331,7 @@ mod tests {
         save_echo_pair(&db, &id, &left_dir, &right_dir);
         let pair = db.get_pair(&id).expect("get").expect("pair");
 
-        let err = super::preview_pair_impl(&db, &pair).expect_err("preview must fail");
+        let err = preview_with_db(&db, &pair).expect_err("preview must fail");
         assert!(err.contains("Cannot run Echo sync"));
         assert!(err.contains("skipped"));
 
