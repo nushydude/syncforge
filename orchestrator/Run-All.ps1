@@ -8,6 +8,9 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
 Set-Location $Root
 
+. "$PSScriptRoot\lib\Ensure-AgentPath.ps1"
+Ensure-AgentPath
+
 # Preflight
 if (-not (Get-Command agent -ErrorAction SilentlyContinue)) {
     Write-Error "Cursor CLI not installed. Run: irm 'https://cursor.com/install?win32=true' | iex"

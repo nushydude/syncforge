@@ -9,9 +9,11 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
 Set-Location $Root
 
+. "$PSScriptRoot\lib\Ensure-AgentPath.ps1"
 . "$PSScriptRoot\lib\Render-Prompt.ps1"
 . "$PSScriptRoot\lib\Invoke-Agent.ps1"
 . "$PSScriptRoot\lib\Parse-Verdict.ps1"
+Ensure-AgentPath
 
 $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
 $story = $config.stories | Where-Object { $_.id -eq $StoryId } | Select-Object -First 1
