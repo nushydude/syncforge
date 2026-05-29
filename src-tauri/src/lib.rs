@@ -1,5 +1,7 @@
 mod commands;
 mod diff;
+mod engine;
+mod hashing;
 mod models;
 mod path_normalization;
 mod persistence;
@@ -33,6 +35,8 @@ pub fn run() {
             commands::pairs::save_pair,
             commands::pairs::delete_pair,
             commands::preview::preview_pair,
+            commands::run::run_pair,
+            commands::run::cancel_run,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
