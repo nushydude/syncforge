@@ -210,6 +210,15 @@ where
     f(&guard)
 }
 
+fn flush_run_items(db: &Mutex<Database>, items: &mut Vec<RunItem>) -> Result<(), String> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    with_db(db, |db| db.insert_run_items(items).map_err(|e| e.to_string()))?;
+    items.clear();
+    Ok(())
+}
+
 pub fn run_pair_impl<F>(
     db: &Mutex<Database>,
     pair: &FolderPair,
@@ -304,7 +313,10 @@ where
 
     progress("scanning", 0, 0, None, Some("Scanning folders"));
 
+    let mut run_items: Vec<RunItem> = Vec::new();
+
     if cancel.load(Ordering::Relaxed) {
+        flush_run_items(db, &mut run_items)?;
         return finish_cancelled(db, pair, left_root, right_root, report, emit);
     }
 
@@ -314,8 +326,8 @@ where
         }
         plan
     } else {
-        let left_scan =
-            scan_directory(left_root, &pair.filters).map_err(|e| format!("scan left failed: {e}"))?;
+        let left_scan = scan_directory(left_root, &pair.filters)
+            .map_err(|e| format!("scan left failed: {e}"))?;
         let right_scan = scan_directory(right_root, &pair.filters)
             .map_err(|e| format!("scan right failed: {e}"))?;
 
@@ -356,6 +368,7 @@ where
     let mut stopped_on_error = false;
     for (index, action) in executable.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
+            flush_run_items(db, &mut run_items)?;
             return finish_cancelled(db, pair, left_root, right_root, report, emit);
         }
 
@@ -365,13 +378,7 @@ where
 
         let item_id = Uuid::new_v4().to_string();
         let kind = action_kind(action);
-        let result = execute_action(
-            action,
-            left_root,
-            right_root,
-            verify_hashes,
-            use_recycle_bin,
-        );
+        let result = execute_action(action, left_root, right_root, verify_hashes, use_recycle_bin);
 
         match result {
             Ok(stats) => {
@@ -387,7 +394,7 @@ where
                     message: None,
                     bytes: if stats.bytes > 0 { Some(stats.bytes) } else { None },
                 };
-                with_db(db, |db| db.insert_run_item(&run_item).map_err(|e| e.to_string()))?;
+                run_items.push(run_item);
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -402,7 +409,7 @@ where
                     message: Some(msg),
                     bytes: None,
                 };
-                with_db(db, |db| db.insert_run_item(&run_item).map_err(|e| e.to_string()))?;
+                run_items.push(run_item);
                 if !is_conflict && stop_on_error {
                     stopped_on_error = true;
                     break;
@@ -412,8 +419,11 @@ where
     }
 
     if cancel.load(Ordering::Relaxed) {
+        flush_run_items(db, &mut run_items)?;
         return finish_cancelled(db, pair, left_root, right_root, report, emit);
     }
+
+    flush_run_items(db, &mut run_items)?;
 
     progress("scanning", total, total, None, Some("Capturing snapshot"));
 
@@ -721,20 +731,13 @@ mod tests {
             run_pair_impl(
                 &db,
                 &pair,
-                RunOptions {
-                    plan: Some(plan),
-                    use_recycle_bin: false,
-                    ..Default::default()
-                },
+                RunOptions { plan: Some(plan), use_recycle_bin: false, ..Default::default() },
                 &cancel,
                 |_| {},
             )
             .expect("run with plan")
         });
-        assert_eq!(
-            run_scans, 2,
-            "run with provided plan should only post-run scan left and right"
-        );
+        assert_eq!(run_scans, 2, "run with provided plan should only post-run scan left and right");
 
         let (_, full_run_scans) = with_scan_counting(|| {
             run_pair_impl(
