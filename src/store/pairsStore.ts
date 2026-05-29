@@ -32,6 +32,7 @@ function emptyPair(): FolderPair {
     filters: defaultFilters(),
     conflictPolicy: defaultConflictPolicy,
     enabled: true,
+    watchEnabled: false,
     createdAt: 0,
     updatedAt: 0,
   };

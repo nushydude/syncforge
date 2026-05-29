@@ -3,10 +3,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use crate::persistence::{Database, PersistenceError};
+use crate::watcher::WatchService;
 
 pub struct AppState {
     pub db: Arc<Mutex<Database>>,
     pub cancel_flag: Mutex<Option<Arc<AtomicBool>>>,
+    pub watch_service: Mutex<Option<WatchService>>,
 }
 
 impl AppState {
@@ -16,6 +18,7 @@ impl AppState {
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             cancel_flag: Mutex::new(None),
+            watch_service: Mutex::new(None),
         })
     }
 }

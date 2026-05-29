@@ -29,7 +29,7 @@ pub async fn run_pair(
     pair: FolderPair,
     options: RunPairOptions,
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<RunReport, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     {

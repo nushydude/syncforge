@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use std::sync::Arc;
+
 use tauri::State;
 
 use crate::diff::build_sync_plan;
@@ -59,7 +61,7 @@ pub(crate) fn preview_pair_impl(db: &Database, pair: &FolderPair) -> Result<Sync
 }
 
 #[tauri::command]
-pub fn preview_pair(pair: FolderPair, state: State<'_, AppState>) -> Result<SyncPlan, String> {
+pub fn preview_pair(pair: FolderPair, state: State<'_, Arc<AppState>>) -> Result<SyncPlan, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     preview_pair_impl(&db, &pair)
 }
@@ -88,6 +90,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            watch_enabled: false,
             created_at: 1,
             updated_at: 2,
         })
@@ -176,6 +179,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::Ask,
             enabled: true,
+            watch_enabled: false,
             created_at: 1,
             updated_at: 2,
         })
@@ -210,6 +214,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::Ask,
             enabled: true,
+            watch_enabled: false,
             created_at: 1,
             updated_at: 2,
         })

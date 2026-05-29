@@ -11,6 +11,8 @@ pub struct FolderPair {
     pub filters: Filters,
     pub conflict_policy: ConflictPolicy,
     pub enabled: bool,
+    #[serde(default)]
+    pub watch_enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -171,6 +173,7 @@ mod tests {
             },
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            watch_enabled: false,
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_100_000,
         }

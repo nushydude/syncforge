@@ -58,6 +58,7 @@ impl Database {
                     filters_json TEXT NOT NULL,
                     conflict_policy TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    watch_enabled INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                 );
@@ -96,6 +97,29 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_run_items_run_id ON run_items(run_id);
                 ",
             )?;
+        } else {
+            self.migrate_watch_enabled()?;
+        }
+
+        Ok(())
+    }
+
+    fn migrate_watch_enabled(&self) -> Result<()> {
+        let has_column: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pairs') WHERE name = 'watch_enabled'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_column {
+            self.conn.execute(
+                "ALTER TABLE pairs ADD COLUMN watch_enabled INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
 
         Ok(())
@@ -104,7 +128,7 @@ impl Database {
     pub fn list_pairs(&self) -> Result<Vec<FolderPair>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, left_path, right_path, mode, filters_json, conflict_policy,
-                    enabled, created_at, updated_at
+                    enabled, watch_enabled, created_at, updated_at
              FROM pairs
              ORDER BY name COLLATE NOCASE",
         )?;
@@ -120,6 +144,7 @@ impl Database {
                 row.get::<_, i64>(7)?,
                 row.get::<_, i64>(8)?,
                 row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
             ))
         })?;
 
@@ -133,6 +158,7 @@ impl Database {
                 filters_json,
                 conflict_policy,
                 enabled,
+                watch_enabled,
                 created_at,
                 updated_at,
             ) = row?;
@@ -145,6 +171,7 @@ impl Database {
                 filters_json,
                 conflict_policy,
                 enabled,
+                watch_enabled,
                 created_at,
                 updated_at,
             )?)
@@ -160,8 +187,8 @@ impl Database {
         self.conn.execute(
             "INSERT INTO pairs (
                 id, name, left_path, right_path, mode, filters_json, conflict_policy,
-                enabled, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                enabled, watch_enabled, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 left_path = excluded.left_path,
@@ -170,6 +197,7 @@ impl Database {
                 filters_json = excluded.filters_json,
                 conflict_policy = excluded.conflict_policy,
                 enabled = excluded.enabled,
+                watch_enabled = excluded.watch_enabled,
                 updated_at = excluded.updated_at",
             params![
                 pair.id,
@@ -180,6 +208,7 @@ impl Database {
                 filters_json,
                 conflict_policy,
                 pair.enabled as i64,
+                pair.watch_enabled as i64,
                 pair.created_at,
                 pair.updated_at,
             ],
@@ -202,7 +231,7 @@ impl Database {
     pub fn get_pair(&self, id: &str) -> Result<Option<FolderPair>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, left_path, right_path, mode, filters_json, conflict_policy,
-                    enabled, created_at, updated_at
+                    enabled, watch_enabled, created_at, updated_at
              FROM pairs WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id])?;
@@ -218,6 +247,7 @@ impl Database {
                 row.get(7)?,
                 row.get(8)?,
                 row.get(9)?,
+                row.get(10)?,
             )?;
             return Ok(Some(pair));
         }
@@ -322,6 +352,7 @@ fn row_to_pair(
     filters_json: String,
     conflict_policy: String,
     enabled: i64,
+    watch_enabled: i64,
     created_at: i64,
     updated_at: i64,
 ) -> Result<FolderPair> {
@@ -334,6 +365,7 @@ fn row_to_pair(
         filters: serde_json::from_str(&filters_json)?,
         conflict_policy: str_to_conflict_policy(&conflict_policy)?,
         enabled: enabled != 0,
+        watch_enabled: watch_enabled != 0,
         created_at,
         updated_at,
     })
@@ -403,6 +435,32 @@ mod tests {
     }
 
     #[test]
+    fn watch_enabled_persists() {
+        let (_dir, db) = temp_db();
+        let mut pair = FolderPair {
+            id: new_pair_id(),
+            name: "Watch".into(),
+            left_path: r"C:\left".into(),
+            right_path: r"D:\right".into(),
+            mode: SyncMode::Synchronize,
+            filters: Filters::default(),
+            conflict_policy: ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: true,
+            created_at: 100,
+            updated_at: 200,
+        };
+        db.save_pair(&pair).expect("save");
+        let loaded = db.get_pair(&pair.id).expect("get").expect("pair");
+        assert!(loaded.watch_enabled);
+
+        pair.watch_enabled = false;
+        db.save_pair(&pair).expect("update");
+        let loaded = db.get_pair(&pair.id).expect("get").expect("pair");
+        assert!(!loaded.watch_enabled);
+    }
+
+    #[test]
     fn pair_crud_round_trip() {
         let (_dir, db) = temp_db();
         let pair = FolderPair {
@@ -414,6 +472,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::Ask,
             enabled: true,
+            watch_enabled: false,
             created_at: 100,
             updated_at: 200,
         };
@@ -439,6 +498,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            watch_enabled: false,
             created_at: 1,
             updated_at: 2,
         };
@@ -496,6 +556,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::Ask,
             enabled: true,
+            watch_enabled: false,
             created_at: 1,
             updated_at: 2,
         };

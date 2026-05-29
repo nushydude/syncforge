@@ -35,6 +35,7 @@ const samplePair: FolderPair = {
   filters: { include: ["*.txt"], exclude: [] },
   conflictPolicy: "newerWins",
   enabled: true,
+  watchEnabled: false,
   createdAt: 1,
   updatedAt: 2,
 };

@@ -149,6 +149,16 @@ export function PairEditor() {
         Enabled
       </label>
 
+      <label className="field checkbox-field">
+        <input
+          type="checkbox"
+          checked={editing.watchEnabled}
+          onChange={(e) => updateEditing({ watchEnabled: e.target.checked })}
+          disabled={saving || !editing.enabled}
+        />
+        Watch for changes (auto-sync)
+      </label>
+
       {!isNew && (
         <PreviewTable
           plan={previewPlan}
