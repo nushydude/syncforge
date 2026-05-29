@@ -1,8 +1,10 @@
+import { PreviewTable } from "../preview/PreviewTable";
 import { usePairsStore } from "../../hooks/usePairsStore";
 import {
   cancelEdit,
   deleteSelected,
   pickFolderForSide,
+  previewSelectedPair,
   saveEditing,
   updateEditing,
 } from "../../store/pairsStore";
@@ -10,8 +12,16 @@ import { FilterEditor } from "./FilterEditor";
 import { ModeSelector } from "./ModeSelector";
 
 export function PairEditor() {
-  const { editing, saving, validationErrors, error, selectedId } =
-    usePairsStore();
+  const {
+    editing,
+    saving,
+    validationErrors,
+    error,
+    selectedId,
+    previewPlan,
+    previewLoading,
+    previewError,
+  } = usePairsStore();
 
   if (!editing) {
     return null;
@@ -118,7 +128,25 @@ export function PairEditor() {
         Enabled
       </label>
 
+      {!isNew && (
+        <PreviewTable
+          plan={previewPlan}
+          loading={previewLoading}
+          error={previewError}
+        />
+      )}
+
       <div className="form-actions">
+        {!isNew && (
+          <button
+            type="button"
+            className="btn-primary"
+            disabled={saving || previewLoading}
+            onClick={() => void previewSelectedPair()}
+          >
+            {previewLoading ? "Previewing…" : "Preview sync"}
+          </button>
+        )}
         <button type="submit" className="btn-primary" disabled={saving}>
           {saving ? "Saving…" : "Save pair"}
         </button>

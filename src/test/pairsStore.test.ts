@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as pairsApi from "../api/pairs";
-import type { FolderPair } from "../types";
+import * as previewApi from "../api/preview";
+import type { FolderPair, SyncPlan } from "../types";
 import {
   getPairsState,
   loadPairs,
+  previewSelectedPair,
   resetPairsStoreForTests,
   saveEditing,
   selectPair,
@@ -18,6 +20,10 @@ vi.mock("../api/pairs", () => ({
   pickFolder: vi.fn(),
   pathExists: vi.fn(),
   pathsEqual: vi.fn(),
+}));
+
+vi.mock("../api/preview", () => ({
+  previewPair: vi.fn(),
 }));
 
 const samplePair: FolderPair = {
@@ -104,6 +110,38 @@ describe("pairsStore", () => {
     expect(pairsApi.savePair).toHaveBeenCalled();
     expect(getPairsState().pairs).toHaveLength(1);
     expect(getPairsState().selectedId).toBe("new-id");
+  });
+
+  it("loads preview for selected pair", async () => {
+    const plan: SyncPlan = {
+      pairId: "pair-1",
+      scannedLeft: 1,
+      scannedRight: 1,
+      actions: [{ kind: "copyLeftToRight", path: "a.txt" }],
+    };
+    vi.mocked(pairsApi.listPairs).mockResolvedValue([samplePair]);
+    vi.mocked(previewApi.previewPair).mockResolvedValue(plan);
+    await loadPairs();
+    selectPair("pair-1");
+    updateEditing({ mode: "synchronize" });
+    await previewSelectedPair();
+    expect(previewApi.previewPair).toHaveBeenCalledWith({
+      ...samplePair,
+      mode: "synchronize",
+    });
+    expect(getPairsState().previewPlan).toEqual(plan);
+    expect(getPairsState().previewLoading).toBe(false);
+    expect(getPairsState().previewError).toBeNull();
+  });
+
+  it("surfaces preview errors", async () => {
+    vi.mocked(pairsApi.listPairs).mockResolvedValue([samplePair]);
+    vi.mocked(previewApi.previewPair).mockRejectedValue(new Error("scan left failed"));
+    await loadPairs();
+    selectPair("pair-1");
+    await previewSelectedPair();
+    expect(getPairsState().previewError).toBe("scan left failed");
+    expect(getPairsState().previewPlan).toBeNull();
   });
 
   it("rejects identical paths", async () => {

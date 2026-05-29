@@ -1,6 +1,7 @@
 import * as pairsApi from "../api/pairs";
+import * as previewApi from "../api/preview";
 import { validatePairForm } from "../lib/pairValidation";
-import type { ConflictPolicy, FolderPair, SyncMode } from "../types";
+import type { ConflictPolicy, FolderPair, SyncMode, SyncPlan } from "../types";
 import { defaultFilters } from "../types";
 
 export interface PairsStoreState {
@@ -11,6 +12,9 @@ export interface PairsStoreState {
   saving: boolean;
   error: string | null;
   validationErrors: string[];
+  previewPlan: SyncPlan | null;
+  previewLoading: boolean;
+  previewError: string | null;
 }
 
 type Listener = () => void;
@@ -41,6 +45,9 @@ let state: PairsStoreState = {
   saving: false,
   error: null,
   validationErrors: [],
+  previewPlan: null,
+  previewLoading: false,
+  previewError: null,
 };
 
 const listeners = new Set<Listener>();
@@ -93,6 +100,8 @@ export function selectPair(id: string): void {
     editing: { ...pair, filters: { ...pair.filters } },
     validationErrors: [],
     error: null,
+    previewPlan: null,
+    previewError: null,
   };
   emit();
 }
@@ -114,7 +123,36 @@ export function cancelEdit(): void {
     editing: null,
     validationErrors: [],
     error: null,
+    previewPlan: null,
+    previewError: null,
   };
+  emit();
+}
+
+export async function previewSelectedPair(): Promise<void> {
+  const editing = state.editing;
+  if (!editing?.id) {
+    return;
+  }
+
+  state = {
+    ...state,
+    previewLoading: true,
+    previewError: null,
+    previewPlan: null,
+  };
+  emit();
+
+  try {
+    const previewPlan = await previewApi.previewPair(editing);
+    state = { ...state, previewPlan, previewLoading: false };
+  } catch (e) {
+    state = {
+      ...state,
+      previewLoading: false,
+      previewError: e instanceof Error ? e.message : String(e),
+    };
+  }
   emit();
 }
 
@@ -254,6 +292,9 @@ export function resetPairsStoreForTests(): void {
     saving: false,
     error: null,
     validationErrors: [],
+    previewPlan: null,
+    previewLoading: false,
+    previewError: null,
   };
   emit();
 }

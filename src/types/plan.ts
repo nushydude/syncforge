@@ -26,4 +26,5 @@ export interface SyncPlan {
   actions: SyncAction[];
   scannedLeft: number;
   scannedRight: number;
+  scanWarnings?: string[];
 }

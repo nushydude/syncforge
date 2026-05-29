@@ -6,12 +6,12 @@ Scan both sides of a pair, diff against last snapshot, and show a preview table 
 
 ## Acceptance criteria
 
-- [ ] `scanner.rs`: parallel walk (jwalk), `FileEntry`, glob include/exclude filters
-- [ ] `diff.rs`: mode-aware plan vs snapshot; heavy `#[cfg(test)]` coverage
-- [ ] `preview_pair` command returns `SyncPlan`
-- [ ] Frontend: `filterMatching.ts`, `planFormatting.ts`, `PreviewTable` component
-- [ ] Vitest tests for filter matching and plan formatting
-- [ ] Preview does not execute copies/deletes
+- [x] `scanner.rs`: parallel walk (jwalk), `FileEntry`, glob include/exclude filters
+- [x] `diff.rs`: mode-aware plan vs snapshot; heavy `#[cfg(test)]` coverage
+- [x] `preview_pair` command returns `SyncPlan`
+- [x] Frontend: `filterMatching.ts`, `planFormatting.ts`, `PreviewTable` component
+- [x] Vitest tests for filter matching and plan formatting
+- [x] Preview does not execute copies/deletes
 
 ## Depends on
 
