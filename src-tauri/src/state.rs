@@ -1,10 +1,12 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use crate::persistence::{Database, PersistenceError};
 
 pub struct AppState {
     pub db: Mutex<Database>,
+    pub cancel_flag: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl AppState {
@@ -13,6 +15,7 @@ impl AppState {
         let db = Database::open(&db_path)?;
         Ok(Self {
             db: Mutex::new(db),
+            cancel_flag: Mutex::new(None),
         })
     }
 }

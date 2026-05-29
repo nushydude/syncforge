@@ -1,5 +1,7 @@
 import { PreviewTable } from "../preview/PreviewTable";
+import { RunProgress } from "../run/RunProgress";
 import { usePairsStore } from "../../hooks/usePairsStore";
+import { useSyncProgress } from "../../hooks/useSyncProgress";
 import {
   cancelEdit,
   deleteSelected,
@@ -8,6 +10,7 @@ import {
   saveEditing,
   updateEditing,
 } from "../../store/pairsStore";
+import { runSelectedPair } from "../../store/runStore";
 import { FilterEditor } from "./FilterEditor";
 import { ModeSelector } from "./ModeSelector";
 
@@ -22,6 +25,7 @@ export function PairEditor() {
     previewLoading,
     previewError,
   } = usePairsStore();
+  const { running: runInProgress } = useSyncProgress();
 
   if (!editing) {
     return null;
@@ -136,16 +140,28 @@ export function PairEditor() {
         />
       )}
 
+      {!isNew && <RunProgress />}
+
       <div className="form-actions">
         {!isNew && (
-          <button
-            type="button"
-            className="btn-primary"
-            disabled={saving || previewLoading}
-            onClick={() => void previewSelectedPair()}
-          >
-            {previewLoading ? "Previewing…" : "Preview sync"}
-          </button>
+          <>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={saving || previewLoading || runInProgress}
+              onClick={() => void previewSelectedPair()}
+            >
+              {previewLoading ? "Previewing…" : "Preview sync"}
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={saving || runInProgress}
+              onClick={() => editing && void runSelectedPair(editing)}
+            >
+              {runInProgress ? "Running…" : "Run sync"}
+            </button>
+          </>
         )}
         <button type="submit" className="btn-primary" disabled={saving}>
           {saving ? "Saving…" : "Save pair"}
