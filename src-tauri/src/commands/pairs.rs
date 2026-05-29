@@ -40,9 +40,7 @@ pub fn save_pair(
         .save_pair(&pair)
         .map_err(|e| e.to_string())?;
 
-    if let Err(e) = refresh_watch_service(&app, &state) {
-        eprintln!("watch service refresh failed after save: {e}");
-    }
+    refresh_watch_service(&app, &state)?;
     Ok(saved)
 }
 
@@ -65,9 +63,7 @@ pub fn delete_pair(
             }
         })?;
 
-    if let Err(e) = refresh_watch_service(&app, &state) {
-        eprintln!("watch service refresh failed after delete: {e}");
-    }
+    refresh_watch_service(&app, &state)?;
     Ok(())
 }
 

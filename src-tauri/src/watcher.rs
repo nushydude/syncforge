@@ -108,6 +108,38 @@ fn plan_has_conflicts(actions: &[SyncAction]) -> bool {
         .any(|a| matches!(a, SyncAction::Conflict { .. }))
 }
 
+pub(crate) fn enqueue_pending_watch_sync(state: &AppState, pair_id: impl Into<String>) {
+    if let Ok(mut guard) = state.pending_watch_syncs.lock() {
+        guard.insert(pair_id.into());
+    }
+}
+
+/// Clears the active sync slot when it matches `slot`, then starts any queued watch syncs.
+pub(crate) fn release_sync_slot(
+    app: AppHandle,
+    state: &Arc<AppState>,
+    slot: &Arc<AtomicBool>,
+) {
+    let pending: Vec<String> = {
+        let mut flag_guard = match state.cancel_flag.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if !flag_guard.as_ref().is_some_and(|f| Arc::ptr_eq(f, slot)) {
+            return;
+        }
+        *flag_guard = None;
+        let mut pending_guard = match state.pending_watch_syncs.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        pending_guard.drain().collect()
+    };
+    for pair_id in pending {
+        run_watch_sync(app.clone(), Arc::clone(state), pair_id);
+    }
+}
+
 fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: String) {
     let cancel = Arc::new(AtomicBool::new(false));
     {
@@ -116,6 +148,7 @@ fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: String) {
             Err(_) => return,
         };
         if guard.is_some() {
+            enqueue_pending_watch_sync(&state, pair_id);
             return;
         }
         *guard = Some(cancel.clone());
@@ -169,14 +202,7 @@ fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: String) {
             Ok(())
         })();
 
-        if let Ok(mut guard) = state.cancel_flag.lock() {
-            if guard
-                .as_ref()
-                .is_some_and(|f| Arc::ptr_eq(f, &cancel))
-            {
-                *guard = None;
-            }
-        }
+        release_sync_slot(app_emit.clone(), &state, &cancel);
 
         if let Err(e) = run_result {
             let _ = app_emit.emit(
@@ -297,7 +323,9 @@ impl WatchService {
 
 pub fn refresh_watch_service(app: &AppHandle, state: &Arc<AppState>) -> Result<(), String> {
     let mut guard = state.watch_service.lock().map_err(|e| e.to_string())?;
-    *guard = Some(WatchService::start(app.clone(), Arc::clone(state))?);
+    *guard = None;
+    let service = WatchService::start(app.clone(), Arc::clone(state))?;
+    *guard = Some(service);
     Ok(())
 }
 
@@ -360,6 +388,30 @@ mod tests {
 
         let ids = pairs_for_path(&roots, Path::new(r"c:\pairs\right\doc.txt"));
         assert_eq!(ids, vec!["pair-1".to_string()]);
+    }
+
+    #[test]
+    fn pending_watch_sync_queue_dedupes_pair_ids() {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+
+        use crate::state::AppState;
+
+        let data_dir = TempDir::new().expect("tempdir");
+        let state = Arc::new(AppState::new(data_dir.path().to_path_buf()).expect("app state"));
+        enqueue_pending_watch_sync(&state, "pair-a");
+        enqueue_pending_watch_sync(&state, "pair-a");
+        enqueue_pending_watch_sync(&state, "pair-b");
+
+        let mut pending = state
+            .pending_watch_syncs
+            .lock()
+            .expect("lock")
+            .drain()
+            .collect::<Vec<_>>();
+        pending.sort();
+        assert_eq!(pending, vec!["pair-a".to_string(), "pair-b".to_string()]);
     }
 
     #[cfg(not(windows))]
