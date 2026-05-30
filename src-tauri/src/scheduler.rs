@@ -5,14 +5,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
-use crate::commands::preview::preview_pair_impl;
-use crate::engine::{run_pair_impl, RunOptions};
-use crate::models::{ConflictPolicy, FolderPair, RunStatus, SyncAction};
-use crate::notifications::{notify_sync_error, notify_sync_report};
+use crate::models::FolderPair;
+use crate::run_coordinator::run_scheduled_sync;
 use crate::state::AppState;
-use crate::watcher::{enqueue_pending_watch_sync, release_sync_slot};
 
 pub fn validate_cron_expression(expr: &str) -> Result<(), String> {
     let trimmed = expr.trim();
@@ -36,7 +33,6 @@ fn normalize_cron_expression(expr: &str) -> String {
 #[derive(Debug, Clone)]
 struct ScheduledPair {
     pair_id: String,
-    pair_name: String,
     next_run: DateTime<Utc>,
 }
 
@@ -57,90 +53,9 @@ fn build_scheduled_pairs(pairs: &[FolderPair]) -> Vec<ScheduledPair> {
         let Some(next_run) = schedule.upcoming(Utc).next() else {
             continue;
         };
-        scheduled.push(ScheduledPair {
-            pair_id: pair.id.clone(),
-            pair_name: pair.name.clone(),
-            next_run,
-        });
+        scheduled.push(ScheduledPair { pair_id: pair.id.clone(), next_run });
     }
     scheduled
-}
-
-fn plan_has_conflicts(actions: &[SyncAction]) -> bool {
-    actions.iter().any(|a| matches!(a, SyncAction::Conflict { .. }))
-}
-
-fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: String, pair_name: String) {
-    let cancel = Arc::new(AtomicBool::new(false));
-    {
-        let mut guard = match state.cancel_flag.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if guard.is_some() {
-            enqueue_pending_watch_sync(&state, pair_id);
-            return;
-        }
-        *guard = Some(cancel.clone());
-    }
-
-    let db = Arc::clone(&state.db);
-    let app_emit = app.clone();
-
-    let _ = std::thread::spawn(move || {
-        let run_result = (|| -> Result<(), String> {
-            let pair = {
-                let guard = db.lock().map_err(|e| e.to_string())?;
-                guard
-                    .get_pair(&pair_id)
-                    .map_err(|e| e.to_string())?
-                    .filter(|p| p.enabled && p.schedule_enabled)
-                    .ok_or_else(|| "pair not found or schedule disabled".to_string())?
-            };
-
-            let snapshot_entries = {
-                let guard = db.lock().map_err(|e| e.to_string())?;
-                guard
-                    .latest_snapshot(&pair.id)
-                    .map_err(|e| e.to_string())?
-                    .map(|s| s.entries)
-            };
-            let plan = preview_pair_impl(&pair, snapshot_entries.as_deref())?;
-
-            if pair.conflict_policy == ConflictPolicy::Ask && plan_has_conflicts(&plan.actions) {
-                notify_sync_error(
-                    &app_emit,
-                    &pair_name,
-                    "Scheduled sync skipped: conflicts require manual resolution.",
-                );
-                return Ok(());
-            }
-
-            let options = RunOptions {
-                verify_hashes: false,
-                use_recycle_bin: true,
-                conflict_resolutions: Default::default(),
-                stop_on_error: true,
-                plan: Some(plan),
-                ..Default::default()
-            };
-
-            let report = run_pair_impl(db.as_ref(), &pair, options, &cancel, |progress| {
-                let _ = app_emit.emit("sync://progress", &progress);
-            })?;
-
-            if report.status == RunStatus::Completed || report.status == RunStatus::Failed {
-                notify_sync_report(&app_emit, &pair_name, &report);
-            }
-            Ok(())
-        })();
-
-        release_sync_slot(app_emit.clone(), &state, &cancel);
-
-        if let Err(e) = run_result {
-            notify_sync_error(&app_emit, &pair_name, &e);
-        }
-    });
 }
 
 pub struct ScheduleService {
@@ -175,18 +90,17 @@ impl ScheduleService {
                 };
 
                 let now = Utc::now();
-                let due: Vec<(String, String)> = scheduled
+                let due: Vec<String> = scheduled
                     .iter()
                     .filter(|entry| entry.next_run <= now)
-                    .map(|entry| (entry.pair_id.clone(), entry.pair_name.clone()))
+                    .map(|entry| entry.pair_id.clone())
                     .collect();
 
-                for (pair_id, pair_name) in due {
+                for pair_id in due {
                     run_scheduled_sync(
                         app_task.clone(),
                         Arc::clone(&state_task),
                         pair_id,
-                        pair_name,
                     );
                 }
 

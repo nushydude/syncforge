@@ -1,29 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
-use crate::commands::preview::preview_pair_impl;
-use crate::engine::{run_pair_impl, RunOptions};
-use crate::models::{ConflictPolicy, FolderPair, SyncAction};
+use crate::models::FolderPair;
 use crate::path_normalization;
-use crate::state::AppState;
+use crate::run_coordinator::run_watch_sync;
+use crate::state::{should_ignore_watch_event, AppState};
 
 /// Debounce window for filesystem events (bulk drops coalesce into one sync).
 pub const DEBOUNCE_MS: u64 = 2000;
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WatchSkippedPayload {
-    pub pair_id: String,
-    pub reason: String,
-}
 
 /// Tracks per-pair debounce deadlines; resets the timer on each new event.
 #[derive(Debug)]
@@ -94,110 +84,6 @@ fn build_roots(pairs: &[FolderPair]) -> Vec<WatchedRoots> {
         .collect()
 }
 
-fn plan_has_conflicts(actions: &[SyncAction]) -> bool {
-    actions.iter().any(|a| matches!(a, SyncAction::Conflict { .. }))
-}
-
-pub(crate) fn enqueue_pending_watch_sync(state: &AppState, pair_id: impl Into<String>) {
-    if let Ok(mut guard) = state.pending_watch_syncs.lock() {
-        guard.insert(pair_id.into());
-    }
-}
-
-/// Clears the active sync slot when it matches `slot`, then starts any queued watch syncs.
-pub(crate) fn release_sync_slot(app: AppHandle, state: &Arc<AppState>, slot: &Arc<AtomicBool>) {
-    let pending: Vec<String> = {
-        let mut flag_guard = match state.cancel_flag.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if !flag_guard.as_ref().is_some_and(|f| Arc::ptr_eq(f, slot)) {
-            return;
-        }
-        *flag_guard = None;
-        let mut pending_guard = match state.pending_watch_syncs.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        pending_guard.drain().collect()
-    };
-    for pair_id in pending {
-        run_watch_sync(app.clone(), Arc::clone(state), pair_id);
-    }
-}
-
-fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: String) {
-    let cancel = Arc::new(AtomicBool::new(false));
-    {
-        let mut guard = match state.cancel_flag.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if guard.is_some() {
-            enqueue_pending_watch_sync(&state, pair_id);
-            return;
-        }
-        *guard = Some(cancel.clone());
-    }
-
-    let db = Arc::clone(&state.db);
-    let app_emit = app.clone();
-
-    let _ = std::thread::spawn(move || {
-        let run_result = (|| -> Result<(), String> {
-            let pair = {
-                let guard = db.lock().map_err(|e| e.to_string())?;
-                guard
-                    .get_pair(&pair_id)
-                    .map_err(|e| e.to_string())?
-                    .filter(|p| p.enabled && p.watch_enabled)
-                    .ok_or_else(|| "pair not found or watch disabled".to_string())?
-            };
-
-            let snapshot_entries = {
-                let guard = db.lock().map_err(|e| e.to_string())?;
-                guard
-                    .latest_snapshot(&pair.id)
-                    .map_err(|e| e.to_string())?
-                    .map(|s| s.entries)
-            };
-            let plan = preview_pair_impl(&pair, snapshot_entries.as_deref())?;
-
-            if pair.conflict_policy == ConflictPolicy::Ask && plan_has_conflicts(&plan.actions) {
-                let _ = app_emit.emit(
-                    "sync://watch-skipped",
-                    &WatchSkippedPayload {
-                        pair_id: pair.id.clone(),
-                        reason: "conflicts require manual resolution".into(),
-                    },
-                );
-                return Ok(());
-            }
-
-            let options = RunOptions {
-                verify_hashes: false,
-                use_recycle_bin: true,
-                conflict_resolutions: Default::default(),
-                stop_on_error: true,
-                plan: Some(plan),
-                ..Default::default()
-            };
-
-            run_pair_impl(db.as_ref(), &pair, options, &cancel, |progress| {
-                let _ = app_emit.emit("sync://progress", &progress);
-            })?;
-            Ok(())
-        })();
-
-        release_sync_slot(app_emit.clone(), &state, &cancel);
-
-        if let Err(e) = run_result {
-            let _ =
-                app_emit.emit("sync://watch-skipped", &WatchSkippedPayload { pair_id, reason: e });
-        }
-    });
-}
-
 pub struct WatchService {
     _watcher: RecommendedWatcher,
     _debounce_thread: std::thread::JoinHandle<()>,
@@ -210,7 +96,7 @@ impl WatchService {
         let roots = Arc::new(Mutex::new(build_roots(&pairs)));
         let (event_tx, event_rx) = mpsc::channel::<String>();
 
-        let watcher = Self::build_watcher(Arc::clone(&roots), event_tx)?;
+        let watcher = Self::build_watcher(Arc::clone(&state), Arc::clone(&roots), event_tx)?;
 
         let app_debounce = app.clone();
         let state_debounce = Arc::clone(&state);
@@ -237,10 +123,12 @@ impl WatchService {
     }
 
     fn build_watcher(
+        state: Arc<AppState>,
         roots: Arc<Mutex<Vec<WatchedRoots>>>,
         event_tx: mpsc::Sender<String>,
     ) -> Result<RecommendedWatcher, String> {
         let roots_for_callback = Arc::clone(&roots);
+        let state_for_callback = Arc::clone(&state);
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<notify::Event, notify::Error>| {
                 let Ok(event) = res else {
@@ -263,6 +151,9 @@ impl WatchService {
                     }
                 }
                 for pair_id in pair_ids {
+                    if should_ignore_watch_event(&state_for_callback, &pair_id) {
+                        continue;
+                    }
                     let _ = event_tx.send(pair_id);
                 }
             },
@@ -304,6 +195,9 @@ pub fn refresh_watch_service(app: &AppHandle, state: &Arc<AppState>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{enqueue_pending_watch_sync, AppState};
+    use std::sync::Arc;
+    use tempfile::TempDir;
 
     #[test]
     fn debounce_coalesces_rapid_events_for_same_pair() {
@@ -361,12 +255,6 @@ mod tests {
 
     #[test]
     fn pending_watch_sync_queue_dedupes_pair_ids() {
-        use std::sync::Arc;
-
-        use tempfile::TempDir;
-
-        use crate::state::AppState;
-
         let data_dir = TempDir::new().expect("tempdir");
         let state = Arc::new(AppState::new(data_dir.path().to_path_buf()).expect("app state"));
         enqueue_pending_watch_sync(&state, "pair-a");
