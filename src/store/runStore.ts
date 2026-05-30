@@ -197,7 +197,9 @@ export async function runSelectedPair(pair: FolderPair): Promise<RunReport | nul
 
     return await executeRun(pair, {});
   } finally {
-    runInFlight = false;
+    if (!state.pendingConflicts) {
+      runInFlight = false;
+    }
   }
 }
 
@@ -218,15 +220,20 @@ export function cancelConflictResolution(): void {
     pendingConflicts: null,
     conflictResolutions: {},
   };
+  runInFlight = false;
   emit();
 }
 
 export async function confirmConflictResolutionAndRun(): Promise<RunReport | null> {
   const pending = state.pendingConflicts;
-  if (!pending) {
+  if (!pending || state.running) {
     return null;
   }
-  return executeRun(pending.pair, state.conflictResolutions);
+  try {
+    return await executeRun(pending.pair, state.conflictResolutions);
+  } finally {
+    runInFlight = false;
+  }
 }
 
 export async function cancelActiveRun(): Promise<void> {

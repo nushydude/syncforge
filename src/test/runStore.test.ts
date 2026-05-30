@@ -216,6 +216,45 @@ describe('runStore', () => {
     expect(getRunState().error).toBe('not running');
   });
 
+  it('ignores duplicate runSelectedPair while conflicts are pending', async () => {
+    vi.mocked(previewApi.previewPair).mockResolvedValue({
+      pairId: 'pair-1',
+      scannedLeft: 1,
+      scannedRight: 1,
+      actions: [
+        {
+          kind: 'conflict',
+          path: 'both.txt',
+          left: {
+            relativePath: 'both.txt',
+            size: 1,
+            modifiedSecs: 1,
+            isDir: false,
+          },
+          right: {
+            relativePath: 'both.txt',
+            size: 2,
+            modifiedSecs: 2,
+            isDir: false,
+          },
+        },
+      ],
+    });
+
+    const askPair = {
+      ...samplePair,
+      mode: 'synchronize' as const,
+      conflictPolicy: 'ask' as const,
+    };
+
+    await runSelectedPair(askPair);
+    expect(getRunState().pendingConflicts?.conflicts).toHaveLength(1);
+
+    await runSelectedPair(askPair);
+    expect(previewApi.previewPair).toHaveBeenCalledTimes(1);
+    expect(runApi.runPair).not.toHaveBeenCalled();
+  });
+
   it('ignores duplicate runSelectedPair while in flight', async () => {
     vi.mocked(runApi.runPair).mockImplementation(() => new Promise(() => {}));
 
@@ -232,6 +271,53 @@ describe('runStore', () => {
     const report = await runSelectedPair(samplePair);
     expect(report).toBeNull();
     expect(runApi.runPair).not.toHaveBeenCalled();
+  });
+
+  it('ignores duplicate confirmConflictResolutionAndRun while running', async () => {
+    vi.mocked(previewApi.previewPair).mockResolvedValue({
+      pairId: 'pair-1',
+      scannedLeft: 1,
+      scannedRight: 1,
+      actions: [
+        {
+          kind: 'conflict',
+          path: 'both.txt',
+          left: {
+            relativePath: 'both.txt',
+            size: 1,
+            modifiedSecs: 1,
+            isDir: false,
+          },
+          right: {
+            relativePath: 'both.txt',
+            size: 2,
+            modifiedSecs: 2,
+            isDir: false,
+          },
+        },
+      ],
+    });
+    let resolveRun: (report: RunReport) => void = () => {};
+    const runDeferred = new Promise<RunReport>((resolve) => {
+      resolveRun = resolve;
+    });
+    vi.mocked(runApi.runPair).mockReturnValue(runDeferred);
+
+    await runSelectedPair({
+      ...samplePair,
+      mode: 'synchronize',
+      conflictPolicy: 'ask',
+    });
+    setConflictResolution('both.txt', 'left');
+
+    void confirmConflictResolutionAndRun();
+    await vi.waitFor(() => getRunState().running);
+
+    const report = await confirmConflictResolutionAndRun();
+    expect(report).toBeNull();
+    expect(runApi.runPair).toHaveBeenCalledTimes(1);
+
+    resolveRun(sampleReport);
   });
 
   it('runs with user conflict resolutions after confirm', async () => {
