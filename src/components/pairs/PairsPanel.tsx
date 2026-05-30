@@ -1,17 +1,27 @@
 import { useEffect } from "react";
 import { usePairsStore } from "../../hooks/usePairsStore";
-import { useSyncProgress } from "../../hooks/useSyncProgress";
+import { useRunStore } from "../../hooks/useRunStore";
 import { loadPairs, startNewPair } from "../../store/pairsStore";
+import type { PairsStoreState } from "../../store/pairsStore";
 import {
   dismissWatchSkipped,
   ensureWatchSkippedListener,
 } from "../../store/runStore";
+import type { RunStoreState } from "../../store/runStore";
 import { PairEditor } from "./PairEditor";
 import { PairList } from "./PairList";
 
+const selectPairsPanel = (s: PairsStoreState) => ({
+  pairs: s.pairs,
+  editing: s.editing,
+  loading: s.loading,
+});
+
+const selectWatchSkipped = (s: RunStoreState) => s.watchSkipped;
+
 export function PairsPanel() {
-  const { pairs, editing, loading } = usePairsStore();
-  const { watchSkipped } = useSyncProgress();
+  const { pairs, editing, loading } = usePairsStore(selectPairsPanel);
+  const watchSkipped = useRunStore(selectWatchSkipped);
 
   useEffect(() => {
     void loadPairs();

@@ -1,19 +1,38 @@
-import { useHistoryStore } from '../../hooks/useHistoryStore';
-import { usePairsStore } from '../../hooks/usePairsStore';
-import { exportRunAsCsv, exportRunAsJson } from '../../lib/exportRun';
+import { useEffect, useState } from "react";
+import { useHistoryStore } from "../../hooks/useHistoryStore";
+import { usePairsStore } from "../../hooks/usePairsStore";
+import { exportRunAsCsv, exportRunAsJson } from "../../lib/exportRun";
 import {
   formatBytes,
   formatDuration,
   statsFromItems,
-} from '../../lib/syncStats';
+} from "../../lib/syncStats";
+import type { HistoryStoreState } from "../../store/historyStore";
+import type { PairsStoreState } from "../../store/pairsStore";
+
+const RUN_DETAIL_PAGE_SIZE = 200;
 
 function formatTimestamp(ms: number): string {
   return new Date(ms).toLocaleString();
 }
 
+const selectRunDetailHistory = (s: HistoryStoreState) => ({
+  detail: s.detail,
+  detailLoading: s.detailLoading,
+  error: s.error,
+});
+
+const selectPairNames = (s: PairsStoreState) =>
+  s.pairs.map((p) => ({ id: p.id, name: p.name }));
+
 export function RunDetail() {
-  const { pairs } = usePairsStore();
-  const { detail, detailLoading, error } = useHistoryStore();
+  const { detail, detailLoading, error } = useHistoryStore(selectRunDetailHistory);
+  const pairNames = usePairsStore(selectPairNames);
+  const [visibleCount, setVisibleCount] = useState(RUN_DETAIL_PAGE_SIZE);
+
+  useEffect(() => {
+    setVisibleCount(RUN_DETAIL_PAGE_SIZE);
+  }, [detail?.report.runId]);
 
   if (detailLoading) {
     return <p className="history-status">Loading run details…</p>;
@@ -34,7 +53,10 @@ export function RunDetail() {
   const { report, items } = detail;
   const stats = statsFromItems(report, items);
   const pairName =
-    pairs.find((p) => p.id === report.pairId)?.name ?? report.pairId;
+    pairNames.find((p) => p.id === report.pairId)?.name ?? report.pairId;
+
+  const visibleItems = items.slice(0, visibleCount);
+  const hasMore = items.length > visibleCount;
 
   const handleExportJson = () => exportRunAsJson(detail);
   const handleExportCsv = () => exportRunAsCsv(detail);
@@ -103,38 +125,53 @@ export function RunDetail() {
         {items.length === 0 ? (
           <p className="history-status">No per-file records for this run.</p>
         ) : (
-          <div className="run-detail-table-wrap">
-            <table className="run-detail-table">
-              <thead>
-                <tr>
-                  <th>Path</th>
-                  <th>Action</th>
-                  <th>Status</th>
-                  <th>Bytes</th>
-                  <th>Message</th>
-                </tr>
-              </thead>
-              <tbody>
-                {items.map((item) => (
-                  <tr key={item.id}>
-                    <td className="run-detail-path">{item.path}</td>
-                    <td>{item.action}</td>
-                    <td>{item.status}</td>
-                    <td>
-                      {item.bytes != null ? formatBytes(item.bytes) : '—'}
-                    </td>
-                    <td>{item.message ?? '—'}</td>
+          <>
+            <div className="run-detail-table-wrap">
+              <table className="run-detail-table">
+                <thead>
+                  <tr>
+                    <th>Path</th>
+                    <th>Action</th>
+                    <th>Status</th>
+                    <th>Bytes</th>
+                    <th>Message</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {visibleItems.map((item) => (
+                    <tr key={item.id}>
+                      <td className="run-detail-path">{item.path}</td>
+                      <td>{item.action}</td>
+                      <td>{item.status}</td>
+                      <td>
+                        {item.bytes != null ? formatBytes(item.bytes) : "—"}
+                      </td>
+                      <td>{item.message ?? "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {hasMore && (
+              <button
+                type="button"
+                className="run-detail-load-more"
+                onClick={() =>
+                  setVisibleCount((n) =>
+                    Math.min(n + RUN_DETAIL_PAGE_SIZE, items.length),
+                  )
+                }
+              >
+                Load more ({items.length - visibleCount} remaining)
+              </button>
+            )}
+          </>
         )}
       </section>
 
       <p className="run-detail-summary">
-        Summary: {stats.filesChanged} file change(s) ·{' '}
-        {formatBytes(stats.bytesTransferred)} ·{' '}
+        Summary: {stats.filesChanged} file change(s) ·{" "}
+        {formatBytes(stats.bytesTransferred)} ·{" "}
         {formatDuration(stats.durationMs)}
       </p>
     </article>

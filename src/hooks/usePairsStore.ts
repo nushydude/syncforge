@@ -1,10 +1,13 @@
-import { useSyncExternalStore } from "react";
+import { createStoreHook } from "./createStoreHook";
 import {
   getPairsState,
   subscribePairs,
   type PairsStoreState,
 } from "../store/pairsStore";
 
-export function usePairsStore(): PairsStoreState {
-  return useSyncExternalStore(subscribePairs, getPairsState, getPairsState);
-}
+export const usePairsStore = createStoreHook<PairsStoreState>(
+  subscribePairs,
+  getPairsState,
+);
+
+export type { PairsStoreState };

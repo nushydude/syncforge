@@ -1,14 +1,13 @@
-import { useSyncExternalStore } from 'react';
+import { createStoreHook } from "./createStoreHook";
 import {
   getHistoryState,
   subscribeHistory,
   type HistoryStoreState,
-} from '../store/historyStore';
+} from "../store/historyStore";
 
-export function useHistoryStore(): HistoryStoreState {
-  return useSyncExternalStore(
-    subscribeHistory,
-    getHistoryState,
-    getHistoryState,
-  );
-}
+export const useHistoryStore = createStoreHook<HistoryStoreState>(
+  subscribeHistory,
+  getHistoryState,
+);
+
+export type { HistoryStoreState };

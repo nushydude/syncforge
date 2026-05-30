@@ -1,25 +1,35 @@
-import { useSyncProgress } from '../../hooks/useSyncProgress';
-import { cancelActiveRun } from '../../store/runStore';
+import { memo } from "react";
+import { useRunStore } from "../../hooks/useRunStore";
+import { cancelActiveRun } from "../../store/runStore";
+import type { RunStoreState } from "../../store/runStore";
 
 function phaseLabel(phase: string | undefined): string {
   switch (phase) {
-    case 'scanning':
-      return 'Scanning…';
-    case 'running':
-      return 'Syncing…';
-    case 'completed':
-      return 'Completed';
-    case 'failed':
-      return 'Failed';
-    case 'cancelled':
-      return 'Cancelled';
+    case "scanning":
+      return "Scanning…";
+    case "running":
+      return "Syncing…";
+    case "completed":
+      return "Completed";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Cancelled";
     default:
-      return 'Running…';
+      return "Running…";
   }
 }
 
-export function RunProgress() {
-  const { running, progress, lastReport, error } = useSyncProgress();
+const selectRunProgress = (s: RunStoreState) => ({
+  running: s.running,
+  progress: s.progress,
+  lastReport: s.lastReport,
+  error: s.error,
+});
+
+export const RunProgress = memo(function RunProgress() {
+  const { running, progress, lastReport, error } =
+    useRunStore(selectRunProgress);
 
   if (!running && !progress && !lastReport && !error) {
     return null;
@@ -73,7 +83,7 @@ export function RunProgress() {
 
       {lastReport && !running && (
         <p className="run-progress-summary">
-          Copied {lastReport.filesCopied} · Deleted {lastReport.filesDeleted} ·{' '}
+          Copied {lastReport.filesCopied} · Deleted {lastReport.filesDeleted} ·{" "}
           {(lastReport.bytesTransferred / 1024).toFixed(1)} KiB
           {lastReport.errors.length > 0 &&
             ` · ${lastReport.errors.length} error(s)`}
@@ -81,4 +91,4 @@ export function RunProgress() {
       )}
     </section>
   );
-}
+});

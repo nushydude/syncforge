@@ -1,14 +1,16 @@
-import { useEffect } from 'react';
-import { useHistoryStore } from '../../hooks/useHistoryStore';
-import { usePairsStore } from '../../hooks/usePairsStore';
-import { loadPairs } from '../../store/pairsStore';
+import { useEffect } from "react";
+import { useHistoryStore } from "../../hooks/useHistoryStore";
+import { usePairsStore } from "../../hooks/usePairsStore";
+import { loadPairs } from "../../store/pairsStore";
+import type { PairsStoreState } from "../../store/pairsStore";
 import {
   clearRunSelection,
   loadHistory,
   selectRun,
   setPairFilter,
-} from '../../store/historyStore';
-import { RunDetail } from './RunDetail';
+} from "../../store/historyStore";
+import type { HistoryStoreState } from "../../store/historyStore";
+import { RunDetail } from "./RunDetail";
 
 function formatTimestamp(ms: number): string {
   return new Date(ms).toLocaleString();
@@ -16,36 +18,43 @@ function formatTimestamp(ms: number): string {
 
 function statusLabel(status: string): string {
   switch (status) {
-    case 'completed':
-      return 'Completed';
-    case 'failed':
-      return 'Failed';
-    case 'cancelled':
-      return 'Cancelled';
-    case 'running':
-      return 'Running';
+    case "completed":
+      return "Completed";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Cancelled";
+    case "running":
+      return "Running";
     default:
       return status;
   }
 }
 
+/** Pair id → display name; only re-renders when the pairs list changes. */
+const selectPairNames = (s: PairsStoreState) =>
+  s.pairs.map((p) => ({ id: p.id, name: p.name }));
+
+const selectHistoryList = (s: HistoryStoreState) => ({
+  runs: s.runs,
+  pairFilter: s.pairFilter,
+  selectedRunId: s.selectedRunId,
+  loading: s.loading,
+  error: s.error,
+});
+
 export function HistoryView() {
-  const { pairs } = usePairsStore();
-  const {
-    runs,
-    pairFilter,
-    selectedRunId,
-    loading,
-    error,
-  } = useHistoryStore();
+  const pairNames = usePairsStore(selectPairNames);
+  const { runs, pairFilter, selectedRunId, loading, error } =
+    useHistoryStore(selectHistoryList);
 
   useEffect(() => {
     void loadPairs();
     void loadHistory();
   }, []);
 
-  const pairName = (pairId: string) =>
-    pairs.find((p) => p.id === pairId)?.name ?? pairId;
+  const pairNameById = new Map(pairNames.map((p) => [p.id, p.name]));
+  const pairName = (pairId: string) => pairNameById.get(pairId) ?? pairId;
 
   return (
     <div className="history-panel">
@@ -55,13 +64,13 @@ export function HistoryView() {
           <label className="history-filter">
             <span>Pair</span>
             <select
-              value={pairFilter ?? ''}
+              value={pairFilter ?? ""}
               onChange={(e) =>
                 setPairFilter(e.target.value ? e.target.value : null)
               }
             >
               <option value="">All pairs</option>
-              {pairs.map((pair) => (
+              {pairNames.map((pair) => (
                 <option key={pair.id} value={pair.id}>
                   {pair.name}
                 </option>
@@ -88,8 +97,8 @@ export function HistoryView() {
                 type="button"
                 className={
                   run.runId === selectedRunId
-                    ? 'history-run-item selected'
-                    : 'history-run-item'
+                    ? "history-run-item selected"
+                    : "history-run-item"
                 }
                 onClick={() => void selectRun(run.runId)}
               >

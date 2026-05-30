@@ -466,6 +466,10 @@ button:disabled {
   overflow-x: auto;
 }
 
+.preview-table-virtual {
+  overflow-y: auto;
+}
+
 .preview-table {
   width: 100%;
   border-collapse: collapse;
@@ -905,6 +909,11 @@ button:disabled {
 .run-detail-path {
   font-family: ui-monospace, Consolas, monospace;
   word-break: break-all;
+}
+
+.run-detail-load-more {
+  margin-top: 0.75rem;
+  font-size: 0.875rem;
 }
 
 .run-detail-summary {

@@ -1,10 +1,4 @@
-import { useSyncExternalStore } from 'react';
-import {
-  getRunState,
-  subscribeRun,
-  type RunStoreState,
-} from '../store/runStore';
+export { useRunStore, type RunStoreState } from "./useRunStore";
 
-export function useSyncProgress(): RunStoreState {
-  return useSyncExternalStore(subscribeRun, getRunState, getRunState);
-}
+/** @deprecated Prefer `useRunStore` — kept for existing imports. */
+export { useRunStore as useSyncProgress } from "./useRunStore";

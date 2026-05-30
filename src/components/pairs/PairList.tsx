@@ -1,8 +1,15 @@
 import { usePairsStore } from "../../hooks/usePairsStore";
 import { selectPair, startNewPair } from "../../store/pairsStore";
+import type { PairsStoreState } from "../../store/pairsStore";
+
+const selectPairList = (s: PairsStoreState) => ({
+  pairs: s.pairs,
+  selectedId: s.selectedId,
+  loading: s.loading,
+});
 
 export function PairList() {
-  const { pairs, selectedId, loading } = usePairsStore();
+  const { pairs, selectedId, loading } = usePairsStore(selectPairList);
 
   return (
     <aside className="pair-list">
