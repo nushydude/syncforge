@@ -1,7 +1,6 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useHistoryStore } from "../../hooks/useHistoryStore";
 import { selectPairsList, usePairsStore } from "../../hooks/usePairsStore";
-import { loadPairs } from "../../store/pairsStore";
 import {
   clearRunSelection,
   loadHistory,
@@ -38,7 +37,12 @@ const selectHistoryList = (s: HistoryStoreState) => ({
   error: s.error,
 });
 
-export function HistoryView() {
+interface HistoryViewProps {
+  /** When false, history is not fetched (panel may stay mounted but hidden). */
+  active?: boolean;
+}
+
+export function HistoryView({ active = true }: HistoryViewProps) {
   const pairs = usePairsStore(selectPairsList);
   const pairNames = useMemo(
     () => pairs.map((p) => ({ id: p.id, name: p.name })),
@@ -46,11 +50,15 @@ export function HistoryView() {
   );
   const { runs, pairFilter, selectedRunId, loading, error } =
     useHistoryStore(selectHistoryList);
+  const historyLoadedRef = useRef(false);
 
   useEffect(() => {
-    void loadPairs();
+    if (!active || historyLoadedRef.current) {
+      return;
+    }
+    historyLoadedRef.current = true;
     void loadHistory();
-  }, []);
+  }, [active]);
 
   const pairNameById = useMemo(
     () => new Map(pairNames.map((p) => [p.id, p.name])),

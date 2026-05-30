@@ -40,7 +40,7 @@ function App() {
         <PairsPanel />
       </div>
       <div hidden={view !== "history"}>
-        <HistoryView />
+        <HistoryView active={view === "history"} />
       </div>
     </div>
   );

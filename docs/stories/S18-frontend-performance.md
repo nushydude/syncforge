@@ -10,14 +10,14 @@ Lean UI for large sync plans (10k+ actions).
 
 ## Acceptance criteria
 
-- [ ] `usePairsStore(selector)` / `useRunStore(selector)` / `useHistoryStore(selector)` with shallow compare (or split subscriptions)
-- [ ] `PairList` only subscribes to `pairs`, `selectedId`, `loading`
-- [ ] `PreviewTable`: virtualize rows (`@tanstack/react-virtual` or windowed render); `useMemo` for formatted rows
-- [ ] `RunDetail` items table virtualized or paginated (first 200 + load more)
-- [ ] `RunProgress` / `PairEditor`: avoid duplicate full `useSyncProgress` re-renders (`React.memo` on `RunProgress`)
-- [ ] `HistoryView`: selector for pair names only
-- [ ] Optional: keep panels mounted in `App.tsx` (hidden) to avoid reload on tab switch
-- [ ] `pnpm test` pass; no regressions in smoke tests
+- [x] `usePairsStore(selector)` / `useRunStore(selector)` / `useHistoryStore(selector)` with shallow compare (or split subscriptions)
+- [x] `PairList` only subscribes to `pairs`, `selectedId`, `loading`
+- [x] `PreviewTable`: virtualize rows (`@tanstack/react-virtual` or windowed render); `useMemo` for formatted rows
+- [x] `RunDetail` items table virtualized or paginated (first 200 + load more)
+- [x] `RunProgress` / `PairEditor`: avoid duplicate full `useSyncProgress` re-renders (`React.memo` on `RunProgress`)
+- [x] `HistoryView`: selector for pair names only
+- [x] Optional: keep panels mounted in `App.tsx` (hidden) to avoid reload on tab switch
+- [x] `pnpm test` pass; no regressions in smoke tests
 
 ## Files likely touched
 
