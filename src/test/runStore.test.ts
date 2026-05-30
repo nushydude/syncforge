@@ -3,6 +3,7 @@ import * as previewApi from '../api/preview';
 import * as runApi from '../api/run';
 import type { FolderPair, RunReport } from '../types';
 import {
+  cancelActiveRun,
   confirmConflictResolutionAndRun,
   dismissWatchSkipped,
   ensureWatchSkippedListener,
@@ -11,6 +12,7 @@ import {
   runSelectedPair,
   setConflictResolution,
 } from '../store/runStore';
+import * as pairsStore from '../store/pairsStore';
 
 const listenHandlers: Record<string, (event: { payload: unknown }) => void> =
   {};
@@ -70,6 +72,7 @@ describe('runStore', () => {
   beforeEach(() => {
     resetRunStoreForTests();
     vi.clearAllMocks();
+    vi.restoreAllMocks();
     for (const key of Object.keys(listenHandlers)) {
       delete listenHandlers[key];
     }
@@ -145,6 +148,90 @@ describe('runStore', () => {
     });
     dismissWatchSkipped();
     expect(getRunState().watchSkipped).toBeNull();
+  });
+
+  it('ignores progress when no UI run is active', async () => {
+    vi.mocked(runApi.runPair).mockResolvedValue(sampleReport);
+    await runSelectedPair(samplePair);
+
+    listenHandlers['sync://progress']?.({
+      payload: {
+        runId: 'bg-run',
+        pairId: 'pair-1',
+        phase: 'running',
+        current: 1,
+        total: 10,
+      },
+    });
+
+    expect(getRunState().progress).toBeNull();
+  });
+
+  it('ignores progress for a different pair during UI run', async () => {
+    let resolveRun: (report: RunReport) => void = () => {};
+    const runDeferred = new Promise<RunReport>((resolve) => {
+      resolveRun = resolve;
+    });
+    vi.mocked(runApi.runPair).mockReturnValue(runDeferred);
+
+    const runPromise = runSelectedPair(samplePair);
+    await vi.waitFor(() => getRunState().running);
+    await vi.waitFor(() => listenHandlers['sync://progress']);
+
+    listenHandlers['sync://progress']?.({
+      payload: {
+        runId: 'run-1',
+        pairId: 'other-pair',
+        phase: 'running',
+        current: 1,
+        total: 5,
+      },
+    });
+    expect(getRunState().progress).toBeNull();
+
+    listenHandlers['sync://progress']?.({
+      payload: {
+        runId: 'run-1',
+        pairId: 'pair-1',
+        phase: 'running',
+        current: 2,
+        total: 5,
+      },
+    });
+    expect(getRunState().progress?.current).toBe(2);
+
+    resolveRun(sampleReport);
+    await runPromise;
+  });
+
+  it('clears running state optimistically and recovers on cancel error', async () => {
+    vi.mocked(runApi.runPair).mockImplementation(() => new Promise(() => {}));
+    vi.mocked(runApi.cancelRun).mockRejectedValue(new Error('not running'));
+
+    void runSelectedPair(samplePair);
+    await vi.waitFor(() => getRunState().running);
+
+    await cancelActiveRun();
+    expect(getRunState().running).toBe(true);
+    expect(getRunState().error).toBe('not running');
+  });
+
+  it('ignores duplicate runSelectedPair while in flight', async () => {
+    vi.mocked(runApi.runPair).mockImplementation(() => new Promise(() => {}));
+
+    void runSelectedPair(samplePair);
+    await vi.waitFor(() => getRunState().running);
+    await runSelectedPair(samplePair);
+
+    expect(runApi.runPair).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocks run while preview is loading', async () => {
+    vi.spyOn(pairsStore, 'isPreviewLoading').mockReturnValue(true);
+
+    const report = await runSelectedPair(samplePair);
+    expect(report).toBeNull();
+    expect(runApi.runPair).not.toHaveBeenCalled();
   });
 
   it('runs with user conflict resolutions after confirm', async () => {

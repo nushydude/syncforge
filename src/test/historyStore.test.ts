@@ -72,6 +72,65 @@ describe('historyStore', () => {
     expect(historyApi.getHistory).toHaveBeenCalledWith('pair-1');
   });
 
+  it('ignores stale loadHistory results', async () => {
+    let resolveFirst!: (runs: RunReport[]) => void;
+    let resolveSecond!: (runs: RunReport[]) => void;
+    let call = 0;
+    vi.mocked(historyApi.getHistory).mockImplementation(() => {
+      call += 1;
+      if (call === 1) {
+        return new Promise((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return new Promise((resolve) => {
+        resolveSecond = resolve;
+      });
+    });
+
+    const first = loadHistory();
+    const second = loadHistory('pair-1');
+
+    resolveFirst([runB]);
+    await first;
+    expect(getHistoryState().loading).toBe(true);
+
+    resolveSecond([runA]);
+    await second;
+    expect(getHistoryState().runs).toEqual([runA]);
+    expect(getHistoryState().pairFilter).toBe('pair-1');
+  });
+
+  it('ignores stale selectRun detail', async () => {
+    const detailB: RunDetail = { report: runB, items: [] };
+    let resolveFirst!: (detail: RunDetail) => void;
+    let resolveSecond!: (detail: RunDetail) => void;
+    let call = 0;
+    vi.mocked(historyApi.getRunDetail).mockImplementation(() => {
+      call += 1;
+      if (call === 1) {
+        return new Promise((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return new Promise((resolve) => {
+        resolveSecond = resolve;
+      });
+    });
+
+    const first = selectRun('run-a');
+    const second = selectRun('run-b');
+
+    resolveFirst(detail);
+    await first;
+    expect(getHistoryState().detail).toBeNull();
+    expect(getHistoryState().selectedRunId).toBe('run-b');
+
+    resolveSecond(detailB);
+    await second;
+    expect(getHistoryState().detail).toEqual(detailB);
+  });
+
   it('loads run detail on selection', async () => {
     vi.mocked(historyApi.getRunDetail).mockResolvedValue(detail);
     await selectRun('run-a');

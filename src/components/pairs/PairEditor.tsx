@@ -238,7 +238,7 @@ export function PairEditor() {
             <button
               type="button"
               className="btn-primary"
-              disabled={saving || runInProgress}
+              disabled={saving || previewLoading || runInProgress}
               onClick={() => editing && void runSelectedPair(editing)}
             >
               {runInProgress ? "Running…" : "Run sync"}

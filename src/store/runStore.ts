@@ -2,6 +2,7 @@ import { listen } from '@tauri-apps/api/event';
 import * as previewApi from '../api/preview';
 import * as runApi from '../api/run';
 import { listConflictActions, type ConflictAction } from '../lib/conflictPolicy';
+import { isPreviewLoading } from './pairsStore';
 import type {
   ConflictChoice,
   FolderPair,
@@ -44,6 +45,11 @@ const listeners = new Set<Listener>();
 let unlistenProgress: (() => void) | null = null;
 let unlistenWatchSkipped: (() => void) | null = null;
 
+/** UI-initiated run ownership — progress events must match these to update state. */
+let activeRunId: string | null = null;
+let activePairId: string | null = null;
+let runInFlight = false;
+
 function emit() {
   listeners.forEach((l) => l());
 }
@@ -63,6 +69,17 @@ async function ensureProgressListener(): Promise<void> {
   }
   unlistenProgress = await listen<SyncProgress>('sync://progress', (event) => {
     const progress = event.payload;
+    if (!state.running || !activePairId) {
+      return;
+    }
+    if (progress.pairId !== activePairId) {
+      return;
+    }
+    if (activeRunId === null) {
+      activeRunId = progress.runId;
+    } else if (progress.runId !== activeRunId) {
+      return;
+    }
     state = {
       ...state,
       progress,
@@ -91,11 +108,18 @@ export function dismissWatchSkipped(): void {
   emit();
 }
 
+function clearActiveRunOwnership(): void {
+  activeRunId = null;
+  activePairId = null;
+}
+
 async function executeRun(
   pair: FolderPair,
   conflictResolutions: Record<string, ConflictChoice>,
 ): Promise<RunReport | null> {
   const settings = defaultAppSettings();
+  activeRunId = null;
+  activePairId = pair.id;
   state = {
     ...state,
     running: true,
@@ -115,6 +139,7 @@ async function executeRun(
       useRecycleBin: settings.moveDeletesToRecycleBin,
       conflictResolutions,
     });
+    clearActiveRunOwnership();
     state = {
       ...state,
       running: false,
@@ -127,6 +152,7 @@ async function executeRun(
     emit();
     return report;
   } catch (e) {
+    clearActiveRunOwnership();
     state = {
       ...state,
       running: false,
@@ -139,35 +165,40 @@ async function executeRun(
 }
 
 export async function runSelectedPair(pair: FolderPair): Promise<RunReport | null> {
-  if (!pair.id || state.running) {
+  if (!pair.id || state.running || runInFlight || isPreviewLoading()) {
     return null;
   }
 
-  if (pair.conflictPolicy === 'ask') {
-    try {
-      const plan = await previewApi.previewPair(pair);
-      const conflicts = listConflictActions(plan);
-      if (conflicts.length > 0) {
+  runInFlight = true;
+  try {
+    if (pair.conflictPolicy === 'ask') {
+      try {
+        const plan = await previewApi.previewPair(pair);
+        const conflicts = listConflictActions(plan);
+        if (conflicts.length > 0) {
+          state = {
+            ...state,
+            pendingConflicts: { pair, conflicts },
+            conflictResolutions: {},
+            error: null,
+          };
+          emit();
+          return null;
+        }
+      } catch (e) {
         state = {
           ...state,
-          pendingConflicts: { pair, conflicts },
-          conflictResolutions: {},
-          error: null,
+          error: e instanceof Error ? e.message : String(e),
         };
         emit();
         return null;
       }
-    } catch (e) {
-      state = {
-        ...state,
-        error: e instanceof Error ? e.message : String(e),
-      };
-      emit();
-      return null;
     }
-  }
 
-  return executeRun(pair, {});
+    return await executeRun(pair, {});
+  } finally {
+    runInFlight = false;
+  }
 }
 
 export function setConflictResolution(
@@ -202,11 +233,25 @@ export async function cancelActiveRun(): Promise<void> {
   if (!state.running || !state.runningPairId) {
     return;
   }
+  const pairId = state.runningPairId;
+  state = {
+    ...state,
+    running: false,
+    runningPairId: null,
+    progress: null,
+    error: null,
+  };
+  clearActiveRunOwnership();
+  emit();
+
   try {
-    await runApi.cancelRun(state.runningPairId);
+    await runApi.cancelRun(pairId);
   } catch (e) {
+    activePairId = pairId;
     state = {
       ...state,
+      running: true,
+      runningPairId: pairId,
       error: e instanceof Error ? e.message : String(e),
     };
     emit();
@@ -217,6 +262,9 @@ export async function cancelActiveRun(): Promise<void> {
 export function resetRunStoreForTests(): void {
   unlistenProgress = null;
   unlistenWatchSkipped = null;
+  activeRunId = null;
+  activePairId = null;
+  runInFlight = false;
   state = {
     running: false,
     runningPairId: null,
