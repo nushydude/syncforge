@@ -65,8 +65,19 @@ const WATCH_INACTIVE_MSG =
 
 const listeners = new Set<Listener>();
 
+/** Monotonic token — stale preview responses are ignored when this changes. */
+let previewRequestId = 0;
+
+const PATH_EXISTS_DEBOUNCE_MS = 300;
+let watchWarningTimer: ReturnType<typeof setTimeout> | null = null;
+let watchWarningRequestId = 0;
+
 function emit() {
   listeners.forEach((l) => l());
+}
+
+export function isPreviewLoading(): boolean {
+  return state.previewLoading;
 }
 
 export function getPairsState(): PairsStoreState {
@@ -96,29 +107,50 @@ async function refreshScheduleDescription(pair: FolderPair | null): Promise<void
   emit();
 }
 
-async function refreshWatchWarning(pair: FolderPair | null): Promise<void> {
+function refreshWatchWarning(pair: FolderPair | null): void {
+  if (watchWarningTimer) {
+    clearTimeout(watchWarningTimer);
+    watchWarningTimer = null;
+  }
+
   if (!pair?.watchEnabled || !pair.enabled) {
+    watchWarningRequestId++;
     state = { ...state, watchWarning: null };
     emit();
     return;
   }
+
   const left = pair.leftPath.trim();
   const right = pair.rightPath.trim();
   if (!left || !right) {
+    watchWarningRequestId++;
     state = { ...state, watchWarning: WATCH_INACTIVE_MSG };
     emit();
     return;
   }
-  const [leftExists, rightExists] = await Promise.all([
-    pairsApi.pathExists(left),
-    pairsApi.pathExists(right),
-  ]);
-  state = {
-    ...state,
-    watchWarning:
-      leftExists && rightExists ? null : WATCH_INACTIVE_MSG,
-  };
-  emit();
+
+  const requestId = ++watchWarningRequestId;
+  watchWarningTimer = setTimeout(() => {
+    watchWarningTimer = null;
+    void (async () => {
+      if (requestId !== watchWarningRequestId) {
+        return;
+      }
+      const [leftExists, rightExists] = await Promise.all([
+        pairsApi.pathExists(left),
+        pairsApi.pathExists(right),
+      ]);
+      if (requestId !== watchWarningRequestId) {
+        return;
+      }
+      state = {
+        ...state,
+        watchWarning:
+          leftExists && rightExists ? null : WATCH_INACTIVE_MSG,
+      };
+      emit();
+    })();
+  }, PATH_EXISTS_DEBOUNCE_MS);
 }
 
 export async function loadPairs(): Promise<void> {
@@ -150,6 +182,7 @@ export function selectPair(id: string): void {
   if (!pair) {
     return;
   }
+  previewRequestId++;
   state = {
     ...state,
     selectedId: id,
@@ -157,13 +190,14 @@ export function selectPair(id: string): void {
     validationErrors: [],
     error: null,
     previewPlan: null,
+    previewLoading: false,
     previewError: null,
     watchWarning: null,
     scheduleError: null,
     scheduleDescription: null,
   };
   emit();
-  void refreshWatchWarning(state.editing);
+  refreshWatchWarning(state.editing);
   void refreshScheduleDescription(state.editing);
 }
 
@@ -182,12 +216,14 @@ export function startNewPair(): void {
 }
 
 export function cancelEdit(): void {
+  previewRequestId++;
   state = {
     ...state,
     editing: null,
     validationErrors: [],
     error: null,
     previewPlan: null,
+    previewLoading: false,
     previewError: null,
     watchWarning: null,
     scheduleError: null,
@@ -202,6 +238,7 @@ export async function previewSelectedPair(): Promise<void> {
     return;
   }
 
+  const requestId = ++previewRequestId;
   state = {
     ...state,
     previewLoading: true,
@@ -212,8 +249,14 @@ export async function previewSelectedPair(): Promise<void> {
 
   try {
     const previewPlan = await previewApi.previewPair(editing);
+    if (requestId !== previewRequestId) {
+      return;
+    }
     state = { ...state, previewPlan, previewLoading: false };
   } catch (e) {
+    if (requestId !== previewRequestId) {
+      return;
+    }
     state = {
       ...state,
       previewLoading: false,
@@ -240,7 +283,7 @@ export function updateEditing(patch: Partial<FolderPair>): void {
     "leftPath" in patch ||
     "rightPath" in patch
   ) {
-    void refreshWatchWarning(editing);
+    refreshWatchWarning(editing);
   }
   if ("scheduleEnabled" in patch || "scheduleCron" in patch) {
     void refreshScheduleDescription(editing);
@@ -334,7 +377,7 @@ export async function saveEditing(): Promise<boolean> {
       validationErrors: [],
     };
     emit();
-    await refreshWatchWarning(state.editing);
+    refreshWatchWarning(state.editing);
     await refreshScheduleDescription(state.editing);
     return true;
   } catch (e) {
@@ -381,6 +424,12 @@ export async function deleteSelected(): Promise<boolean> {
 
 /** Test helper — reset module state between Vitest cases. */
 export function resetPairsStoreForTests(): void {
+  previewRequestId = 0;
+  watchWarningRequestId = 0;
+  if (watchWarningTimer) {
+    clearTimeout(watchWarningTimer);
+    watchWarningTimer = null;
+  }
   state = {
     pairs: [],
     selectedId: null,

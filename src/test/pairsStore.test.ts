@@ -3,6 +3,7 @@ import * as pairsApi from "../api/pairs";
 import * as previewApi from "../api/preview";
 import type { FolderPair, SyncPlan } from "../types";
 import {
+  cancelEdit,
   getPairsState,
   loadPairs,
   previewSelectedPair,
@@ -181,6 +182,71 @@ describe("pairsStore", () => {
     expect(getPairsState().previewPlan).toEqual(plan);
     expect(getPairsState().previewLoading).toBe(false);
     expect(getPairsState().previewError).toBeNull();
+  });
+
+  it("ignores stale preview responses after selectPair", async () => {
+    const pair2: FolderPair = { ...samplePair, id: "pair-2", name: "Other" };
+    vi.mocked(pairsApi.listPairs).mockResolvedValue([samplePair, pair2]);
+    let resolvePreview!: (plan: SyncPlan) => void;
+    vi.mocked(previewApi.previewPair).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolvePreview = resolve;
+        }),
+    );
+
+    await loadPairs();
+    selectPair("pair-1");
+    const previewPromise = previewSelectedPair();
+    selectPair("pair-2");
+
+    resolvePreview({
+      pairId: "pair-1",
+      scannedLeft: 1,
+      scannedRight: 1,
+      actions: [],
+    });
+    await previewPromise;
+
+    expect(getPairsState().previewPlan).toBeNull();
+    expect(getPairsState().previewLoading).toBe(false);
+  });
+
+  it("resets previewLoading on cancelEdit", async () => {
+    vi.mocked(pairsApi.listPairs).mockResolvedValue([samplePair]);
+    vi.mocked(previewApi.previewPair).mockImplementation(
+      () => new Promise(() => {}),
+    );
+    await loadPairs();
+    selectPair("pair-1");
+    void previewSelectedPair();
+    expect(getPairsState().previewLoading).toBe(true);
+
+    cancelEdit();
+    expect(getPairsState().previewLoading).toBe(false);
+    expect(getPairsState().editing).toBeNull();
+  });
+
+  it("debounces path-exists checks for watch warning", async () => {
+    vi.useFakeTimers();
+    vi.mocked(pairsApi.pathExists).mockResolvedValue(true);
+
+    startNewPair();
+    updateEditing({
+      name: "Watch",
+      leftPath: "C:\\left",
+      rightPath: "D:\\right",
+      watchEnabled: true,
+    });
+    updateEditing({ leftPath: "C:\\left2" });
+    updateEditing({ leftPath: "C:\\left3" });
+
+    expect(pairsApi.pathExists).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(300);
+    await vi.waitFor(() => {
+      expect(pairsApi.pathExists).toHaveBeenCalledTimes(2);
+    });
+    vi.useRealTimers();
   });
 
   it("surfaces preview errors", async () => {

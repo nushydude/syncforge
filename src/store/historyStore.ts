@@ -25,6 +25,9 @@ let state: HistoryStoreState = {
 
 const listeners = new Set<Listener>();
 
+let historyLoadRequestId = 0;
+let historyDetailRequestId = 0;
+
 function emit() {
   listeners.forEach((l) => l());
 }
@@ -41,6 +44,8 @@ export function subscribeHistory(listener: Listener): () => void {
 export async function loadHistory(pairFilter?: string | null): Promise<void> {
   const filter =
     pairFilter === undefined ? state.pairFilter : (pairFilter ?? null);
+  const requestId = ++historyLoadRequestId;
+  historyDetailRequestId++;
   state = {
     ...state,
     loading: true,
@@ -48,13 +53,20 @@ export async function loadHistory(pairFilter?: string | null): Promise<void> {
     pairFilter: filter,
     selectedRunId: null,
     detail: null,
+    detailLoading: false,
   };
   emit();
 
   try {
     const runs = await historyApi.getHistory(filter);
+    if (requestId !== historyLoadRequestId) {
+      return;
+    }
     state = { ...state, runs, loading: false };
   } catch (e) {
+    if (requestId !== historyLoadRequestId) {
+      return;
+    }
     state = {
       ...state,
       loading: false,
@@ -69,6 +81,7 @@ export function setPairFilter(pairId: string | null): void {
 }
 
 export async function selectRun(runId: string): Promise<void> {
+  const requestId = ++historyDetailRequestId;
   state = {
     ...state,
     selectedRunId: runId,
@@ -80,6 +93,9 @@ export async function selectRun(runId: string): Promise<void> {
 
   try {
     const detail = await historyApi.getRunDetail(runId);
+    if (requestId !== historyDetailRequestId) {
+      return;
+    }
     state = {
       ...state,
       detail,
@@ -87,6 +103,9 @@ export async function selectRun(runId: string): Promise<void> {
       error: detail ? null : 'Run not found',
     };
   } catch (e) {
+    if (requestId !== historyDetailRequestId) {
+      return;
+    }
     state = {
       ...state,
       detailLoading: false,
@@ -108,6 +127,8 @@ export function clearRunSelection(): void {
 
 /** Test helper — reset module state between Vitest cases. */
 export function resetHistoryStoreForTests(): void {
+  historyLoadRequestId = 0;
+  historyDetailRequestId = 0;
   state = {
     runs: [],
     pairFilter: null,
