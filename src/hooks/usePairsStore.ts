@@ -10,4 +10,7 @@ export const usePairsStore = createStoreHook<PairsStoreState>(
   getPairsState,
 );
 
+/** Stable when only editing/preview/etc. change; derive id+name via useMemo. */
+export const selectPairsList = (s: PairsStoreState) => s.pairs;
+
 export type { PairsStoreState };

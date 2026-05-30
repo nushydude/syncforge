@@ -1,7 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createStoreHook } from "../hooks/createStoreHook";
-import { usePairsStore } from "../hooks/usePairsStore";
+import { selectPairsList, usePairsStore } from "../hooks/usePairsStore";
 import { startNewPair, updateEditing } from "../store/pairsStore";
 import { resetPairsStoreForTests } from "../store/pairsStore";
 
@@ -81,5 +81,22 @@ describe("usePairsStore selectors", () => {
     act(() => updateEditing({ name: "Docs" }));
     expect(pairsRenders).toBe(1);
     expect(editingRenders).toBe(3);
+  });
+
+  it("skips re-render when only editing changes and selectPairsList is used (HistoryView pattern)", () => {
+    let pairsListRenders = 0;
+
+    renderHook(() => {
+      pairsListRenders++;
+      return usePairsStore(selectPairsList);
+    });
+
+    expect(pairsListRenders).toBe(1);
+
+    act(() => startNewPair());
+    expect(pairsListRenders).toBe(1);
+
+    act(() => updateEditing({ name: "Docs" }));
+    expect(pairsListRenders).toBe(1);
   });
 });

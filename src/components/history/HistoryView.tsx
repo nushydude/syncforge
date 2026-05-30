@@ -1,8 +1,7 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { useHistoryStore } from "../../hooks/useHistoryStore";
-import { usePairsStore } from "../../hooks/usePairsStore";
+import { selectPairsList, usePairsStore } from "../../hooks/usePairsStore";
 import { loadPairs } from "../../store/pairsStore";
-import type { PairsStoreState } from "../../store/pairsStore";
 import {
   clearRunSelection,
   loadHistory,
@@ -31,10 +30,6 @@ function statusLabel(status: string): string {
   }
 }
 
-/** Pair id → display name; only re-renders when the pairs list changes. */
-const selectPairNames = (s: PairsStoreState) =>
-  s.pairs.map((p) => ({ id: p.id, name: p.name }));
-
 const selectHistoryList = (s: HistoryStoreState) => ({
   runs: s.runs,
   pairFilter: s.pairFilter,
@@ -44,7 +39,11 @@ const selectHistoryList = (s: HistoryStoreState) => ({
 });
 
 export function HistoryView() {
-  const pairNames = usePairsStore(selectPairNames);
+  const pairs = usePairsStore(selectPairsList);
+  const pairNames = useMemo(
+    () => pairs.map((p) => ({ id: p.id, name: p.name })),
+    [pairs],
+  );
   const { runs, pairFilter, selectedRunId, loading, error } =
     useHistoryStore(selectHistoryList);
 
@@ -53,7 +52,10 @@ export function HistoryView() {
     void loadHistory();
   }, []);
 
-  const pairNameById = new Map(pairNames.map((p) => [p.id, p.name]));
+  const pairNameById = useMemo(
+    () => new Map(pairNames.map((p) => [p.id, p.name])),
+    [pairNames],
+  );
   const pairName = (pairId: string) => pairNameById.get(pairId) ?? pairId;
 
   return (

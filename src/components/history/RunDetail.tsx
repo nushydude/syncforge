@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useHistoryStore } from "../../hooks/useHistoryStore";
-import { usePairsStore } from "../../hooks/usePairsStore";
+import { selectPairsList, usePairsStore } from "../../hooks/usePairsStore";
 import { exportRunAsCsv, exportRunAsJson } from "../../lib/exportRun";
 import {
   formatBytes,
@@ -8,7 +8,6 @@ import {
   statsFromItems,
 } from "../../lib/syncStats";
 import type { HistoryStoreState } from "../../store/historyStore";
-import type { PairsStoreState } from "../../store/pairsStore";
 
 const RUN_DETAIL_PAGE_SIZE = 200;
 
@@ -22,12 +21,15 @@ const selectRunDetailHistory = (s: HistoryStoreState) => ({
   error: s.error,
 });
 
-const selectPairNames = (s: PairsStoreState) =>
-  s.pairs.map((p) => ({ id: p.id, name: p.name }));
-
 export function RunDetail() {
-  const { detail, detailLoading, error } = useHistoryStore(selectRunDetailHistory);
-  const pairNames = usePairsStore(selectPairNames);
+  const { detail, detailLoading, error } = useHistoryStore(
+    selectRunDetailHistory,
+  );
+  const pairs = usePairsStore(selectPairsList);
+  const pairNames = useMemo(
+    () => pairs.map((p) => ({ id: p.id, name: p.name })),
+    [pairs],
+  );
   const [visibleCount, setVisibleCount] = useState(RUN_DETAIL_PAGE_SIZE);
 
   useEffect(() => {
