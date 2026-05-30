@@ -36,7 +36,12 @@ function App() {
           </nav>
         </div>
       </header>
-      {view === "pairs" ? <PairsPanel /> : <HistoryView />}
+      <div hidden={view !== "pairs"}>
+        <PairsPanel />
+      </div>
+      <div hidden={view !== "history"}>
+        <HistoryView active={view === "history"} />
+      </div>
     </div>
   );
 }

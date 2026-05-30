@@ -60,4 +60,21 @@ describe('PreviewTable', () => {
     render(<PreviewTable plan={plan} />);
     expect(screen.getByText(/skipped 1 path/i)).toBeInTheDocument();
   });
+
+  it('virtualizes a large plan without rendering every row in the DOM', () => {
+    const largePlan: SyncPlan = {
+      pairId: 'p1',
+      scannedLeft: 5000,
+      scannedRight: 5000,
+      actions: Array.from({ length: 5000 }, (_, i) => ({
+        kind: 'copyLeftToRight' as const,
+        path: `file-${i}.txt`,
+      })),
+    };
+    const { container } = render(<PreviewTable plan={largePlan} />);
+    const dataRows = container.querySelectorAll('tbody tr[data-index]');
+    expect(dataRows.length).toBeLessThan(5000);
+    expect(dataRows.length).toBeGreaterThan(0);
+    expect(screen.getByText('file-0.txt')).toBeInTheDocument();
+  });
 });

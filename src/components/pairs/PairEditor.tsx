@@ -2,7 +2,7 @@ import { ConflictDialog } from "../conflicts/ConflictDialog";
 import { PreviewTable } from "../preview/PreviewTable";
 import { RunProgress } from "../run/RunProgress";
 import { usePairsStore } from "../../hooks/usePairsStore";
-import { useSyncProgress } from "../../hooks/useSyncProgress";
+import { useRunStore } from "../../hooks/useRunStore";
 import {
   cancelEdit,
   deleteSelected,
@@ -11,15 +11,37 @@ import {
   saveEditing,
   updateEditing,
 } from "../../store/pairsStore";
+import type { PairsStoreState } from "../../store/pairsStore";
 import {
   cancelConflictResolution,
   confirmConflictResolutionAndRun,
   runSelectedPair,
   setConflictResolution,
 } from "../../store/runStore";
+import type { RunStoreState } from "../../store/runStore";
 import { ConflictPolicySelector } from "./ConflictPolicySelector";
 import { FilterEditor } from "./FilterEditor";
 import { ModeSelector } from "./ModeSelector";
+
+const selectPairEditor = (s: PairsStoreState) => ({
+  editing: s.editing,
+  saving: s.saving,
+  validationErrors: s.validationErrors,
+  error: s.error,
+  selectedId: s.selectedId,
+  previewPlan: s.previewPlan,
+  previewLoading: s.previewLoading,
+  previewError: s.previewError,
+  watchWarning: s.watchWarning,
+  scheduleError: s.scheduleError,
+  scheduleDescription: s.scheduleDescription,
+});
+
+const selectPairEditorRun = (s: RunStoreState) => ({
+  running: s.running,
+  pendingConflicts: s.pendingConflicts,
+  conflictResolutions: s.conflictResolutions,
+});
 
 export function PairEditor() {
   const {
@@ -34,12 +56,12 @@ export function PairEditor() {
     watchWarning,
     scheduleError,
     scheduleDescription,
-  } = usePairsStore();
+  } = usePairsStore(selectPairEditor);
   const {
     running: runInProgress,
     pendingConflicts,
     conflictResolutions,
-  } = useSyncProgress();
+  } = useRunStore(selectPairEditorRun);
 
   if (!editing) {
     return null;
