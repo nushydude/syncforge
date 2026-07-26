@@ -32,17 +32,25 @@ Download the latest Windows installer from the [Releases](https://github.com/nus
 git clone https://github.com/nushydude/syncforge.git
 cd syncforge
 pnpm install
-pnpm tauri dev
+pnpm start
 ```
 
-| Command | Description |
-| --- | --- |
-| `pnpm test` | Vitest unit tests |
-| `pnpm build` | Typecheck and build the Vite frontend |
-| `pnpm lint` | ESLint |
-| `pnpm format` | Prettier write |
-| `pnpm ci:local` | Full local CI gate (frontend + Rust) |
-| `cargo build` | Build the Rust crate (from `src-tauri/`) |
+You can also double-click `Start-SyncForge.cmd` from the project folder.
+Do not launch `src-tauri/target/debug/syncforge.exe` directly; that debug binary
+expects the Vite dev server to already be running and will show a localhost
+connection error by itself.
+
+| Command                     | Description                                   |
+| --------------------------- | --------------------------------------------- |
+| `pnpm start`                | Run the Tauri desktop app in development mode |
+| `pnpm dev:desktop`          | Alias for `pnpm start`                        |
+| `pnpm dev` / `pnpm dev:web` | Run only the Vite frontend dev server         |
+| `pnpm test`                 | Vitest unit tests                             |
+| `pnpm build`                | Typecheck and build the Vite frontend         |
+| `pnpm lint`                 | ESLint                                        |
+| `pnpm format`               | Prettier write                                |
+| `pnpm ci:local`             | Full local CI gate (frontend + Rust)          |
+| `cargo build`               | Build the Rust crate (from `src-tauri/`)      |
 
 ### Production build
 

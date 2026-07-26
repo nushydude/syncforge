@@ -16,7 +16,7 @@ Thank you for your interest in contributing.
 3. Run the app in development mode:
 
    ```bash
-   pnpm tauri dev
+   pnpm start
    ```
 
 ## Quality gates

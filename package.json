@@ -5,7 +5,10 @@
   "type": "module",
   "packageManager": "pnpm@10.33.2",
   "scripts": {
+    "start": "tauri dev",
     "dev": "vite",
+    "dev:desktop": "tauri dev",
+    "dev:web": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
