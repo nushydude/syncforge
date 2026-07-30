@@ -73,6 +73,7 @@ describe('runStore', () => {
     resetRunStoreForTests();
     vi.clearAllMocks();
     vi.restoreAllMocks();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
     for (const key of Object.keys(listenHandlers)) {
       delete listenHandlers[key];
     }
@@ -91,6 +92,15 @@ describe('runStore', () => {
     const report = await runSelectedPair(samplePair);
     expect(report).toBeNull();
     expect(getRunState().error).toBe('disk full');
+  });
+
+  it('does not start a manual run when confirmation is declined', async () => {
+    vi.mocked(runApi.runPair).mockResolvedValue(sampleReport);
+    vi.mocked(window.confirm).mockReturnValue(false);
+    const report = await runSelectedPair(samplePair);
+    expect(report).toBeNull();
+    expect(window.confirm).toHaveBeenCalledWith('Start sync for "Docs"?');
+    expect(runApi.runPair).not.toHaveBeenCalled();
   });
 
   it('ignores run without pair id', async () => {

@@ -7,6 +7,7 @@ import {
 } from "../lib/scheduleParsing";
 import type { ConflictPolicy, FolderPair, SyncMode, SyncPlan } from "../types";
 import { defaultFilters } from "../types";
+import { getAppSettings } from "./settingsStore";
 
 export interface PairsStoreState {
   pairs: FolderPair[];
@@ -31,6 +32,7 @@ const defaultConflictPolicy: ConflictPolicy = "newerWins";
 const defaultMode: SyncMode = "synchronize";
 
 function emptyPair(): FolderPair {
+  const settings = getAppSettings();
   return {
     id: "",
     name: "",
@@ -38,7 +40,7 @@ function emptyPair(): FolderPair {
     rightPath: "",
     mode: defaultMode,
     filters: defaultFilters(),
-    conflictPolicy: defaultConflictPolicy,
+    conflictPolicy: settings.defaultConflictPolicy ?? defaultConflictPolicy,
     enabled: true,
     watchEnabled: false,
     scheduleEnabled: false,

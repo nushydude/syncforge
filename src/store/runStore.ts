@@ -10,7 +10,7 @@ import type {
   SyncProgress,
   WatchSkippedNotice,
 } from '../types';
-import { defaultAppSettings } from '../types';
+import { getAppSettings } from './settingsStore';
 
 export interface PendingConflicts {
   pair: FolderPair;
@@ -117,7 +117,14 @@ async function executeRun(
   pair: FolderPair,
   conflictResolutions: Record<string, ConflictChoice>,
 ): Promise<RunReport | null> {
-  const settings = defaultAppSettings();
+  const settings = getAppSettings();
+  if (
+    settings.confirmBeforeRun &&
+    typeof window !== "undefined" &&
+    !window.confirm(`Start sync for "${pair.name}"?`)
+  ) {
+    return null;
+  }
   activeRunId = null;
   activePairId = pair.id;
   state = {

@@ -3,8 +3,9 @@ import "./App.css";
 import { HistoryView } from "./components/history/HistoryView";
 import { DuplicatesView } from "./components/duplicates/DuplicatesView";
 import { PairsPanel } from "./components/pairs/PairsPanel";
+import { SettingsView } from "./components/settings/SettingsView";
 
-type AppView = "pairs" | "duplicates" | "history";
+type AppView = "pairs" | "duplicates" | "history" | "settings";
 
 function App() {
   const [view, setView] = useState<AppView>("pairs");
@@ -45,6 +46,15 @@ function App() {
             >
               Duplicates
             </button>
+            <button
+              type="button"
+              className={
+                view === "settings" ? "app-nav-btn active" : "app-nav-btn"
+              }
+              onClick={() => setView("settings")}
+            >
+              Settings
+            </button>
           </nav>
         </div>
       </header>
@@ -56,6 +66,9 @@ function App() {
       </div>
       <div className="app-view" hidden={view !== "duplicates"}>
         <DuplicatesView />
+      </div>
+      <div className="app-view" hidden={view !== "settings"}>
+        <SettingsView />
       </div>
     </div>
   );
