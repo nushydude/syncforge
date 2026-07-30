@@ -15,3 +15,5 @@ export const defaultAppSettings = (): AppSettings => ({
   verifyHashesAfterCopy: false,
   theme: 'system',
 });
+
+export const APP_SETTINGS_STORAGE_KEY = 'syncforge.appSettings';

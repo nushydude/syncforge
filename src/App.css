@@ -54,6 +54,228 @@ body {
   display: none;
 }
 
+.settings-view {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.5rem;
+  max-width: 760px;
+}
+
+
+.settings-card {
+  margin-bottom: 1rem;
+  padding: 1.25rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.5rem;
+  background: #fff;
+}
+
+.settings-card h3 {
+  margin: 0 0 1rem;
+  font-size: 1rem;
+}
+
+.settings-saved {
+  color: #64748b;
+  font-size: 0.875rem;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+html[data-theme="dark"] body,
+html[data-theme="dark"] .app {
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+html[data-theme="dark"] .app-header,
+html[data-theme="dark"] .settings-card {
+  background: #1e293b;
+  border-color: #334155;
+}
+
+html[data-theme="dark"] .pairs-panel,
+html[data-theme="dark"] .history-panel,
+html[data-theme="dark"] .duplicates-view,
+html[data-theme="dark"] .settings-view,
+html[data-theme="dark"] .pair-list,
+html[data-theme="dark"] .pair-details,
+html[data-theme="dark"] .pair-editor,
+html[data-theme="dark"] .history-sidebar,
+html[data-theme="dark"] .history-main {
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+html[data-theme="dark"] .pair-item,
+html[data-theme="dark"] input,
+html[data-theme="dark"] select,
+html[data-theme="dark"] textarea,
+html[data-theme="dark"] table,
+html[data-theme="dark"] .run-detail,
+html[data-theme="dark"] .preview-table-wrap {
+  background: #1e293b;
+  color: #e2e8f0;
+  border-color: #475569;
+}
+
+html[data-theme="dark"] button {
+  color: #e2e8f0;
+  background: #334155;
+  border-color: #64748b;
+}
+
+html[data-theme="dark"] .app-nav-btn.active,
+html[data-theme="dark"] .btn-primary {
+  background: #1d4ed8;
+  border-color: #60a5fa;
+  color: #fff;
+}
+
+html[data-theme="dark"] .tagline,
+html[data-theme="dark"] .workspace-header p,
+html[data-theme="dark"] .settings-saved,
+html[data-theme="dark"] .field-hint {
+  color: #cbd5e1;
+}
+
+html[data-theme="dark"] .pair-details-grid > div,
+html[data-theme="dark"] .pair-details-filters,
+html[data-theme="dark"] .preview-table,
+html[data-theme="dark"] .run-progress,
+html[data-theme="dark"] .conflict-dialog,
+html[data-theme="dark"] .conflict-panel,
+html[data-theme="dark"] .duplicates-controls,
+html[data-theme="dark"] .duplicate-group,
+html[data-theme="dark"] .duplicate-summary,
+html[data-theme="dark"] .history-run-list,
+html[data-theme="dark"] .history-run-item,
+html[data-theme="dark"] .run-detail-items,
+html[data-theme="dark"] .schedule-fieldset,
+html[data-theme="dark"] .conflict-policy-selector,
+html[data-theme="dark"] .filter-editor {
+  background: #1e293b;
+  color: #e2e8f0;
+  border-color: #475569;
+}
+
+html[data-theme="dark"] .preview-table-section,
+html[data-theme="dark"] .duplicate-progress,
+html[data-theme="dark"] .duplicate-selection-bar,
+html[data-theme="dark"] .run-detail-stats,
+html[data-theme="dark"] .duplicate-summary div,
+html[data-theme="dark"] .history-run-list li {
+  background: #1e293b;
+  color: #e2e8f0;
+  border-color: #475569;
+}
+
+html[data-theme="dark"] a,
+html[data-theme="dark"] .preview-path,
+html[data-theme="dark"] .history-run-meta,
+html[data-theme="dark"] .run-detail-subtitle {
+  color: #93c5fd;
+}
+
+html[data-theme="dark"] .duplicate-progress-path,
+html[data-theme="dark"] .duplicate-progress-stats,
+html[data-theme="dark"] .duplicate-file-path,
+html[data-theme="dark"] .run-progress-path,
+html[data-theme="dark"] .run-progress-summary,
+html[data-theme="dark"] .run-progress-message,
+html[data-theme="dark"] .run-progress-count,
+html[data-theme="dark"] .conflict-path,
+html[data-theme="dark"] .conflict-sides,
+html[data-theme="dark"] .conflict-sides strong,
+html[data-theme="dark"] .conflict-dialog label {
+  color: #cbd5e1;
+}
+
+html[data-theme="dark"] .duplicate-progress-path {
+  background: #0f172a;
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-theme="system"] {
+    color-scheme: dark;
+  }
+
+  html[data-theme="system"] body,
+  html[data-theme="system"] .app,
+  html[data-theme="system"] .pairs-panel,
+  html[data-theme="system"] .history-panel,
+  html[data-theme="system"] .duplicates-view,
+  html[data-theme="system"] .settings-view,
+  html[data-theme="system"] .pair-list,
+  html[data-theme="system"] .pair-details,
+  html[data-theme="system"] .pair-editor,
+  html[data-theme="system"] .history-sidebar,
+  html[data-theme="system"] .history-main {
+    background: #0f172a;
+    color: #e2e8f0;
+  }
+
+  html[data-theme="system"] .app-header,
+  html[data-theme="system"] .settings-card,
+  html[data-theme="system"] .pair-item,
+  html[data-theme="system"] input,
+  html[data-theme="system"] select,
+  html[data-theme="system"] textarea,
+  html[data-theme="system"] table,
+  html[data-theme="system"] .run-detail,
+  html[data-theme="system"] .preview-table-wrap,
+  html[data-theme="system"] .pair-details-grid > div,
+  html[data-theme="system"] .pair-details-filters,
+  html[data-theme="system"] .preview-table,
+  html[data-theme="system"] .run-progress,
+  html[data-theme="system"] .conflict-dialog,
+  html[data-theme="system"] .conflict-panel,
+  html[data-theme="system"] .duplicates-controls,
+  html[data-theme="system"] .duplicate-group,
+  html[data-theme="system"] .duplicate-summary,
+  html[data-theme="system"] .history-run-list,
+  html[data-theme="system"] .history-run-item,
+  html[data-theme="system"] .run-detail-items,
+  html[data-theme="system"] .schedule-fieldset,
+  html[data-theme="system"] .conflict-policy-selector,
+  html[data-theme="system"] .filter-editor {
+    background: #1e293b;
+    color: #e2e8f0;
+    border-color: #475569;
+  }
+
+  html[data-theme="system"] .preview-table-section,
+  html[data-theme="system"] .duplicate-progress,
+  html[data-theme="system"] .duplicate-selection-bar,
+  html[data-theme="system"] .run-detail-stats,
+  html[data-theme="system"] .duplicate-summary div,
+  html[data-theme="system"] .history-run-list li {
+    background: #1e293b;
+    color: #e2e8f0;
+    border-color: #475569;
+  }
+
+  html[data-theme="system"] .duplicate-progress-path,
+  html[data-theme="system"] .duplicate-progress-stats,
+  html[data-theme="system"] .duplicate-file-path,
+  html[data-theme="system"] .run-progress-path,
+  html[data-theme="system"] .run-progress-summary,
+  html[data-theme="system"] .run-progress-message,
+  html[data-theme="system"] .run-progress-count,
+  html[data-theme="system"] .conflict-path,
+  html[data-theme="system"] .conflict-sides,
+  html[data-theme="system"] .conflict-sides strong,
+  html[data-theme="system"] .conflict-dialog label {
+    color: #cbd5e1;
+  }
+
+  html[data-theme="system"] .duplicate-progress-path {
+    background: #0f172a;
+  }
+}
+
 .app-nav {
   display: flex;
   gap: 0.375rem;
