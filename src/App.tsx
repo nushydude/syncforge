@@ -1,9 +1,10 @@
 import { useState } from "react";
 import "./App.css";
 import { HistoryView } from "./components/history/HistoryView";
+import { DuplicatesView } from "./components/duplicates/DuplicatesView";
 import { PairsPanel } from "./components/pairs/PairsPanel";
 
-type AppView = "pairs" | "history";
+type AppView = "pairs" | "duplicates" | "history";
 
 function App() {
   const [view, setView] = useState<AppView>("pairs");
@@ -19,7 +20,9 @@ function App() {
           <nav className="app-nav" aria-label="Main">
             <button
               type="button"
-              className={view === "pairs" ? "app-nav-btn active" : "app-nav-btn"}
+              className={
+                view === "pairs" ? "app-nav-btn active" : "app-nav-btn"
+              }
               onClick={() => setView("pairs")}
             >
               Pairs
@@ -33,14 +36,26 @@ function App() {
             >
               History
             </button>
+            <button
+              type="button"
+              className={
+                view === "duplicates" ? "app-nav-btn active" : "app-nav-btn"
+              }
+              onClick={() => setView("duplicates")}
+            >
+              Duplicates
+            </button>
           </nav>
         </div>
       </header>
-      <div hidden={view !== "pairs"}>
+      <div className="app-view" hidden={view !== "pairs"}>
         <PairsPanel />
       </div>
-      <div hidden={view !== "history"}>
+      <div className="app-view" hidden={view !== "history"}>
         <HistoryView active={view === "history"} />
+      </div>
+      <div className="app-view" hidden={view !== "duplicates"}>
+        <DuplicatesView />
       </div>
     </div>
   );

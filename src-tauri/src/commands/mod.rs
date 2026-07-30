@@ -1,4 +1,5 @@
 pub mod dialog;
+pub mod duplicates;
 pub mod history;
 pub mod pairs;
 pub mod preview;

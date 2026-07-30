@@ -3,6 +3,7 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 use uuid::Uuid;
 
+use crate::duplicates::{self, DuplicateScanJob};
 use crate::models::{
     ConflictPolicy, FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot, SyncMode,
 };
@@ -113,6 +114,7 @@ impl Database {
 
         self.migrate_watch_enabled()?;
         self.migrate_schedule_fields()?;
+        self.migrate_duplicate_scans()?;
 
         Ok(())
     }
@@ -170,6 +172,33 @@ impl Database {
             self.conn.execute("ALTER TABLE pairs ADD COLUMN schedule_cron TEXT", [])?;
         }
 
+        Ok(())
+    }
+
+    fn migrate_duplicate_scans(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS duplicate_scans (
+                id TEXT PRIMARY KEY NOT NULL,
+                root TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                phase TEXT,
+                files_found INTEGER NOT NULL DEFAULT 0,
+                total_files INTEGER,
+                hashed_files INTEGER NOT NULL DEFAULT 0,
+                hash_total INTEGER,
+                bytes_processed INTEGER NOT NULL DEFAULT 0,
+                bytes_total INTEGER,
+                current_path TEXT,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                result_json TEXT,
+                error TEXT,
+                started_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_duplicate_scans_updated_at
+                ON duplicate_scans(updated_at DESC);",
+        )?;
         Ok(())
     }
 
@@ -231,6 +260,89 @@ impl Database {
             )?)
         })
         .collect()
+    }
+
+    pub fn save_duplicate_scan(&self, job: &DuplicateScanJob) -> Result<()> {
+        let result_json = job.result.as_ref().map(serde_json::to_string).transpose()?;
+        self.conn.execute(
+            "INSERT INTO duplicate_scans (
+                id, root, mode, status, phase, files_found, total_files,
+                hashed_files, hash_total, bytes_processed, bytes_total,
+                current_path, cancel_requested, result_json, error, started_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+             ON CONFLICT(id) DO UPDATE SET
+                root = excluded.root,
+                mode = excluded.mode,
+                status = excluded.status,
+                phase = excluded.phase,
+                files_found = excluded.files_found,
+                total_files = excluded.total_files,
+                hashed_files = excluded.hashed_files,
+                hash_total = excluded.hash_total,
+                bytes_processed = excluded.bytes_processed,
+                bytes_total = excluded.bytes_total,
+                current_path = excluded.current_path,
+                cancel_requested = excluded.cancel_requested,
+                result_json = excluded.result_json,
+                error = excluded.error,
+                started_at = excluded.started_at,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                job.id,
+                job.root,
+                duplicates::mode_to_str(job.mode),
+                duplicates::status_to_str(job.status),
+                duplicates::phase_to_str(job.phase),
+                job.files_found as i64,
+                job.total_files.map(|value| value as i64),
+                job.hashed_files as i64,
+                job.hash_total.map(|value| value as i64),
+                job.bytes_processed as i64,
+                job.bytes_total.map(|value| value as i64),
+                job.current_path,
+                job.cancel_requested as i64,
+                result_json,
+                job.error,
+                job.started_at,
+                job.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_duplicate_scan(&self, id: &str) -> Result<Option<DuplicateScanJob>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root, mode, status, phase, files_found, total_files,
+                    hashed_files, hash_total, bytes_processed, bytes_total,
+                    current_path, cancel_requested, result_json, error, started_at, updated_at
+             FROM duplicate_scans WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![id])?;
+        rows.next()?.map(row_to_duplicate_scan).transpose()
+    }
+
+    pub fn latest_duplicate_scan(&self) -> Result<Option<DuplicateScanJob>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root, mode, status, phase, files_found, total_files,
+                    hashed_files, hash_total, bytes_processed, bytes_total,
+                    current_path, cancel_requested, result_json, error, started_at, updated_at
+             FROM duplicate_scans ORDER BY updated_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        rows.next()?.map(row_to_duplicate_scan).transpose()
+    }
+
+    pub fn mark_duplicate_scans_interrupted(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE duplicate_scans
+             SET status = 'interrupted',
+                 cancel_requested = 0,
+                 error = 'The previous scan was interrupted. Resume it to continue.',
+                 updated_at = updated_at
+             WHERE status = 'running'",
+            [],
+        )?;
+        Ok(())
     }
 
     pub fn save_pair(&self, pair: &FolderPair) -> Result<FolderPair> {
@@ -524,6 +636,38 @@ fn row_to_pair(
     })
 }
 
+fn row_to_duplicate_scan(row: &rusqlite::Row<'_>) -> Result<DuplicateScanJob> {
+    let mode: String = row.get(2)?;
+    let status: String = row.get(3)?;
+    let phase: Option<String> = row.get(4)?;
+    let result_json: Option<String> = row.get(13)?;
+    let mode = duplicates::mode_from_str(&mode).map_err(rusqlite::Error::InvalidParameterName)?;
+    let status =
+        duplicates::status_from_str(&status).map_err(rusqlite::Error::InvalidParameterName)?;
+    let phase = duplicates::phase_from_str(phase).map_err(rusqlite::Error::InvalidParameterName)?;
+    let result = result_json.map(|json| serde_json::from_str(&json)).transpose()?;
+
+    Ok(DuplicateScanJob {
+        id: row.get(0)?,
+        root: row.get(1)?,
+        mode,
+        status,
+        phase,
+        files_found: row.get::<_, i64>(5)? as u64,
+        total_files: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+        hashed_files: row.get::<_, i64>(7)? as u64,
+        hash_total: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
+        bytes_processed: row.get::<_, i64>(9)? as u64,
+        bytes_total: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
+        current_path: row.get(11)?,
+        cancel_requested: row.get::<_, i64>(12)? != 0,
+        result,
+        error: row.get(14)?,
+        started_at: row.get(15)?,
+        updated_at: row.get(16)?,
+    })
+}
+
 fn sync_mode_to_str(mode: SyncMode) -> &'static str {
     match mode {
         SyncMode::Synchronize => "synchronize",
@@ -578,6 +722,9 @@ fn run_status_to_str(status: RunStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::duplicates::{
+        DuplicateMatchMode, DuplicateScanJob, DuplicateScanPhase, DuplicateScanStatus,
+    };
     use crate::models::Filters;
 
     fn temp_db() -> (tempfile::TempDir, Database) {
@@ -1081,5 +1228,39 @@ mod tests {
         assert_eq!(snapshot_count, 0);
         assert_eq!(run_count, 0);
         assert_eq!(run_item_count, 0);
+    }
+
+    #[test]
+    fn duplicate_scan_job_round_trip_and_interruption_recovery() {
+        let (_dir, db) = temp_db();
+        let job = DuplicateScanJob {
+            id: "scan-1".into(),
+            root: "/data".into(),
+            mode: DuplicateMatchMode::Hash,
+            status: DuplicateScanStatus::Running,
+            phase: Some(DuplicateScanPhase::Hashing),
+            files_found: 12,
+            total_files: Some(24),
+            hashed_files: 8,
+            hash_total: Some(1024),
+            bytes_processed: 512,
+            bytes_total: Some(2048),
+            current_path: Some("nested/file.bin".into()),
+            cancel_requested: false,
+            result: None,
+            error: None,
+            started_at: 1,
+            updated_at: 2,
+        };
+        db.save_duplicate_scan(&job).expect("save scan");
+
+        let loaded = db.get_duplicate_scan("scan-1").expect("load scan").expect("scan");
+        assert_eq!(loaded, job);
+
+        db.mark_duplicate_scans_interrupted().expect("interrupt scan");
+        let interrupted =
+            db.get_duplicate_scan("scan-1").expect("load interrupted scan").expect("scan");
+        assert_eq!(interrupted.status, DuplicateScanStatus::Interrupted);
+        assert!(interrupted.error.unwrap_or_default().contains("interrupted"));
     }
 }

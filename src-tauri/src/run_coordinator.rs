@@ -36,7 +36,8 @@ pub(crate) fn release_sync_slot(
     pair_id: &str,
     slot: &Arc<AtomicBool>,
 ) {
-    let Some((watch_pending, schedule_pending)) = release_pair_run_slot(state, pair_id, slot) else {
+    let Some((watch_pending, schedule_pending)) = release_pair_run_slot(state, pair_id, slot)
+    else {
         return;
     };
     if watch_pending {
@@ -73,10 +74,7 @@ pub(crate) fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: Stri
 
             let snapshot_entries = {
                 let guard = db.lock().map_err(|e| e.to_string())?;
-                guard
-                    .latest_snapshot(&pair.id)
-                    .map_err(|e| e.to_string())?
-                    .map(|s| s.entries)
+                guard.latest_snapshot(&pair.id).map_err(|e| e.to_string())?.map(|s| s.entries)
             };
             let plan = preview_pair_impl(&pair, snapshot_entries.as_deref())?;
 
@@ -148,10 +146,7 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
 
             let snapshot_entries = {
                 let guard = db.lock().map_err(|e| e.to_string())?;
-                guard
-                    .latest_snapshot(&pair.id)
-                    .map_err(|e| e.to_string())?
-                    .map(|s| s.entries)
+                guard.latest_snapshot(&pair.id).map_err(|e| e.to_string())?.map(|s| s.entries)
             };
             let plan = preview_pair_impl(&pair, snapshot_entries.as_deref())?;
 
@@ -200,15 +195,15 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{release_pair_run_slot, should_ignore_watch_event, try_acquire_pair_run, AppState};
+    use crate::state::{
+        release_pair_run_slot, should_ignore_watch_event, try_acquire_pair_run, AppState,
+    };
     use tempfile::TempDir;
 
     #[test]
     fn empty_watch_plan_is_detected() {
         assert!(watch_plan_is_empty(&[]));
-        assert!(!watch_plan_is_empty(&[SyncAction::CopyLeftToRight {
-            path: "a.txt".into(),
-        }]));
+        assert!(!watch_plan_is_empty(&[SyncAction::CopyLeftToRight { path: "a.txt".into() }]));
     }
 
     /// Simulates `run_watch_sync` acquiring, finding an empty plan, and releasing without

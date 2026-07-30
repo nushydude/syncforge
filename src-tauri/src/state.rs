@@ -13,6 +13,8 @@ pub const WATCH_SUPPRESS_AFTER_RUN_MS: u64 = 2000;
 
 pub struct AppState {
     pub db: Arc<Mutex<Database>>,
+    /// Cancellation flags for active duplicate analysis jobs.
+    pub duplicate_scan_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Per-pair cancel flags while a sync run is active.
     pub active_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Pair ids whose debounced watch sync could not start while that pair was busy.
@@ -31,8 +33,10 @@ impl AppState {
     pub fn new(data_dir: PathBuf) -> Result<Self, PersistenceError> {
         let db_path = data_dir.join("syncforge.db");
         let db = Database::open(&db_path)?;
+        db.mark_duplicate_scans_interrupted()?;
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
+            duplicate_scan_cancels: Mutex::new(HashMap::new()),
             active_runs: Mutex::new(HashMap::new()),
             pending_watch_syncs: Mutex::new(HashSet::new()),
             pending_schedule_syncs: Mutex::new(HashSet::new()),
@@ -83,16 +87,10 @@ pub fn release_pair_run_slot(
         );
     }
 
-    let watch_pending = state
-        .pending_watch_syncs
-        .lock()
-        .ok()
-        .is_some_and(|mut g| g.remove(pair_id));
-    let schedule_pending = state
-        .pending_schedule_syncs
-        .lock()
-        .ok()
-        .is_some_and(|mut g| g.remove(pair_id));
+    let watch_pending =
+        state.pending_watch_syncs.lock().ok().is_some_and(|mut g| g.remove(pair_id));
+    let schedule_pending =
+        state.pending_schedule_syncs.lock().ok().is_some_and(|mut g| g.remove(pair_id));
 
     Some((watch_pending, schedule_pending))
 }

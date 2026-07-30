@@ -12,6 +12,8 @@ A modern desktop folder-sync tool (SyncToy replacement) built with **Tauri 2**, 
 - **Scheduling** — Cron-based runs with desktop notifications
 - **History** — Past runs with detail view and CSV/JSON export
 
+The Duplicates workspace can find candidate copies by exact content hash, file size, or filename, then move reviewed files to the Recycle Bin. Hash scanning streams file contents and only hashes files that share a size, so large files are not loaded into memory.
+
 ## Installation
 
 Download the latest Windows installer from the [Releases](https://github.com/nushydude/syncforge/releases) page.
@@ -32,11 +34,19 @@ Download the latest Windows installer from the [Releases](https://github.com/nus
 git clone https://github.com/nushydude/syncforge.git
 cd syncforge
 pnpm install
-pnpm tauri dev
+pnpm start
 ```
+
+You can also double-click `Start-SyncForge.cmd` from the project folder.
+Do not launch `src-tauri/target/debug/syncforge.exe` directly; that debug binary
+expects the Vite dev server to already be running and will show a localhost
+connection error by itself.
 
 | Command | Description |
 | --- | --- |
+| `pnpm start` | Run the Tauri desktop app in development mode |
+| `pnpm dev:desktop` | Alias for `pnpm start` |
+| `pnpm dev` / `pnpm dev:web` | Run only the Vite frontend dev server |
 | `pnpm test` | Vitest unit tests |
 | `pnpm build` | Typecheck and build the Vite frontend |
 | `pnpm lint` | ESLint |

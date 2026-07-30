@@ -1,5 +1,6 @@
 mod commands;
 mod diff;
+mod duplicates;
 mod engine;
 mod hashing;
 mod models;
@@ -115,6 +116,12 @@ pub fn run() {
             commands::dialog::pick_folder,
             commands::dialog::path_exists,
             commands::dialog::paths_equal,
+            commands::duplicates::start_duplicate_scan,
+            commands::duplicates::get_duplicate_scan,
+            commands::duplicates::resume_duplicate_scan,
+            commands::duplicates::cancel_duplicate_scan,
+            commands::duplicates::find_duplicates,
+            commands::duplicates::remove_duplicates,
             commands::pairs::list_pairs,
             commands::pairs::save_pair,
             commands::pairs::delete_pair,

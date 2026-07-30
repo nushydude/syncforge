@@ -4,15 +4,29 @@ use std::path::Path;
 
 /// Returns a lowercase hex BLAKE3 digest of the file at `path`.
 pub fn hash_file(path: &Path) -> io::Result<String> {
+    let mut noop = |_: u64, _: u64| true;
+    hash_file_with_progress(path, &mut noop)
+}
+
+pub fn hash_file_with_progress(
+    path: &Path,
+    mut on_progress: impl FnMut(u64, u64) -> bool,
+) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
+    let total = file.metadata()?.len();
+    let mut processed = 0;
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        processed += read as u64;
+        if !on_progress(processed, total) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
     }
     Ok(hasher.finalize().to_hex().to_string())
 }

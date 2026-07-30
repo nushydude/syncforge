@@ -1,7 +1,10 @@
 import * as pairsApi from "../api/pairs";
 import * as previewApi from "../api/preview";
 import { validatePairForm } from "../lib/pairValidation";
-import { validateCronExpression, describeCronExpression } from "../lib/scheduleParsing";
+import {
+  validateCronExpression,
+  describeCronExpression,
+} from "../lib/scheduleParsing";
 import type { ConflictPolicy, FolderPair, SyncMode, SyncPlan } from "../types";
 import { defaultFilters } from "../types";
 
@@ -9,6 +12,7 @@ export interface PairsStoreState {
   pairs: FolderPair[];
   selectedId: string | null;
   editing: FolderPair | null;
+  editorOpen: boolean;
   loading: boolean;
   saving: boolean;
   error: string | null;
@@ -48,6 +52,7 @@ let state: PairsStoreState = {
   pairs: [],
   selectedId: null,
   editing: null,
+  editorOpen: false,
   loading: false,
   saving: false,
   error: null,
@@ -89,7 +94,9 @@ export function subscribePairs(listener: Listener): () => void {
   return () => listeners.delete(listener);
 }
 
-async function refreshScheduleDescription(pair: FolderPair | null): Promise<void> {
+async function refreshScheduleDescription(
+  pair: FolderPair | null,
+): Promise<void> {
   if (!pair?.scheduleEnabled || !pair.scheduleCron?.trim()) {
     state = { ...state, scheduleDescription: null, scheduleError: null };
     emit();
@@ -99,7 +106,9 @@ async function refreshScheduleDescription(pair: FolderPair | null): Promise<void
   const validation = validateCronExpression(pair.scheduleCron);
   state = {
     ...state,
-    scheduleError: validation.valid ? null : validation.error ?? "Invalid cron expression",
+    scheduleError: validation.valid
+      ? null
+      : (validation.error ?? "Invalid cron expression"),
     scheduleDescription: validation.valid
       ? describeCronExpression(pair.scheduleCron)
       : null,
@@ -145,8 +154,7 @@ function refreshWatchWarning(pair: FolderPair | null): void {
       }
       state = {
         ...state,
-        watchWarning:
-          leftExists && rightExists ? null : WATCH_INACTIVE_MSG,
+        watchWarning: leftExists && rightExists ? null : WATCH_INACTIVE_MSG,
       };
       emit();
     })();
@@ -187,6 +195,7 @@ export function selectPair(id: string): void {
     ...state,
     selectedId: id,
     editing: { ...pair, filters: { ...pair.filters } },
+    editorOpen: false,
     validationErrors: [],
     error: null,
     previewPlan: null,
@@ -206,6 +215,7 @@ export function startNewPair(): void {
     ...state,
     selectedId: null,
     editing: emptyPair(),
+    editorOpen: true,
     validationErrors: [],
     error: null,
     watchWarning: null,
@@ -215,11 +225,29 @@ export function startNewPair(): void {
   emit();
 }
 
+export function beginEdit(): void {
+  const pair = state.pairs.find((p) => p.id === state.selectedId);
+  if (!pair) {
+    return;
+  }
+  state = {
+    ...state,
+    editing: { ...pair, filters: { ...pair.filters } },
+    editorOpen: true,
+    validationErrors: [],
+    error: null,
+  };
+  emit();
+  refreshWatchWarning(state.editing);
+  void refreshScheduleDescription(state.editing);
+}
+
 export function cancelEdit(): void {
   previewRequestId++;
   state = {
     ...state,
     editing: null,
+    editorOpen: false,
     validationErrors: [],
     error: null,
     previewPlan: null,
@@ -362,7 +390,7 @@ export async function saveEditing(): Promise<boolean> {
     const scheduled = await pairsApi.setSchedule(
       saved.id,
       editing.scheduleEnabled,
-      editing.scheduleEnabled ? editing.scheduleCron?.trim() ?? null : null,
+      editing.scheduleEnabled ? (editing.scheduleCron?.trim() ?? null) : null,
     );
     const exists = state.pairs.some((p) => p.id === scheduled.id);
     const pairs = exists
@@ -373,6 +401,7 @@ export async function saveEditing(): Promise<boolean> {
       pairs,
       selectedId: scheduled.id,
       editing: { ...scheduled, filters: { ...scheduled.filters } },
+      editorOpen: false,
       saving: false,
       validationErrors: [],
     };
@@ -406,6 +435,7 @@ export async function deleteSelected(): Promise<boolean> {
       pairs,
       selectedId: null,
       editing: null,
+      editorOpen: false,
       saving: false,
       validationErrors: [],
     };
@@ -434,6 +464,7 @@ export function resetPairsStoreForTests(): void {
     pairs: [],
     selectedId: null,
     editing: null,
+    editorOpen: false,
     loading: false,
     saving: false,
     error: null,

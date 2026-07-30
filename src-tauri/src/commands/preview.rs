@@ -70,9 +70,11 @@ pub async fn preview_pair(
         load_preview_snapshot(&db, &pair.id)?
     };
 
-    tauri::async_runtime::spawn_blocking(move || preview_pair_impl(&pair, snapshot_entries.as_deref()))
-        .await
-        .map_err(|e| format!("preview task failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        preview_pair_impl(&pair, snapshot_entries.as_deref())
+    })
+    .await
+    .map_err(|e| format!("preview task failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -106,7 +108,10 @@ mod tests {
         .expect("save");
     }
 
-    fn preview_with_db(db: &Database, pair: &FolderPair) -> Result<crate::models::SyncPlan, String> {
+    fn preview_with_db(
+        db: &Database,
+        pair: &FolderPair,
+    ) -> Result<crate::models::SyncPlan, String> {
         let snapshot_entries = super::load_preview_snapshot(db, &pair.id)?;
         super::preview_pair_impl(pair, snapshot_entries.as_deref())
     }
@@ -298,8 +303,8 @@ mod tests {
             )
         }));
 
-        let persisted = preview_with_db(&db, &db.get_pair(&id).expect("get").expect("pair"))
-            .expect("preview");
+        let persisted =
+            preview_with_db(&db, &db.get_pair(&id).expect("get").expect("pair")).expect("preview");
         assert!(persisted.actions.iter().any(|a| {
             matches!(
                 a,

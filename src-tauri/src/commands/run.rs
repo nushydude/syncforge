@@ -81,10 +81,7 @@ pub async fn run_pair(
 
 /// Cancel an in-progress sync. With `pair_id`, cancels only that pair; without, cancels all active runs.
 #[tauri::command]
-pub fn cancel_run(
-    pair_id: Option<String>,
-    state: State<'_, Arc<AppState>>,
-) -> Result<(), String> {
+pub fn cancel_run(pair_id: Option<String>, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let guard = state.active_runs.lock().map_err(|e| e.to_string())?;
     match pair_id {
         Some(id) => {

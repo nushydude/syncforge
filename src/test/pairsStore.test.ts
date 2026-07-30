@@ -3,6 +3,7 @@ import * as pairsApi from "../api/pairs";
 import * as previewApi from "../api/preview";
 import type { FolderPair, SyncPlan } from "../types";
 import {
+  beginEdit,
   cancelEdit,
   getPairsState,
   loadPairs,
@@ -69,6 +70,7 @@ describe("pairsStore", () => {
     expect(editing).not.toBeNull();
     expect(editing?.id).toBe("");
     expect(editing?.name).toBe("");
+    expect(getPairsState().editorOpen).toBe(true);
   });
 
   it("selects a pair for editing", async () => {
@@ -77,6 +79,10 @@ describe("pairsStore", () => {
     selectPair("pair-1");
     expect(getPairsState().selectedId).toBe("pair-1");
     expect(getPairsState().editing?.name).toBe("Docs");
+    expect(getPairsState().editorOpen).toBe(false);
+
+    beginEdit();
+    expect(getPairsState().editorOpen).toBe(true);
   });
 
   it("validates before save", async () => {
@@ -251,7 +257,9 @@ describe("pairsStore", () => {
 
   it("surfaces preview errors", async () => {
     vi.mocked(pairsApi.listPairs).mockResolvedValue([samplePair]);
-    vi.mocked(previewApi.previewPair).mockRejectedValue(new Error("scan left failed"));
+    vi.mocked(previewApi.previewPair).mockRejectedValue(
+      new Error("scan left failed"),
+    );
     await loadPairs();
     selectPair("pair-1");
     await previewSelectedPair();

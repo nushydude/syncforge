@@ -97,11 +97,7 @@ impl ScheduleService {
                     .collect();
 
                 for pair_id in due {
-                    run_scheduled_sync(
-                        app_task.clone(),
-                        Arc::clone(&state_task),
-                        pair_id,
-                    );
+                    run_scheduled_sync(app_task.clone(), Arc::clone(&state_task), pair_id);
                 }
 
                 let sleep_until =
