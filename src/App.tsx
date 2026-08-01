@@ -4,11 +4,14 @@ import { HistoryView } from "./components/history/HistoryView";
 import { DuplicatesView } from "./components/duplicates/DuplicatesView";
 import { PairsPanel } from "./components/pairs/PairsPanel";
 import { SettingsView } from "./components/settings/SettingsView";
+import { useRunStore } from "./hooks/useRunStore";
+import type { RunStoreState } from "./store/runStore";
 
 type AppView = "pairs" | "duplicates" | "history" | "settings";
 
 function App() {
   const [view, setView] = useState<AppView>("pairs");
+  const running = useRunStore((s: RunStoreState) => s.running);
 
   return (
     <div className="app">
@@ -25,6 +28,7 @@ function App() {
                 view === "pairs" ? "app-nav-btn active" : "app-nav-btn"
               }
               onClick={() => setView("pairs")}
+              disabled={running}
             >
               Pairs
             </button>
@@ -34,6 +38,7 @@ function App() {
                 view === "history" ? "app-nav-btn active" : "app-nav-btn"
               }
               onClick={() => setView("history")}
+              disabled={running}
             >
               History
             </button>
@@ -43,6 +48,7 @@ function App() {
                 view === "duplicates" ? "app-nav-btn active" : "app-nav-btn"
               }
               onClick={() => setView("duplicates")}
+              disabled={running}
             >
               Duplicates
             </button>
@@ -52,6 +58,7 @@ function App() {
                 view === "settings" ? "app-nav-btn active" : "app-nav-btn"
               }
               onClick={() => setView("settings")}
+              disabled={running}
             >
               Settings
             </button>

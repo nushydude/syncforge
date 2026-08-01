@@ -1,6 +1,8 @@
 import { ConflictDialog } from "../conflicts/ConflictDialog";
-import { PreviewTable } from "../preview/PreviewTable";
+import { PreviewResults } from "../preview/PreviewResults";
+import { PreviewScanProgress } from "../preview/PreviewScanProgress";
 import { RunProgress } from "../run/RunProgress";
+import { useEffect, useRef, useState } from "react";
 import { usePairsStore } from "../../hooks/usePairsStore";
 import { useRunStore } from "../../hooks/useRunStore";
 import {
@@ -62,6 +64,19 @@ export function PairEditor() {
     pendingConflicts,
     conflictResolutions,
   } = useRunStore(selectPairEditorRun);
+  const [showResults, setShowResults] = useState(false);
+  const resultsTitleRef = useRef<HTMLHeadingElement>(null);
+  const resultsTriggerRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    setShowResults(false);
+  }, [editing?.id, previewPlan]);
+
+  useEffect(() => {
+    if (showResults) {
+      window.requestAnimationFrame(() => resultsTitleRef.current?.focus());
+    }
+  }, [showResults]);
 
   if (!editing) {
     return null;
@@ -74,6 +89,7 @@ export function PairEditor() {
       className="pair-editor"
       onSubmit={(e) => {
         e.preventDefault();
+        if (runInProgress) return;
         void saveEditing();
       }}
     >
@@ -199,7 +215,7 @@ export function PairEditor() {
               updateEditing({
                 scheduleEnabled: e.target.checked,
                 scheduleCron: e.target.checked
-                  ? editing.scheduleCron ?? "0 9 * * *"
+                  ? (editing.scheduleCron ?? "0 9 * * *")
                   : null,
               })
             }
@@ -236,12 +252,55 @@ export function PairEditor() {
         )}
       </fieldset>
 
-      {!isNew && (
-        <PreviewTable
-          plan={previewPlan}
-          loading={previewLoading}
-          error={previewError}
-        />
+      {!isNew && <PreviewScanProgress loading={previewLoading} />}
+
+      {!isNew && previewPlan && !previewLoading && !showResults && (
+        <section className="preview-ready-card" aria-live="polite">
+          <div>
+            <strong>Preview ready</strong>
+            <p>
+              {previewPlan.actions.length === 0
+                ? "Folders are already in sync."
+                : "Review the planned changes before syncing."}
+            </p>
+          </div>
+          <button
+            ref={resultsTriggerRef}
+            type="button"
+            onClick={() => setShowResults(true)}
+            disabled={runInProgress}
+          >
+            View results
+          </button>
+        </section>
+      )}
+
+      {!isNew && showResults && previewPlan && (
+        <>
+          <button
+            type="button"
+            className="preview-back-button"
+            onClick={() => {
+              setShowResults(false);
+              window.requestAnimationFrame(() =>
+                resultsTriggerRef.current?.focus(),
+              );
+            }}
+            disabled={runInProgress}
+          >
+            ← Back to pair editor
+          </button>
+          <PreviewResults
+            plan={previewPlan}
+            resultsTitleRef={resultsTitleRef}
+          />
+        </>
+      )}
+
+      {!isNew && previewError && (
+        <p className="preview-error" role="alert">
+          {previewError}
+        </p>
       )}
 
       {!isNew && <RunProgress />}
@@ -272,13 +331,17 @@ export function PairEditor() {
             </button>
           </>
         )}
-        <button type="submit" className="btn-primary" disabled={saving}>
+        <button
+          type="submit"
+          className="btn-primary"
+          disabled={saving || runInProgress}
+        >
           {saving ? "Saving…" : "Save pair"}
         </button>
         <button
           type="button"
           onClick={cancelEdit}
-          disabled={saving}
+          disabled={saving || runInProgress}
         >
           Cancel
         </button>
@@ -286,7 +349,7 @@ export function PairEditor() {
           <button
             type="button"
             className="btn-danger"
-            disabled={saving}
+            disabled={saving || runInProgress}
             onClick={() => {
               if (
                 window.confirm(
