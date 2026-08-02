@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     fn scan_directory_records_warning_for_unreadable_file() {
         use std::os::unix::fs::PermissionsExt;
 
