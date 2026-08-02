@@ -6,86 +6,66 @@ Audited on 2026-08-02.
 
 ### No canonical repository-level instructions
 
-The repository had orchestrator prompts and contributor guidance, but no root-level agent contract.
+The repository had orchestrator prompts and contributor guidance, but no root-level agent contract. This made it unclear which rules applied to agents outside the story orchestrator.
 
 **Resolution:** added [`AGENTS.md`](../AGENTS.md) with safety, validation, Git, PR, release, and orchestration rules.
 
 ### Release-note behavior was implicit
 
-The release workflow created a generic body while prior releases used structured, user-facing notes. There was no deterministic instruction to inspect previous releases or verify installer links.
+The release workflow created a generic body (`See the assets to download the installer.`), while prior releases used structured, user-facing notes. There was no deterministic instruction to inspect previous releases or verify installer links.
 
 **Resolution:** added [`RELEASE_GUIDE.md`](RELEASE_GUIDE.md) with a required structure, evidence rules, version checklist, tag behavior, and publish checklist.
 
 ### Version sources were incomplete
 
-Contributor guidance omitted the `syncforge` entry in `Cargo.lock`.
+Contributor guidance listed `package.json`, `Cargo.toml`, and `tauri.conf.json`, but omitted the root `syncforge` entry in `Cargo.lock`.
 
-**Resolution:** the release guide requires `package.json`, `Cargo.toml`, `Cargo.lock`, and `tauri.conf.json` to match. CI now checks them automatically.
-
-## Hardening implemented
-
-### Orchestrator branch safety
-
-`Run-Story.ps1` previously used `git checkout -B`, which could rewrite an existing local story branch and did not reject unrelated uncommitted changes.
-
-**Resolution:** the orchestrator now requires a clean worktree, verifies local `main`, switches without rewriting existing branches, and refuses to initialize missing repository history. It remains local-only and does not fetch or push remote state.
-
-### Fail-closed verdict parsing
-
-`Parse-Verdict.ps1` previously searched for verdict text anywhere in agent output and did not enforce the final-line requirement.
-
-**Resolution:** parsing now requires the final non-empty line to be an exact recognized verdict. Unknown implementer, reviewer, or approver output stops the workflow.
-
-### Orchestrator portability
-
-`orchestrator/stories.json` contained an absolute Windows workspace path.
-
-**Resolution:** removed the machine-specific value; the runner defaults to the repository root when no override is configured.
-
-### Agent permission separation
-
-The shared Cursor CLI profile remains broad, but the invocation layer previously gave all roles trusted/MCP-enabled flags.
-
-**Resolution:** implementers retain write/trusted/MCP flags; reviewers and approvers run in ask mode without those flags. The shared profile remains a follow-up because it needs role-specific configuration or isolated worktrees.
-
-### CI version consistency
-
-CI did not compare the four version sources.
-
-**Resolution:** added `scripts/check-version-consistency.mjs` and run it in the frontend quality gate.
-
-### CI and release execution controls
-
-The workflows had no explicit concurrency or release timeout policy.
-
-**Resolution:** CI now cancels superseded runs per ref; releases are serialized and the Windows bundle has a 20-minute timeout.
-
-### Generated-file formatting scope
-
-Generated Tauri schemas could cause repository-wide Prettier checks to drift from source formatting.
-
-**Resolution:** `src-tauri/gen/schemas` is now explicitly excluded in `.prettierignore`.
+**Resolution:** the release guide requires all four locations to match.
 
 ## Remaining risks and recommended follow-ups
 
-### Remote main freshness
+### Orchestrator branch safety
 
-The orchestrator verifies and switches to local `main`, but deliberately does not fetch or fast-forward from a remote because it is documented as local-only.
+`Run-Story.ps1` uses `git checkout -B`, which can reset an existing local story branch to the current commit. It also does not refuse to start with unrelated uncommitted changes or refresh `main` from the remote.
 
-**Recommendation:** add an explicit opt-in refresh switch if the orchestrator is later used in a shared remote workflow.
+**Recommendation:** add a preflight that requires a clean worktree, verifies the current repository, fast-forwards `main`, and refuses to overwrite an existing branch unless explicitly requested.
 
-### Shared CLI permission profile
+### Orchestrator verdict parsing
 
-`.cursor/cli.json` remains broad because implementers need write access and the file does not support role-specific permissions.
+`Parse-Verdict.ps1` searches for verdict text anywhere in agent output. It does not enforce the prompts’ “exactly one final line” requirement, and an implementer output with no recognized verdict is not treated as blocked.
 
-**Recommendation:** introduce separate reviewer/approver profiles or run those roles in isolated read-only worktrees.
+**Recommendation:** parse only an anchored final verdict line and fail closed on `UNKNOWN` for every role.
 
-### Release-note automation
+### Orchestrator configuration portability
 
-The release workflow still starts with a generic release body, so final notes must be written before publishing.
+`orchestrator/stories.json` contains an absolute Windows workspace path. A different checkout or operating system will not use the configured repository automatically.
 
-**Recommendation:** add release-note validation or generation once the preferred GitHub release-note source is decided.
+**Recommendation:** default the workspace to the repository root and allow an explicit override through a parameter or environment variable.
+
+### Agent permissions are broad
+
+`.cursor/cli.json` allows all Shell, Read, Write, and MCP operations, while `Invoke-Agent.ps1` runs trusted agents with MCP approval enabled. The prompts add behavioral constraints, but the permissions are not technically restricted.
+
+**Recommendation:** use a least-privilege profile for reviewers and approvers, and require explicit confirmation for destructive filesystem or remote Git operations.
+
+### CI does not enforce version consistency
+
+CI validates formatting, lint, tests, and builds, but it does not compare the four version sources or validate release-note presence for a version tag.
+
+**Recommendation:** add a small CI check that compares package, Cargo, lockfile, and Tauri versions, and optionally checks that a tagged release has non-placeholder notes before publication.
+
+### Release workflow has no explicit concurrency or timeout policy
+
+The workflow relies on the default GitHub Actions behavior. A stuck Windows build can consume a runner indefinitely, and two tags could publish concurrently.
+
+**Recommendation:** add workflow-level `concurrency` and a job timeout appropriate for the Windows bundle.
+
+### Local and CI formatting scope can drift
+
+The repository-wide `pnpm run format:check` currently flags four tracked generated Tauri schema files in `src-tauri/gen/schemas/`, even though the documentation files in this change pass targeted formatting. Generated-file ownership and whether generated schemas must be formatted are not stated.
+
+**Recommendation:** either include generated schemas in the formatting contract and format them in CI, or exclude generated files consistently in `.prettierignore` and document when they are regenerated.
 
 ## Overall assessment
 
-The previous instructions were useful for the local story orchestrator, but incomplete as a repository-wide agent contract. The new root instructions, release guide, preflight checks, CI version validation, and workflow controls close most clarity and safety gaps. Remaining work is primarily remote freshness, role-specific CLI permissions, and optional release-note automation.
+The previous instructions were useful for the local story orchestrator, but incomplete as a repository-wide agent contract. The new root instructions and release guide close the immediate clarity gap. The remaining items are implementation hardening opportunities, especially branch safety, fail-closed verdict parsing, and least-privilege agent execution.
