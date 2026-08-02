@@ -5,6 +5,7 @@ pub mod pairs;
 pub mod preview;
 pub mod run;
 pub mod schedule;
+pub mod sniffer;
 
 #[tauri::command]
 pub fn greet(name: &str) -> String {

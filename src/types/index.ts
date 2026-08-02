@@ -4,3 +4,4 @@ export * from './history';
 export * from './duplicates';
 export * from './settings';
 export * from './run';
+export * from './sniffer';
