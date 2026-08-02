@@ -17,8 +17,9 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "check:version": "node scripts/check-version-consistency.mjs",
     "tauri": "tauri",
-    "ci:frontend": "pnpm run format:check && pnpm run lint && pnpm run test:run && pnpm run build",
+    "ci:frontend": "pnpm run check:version && pnpm run format:check && pnpm run lint && pnpm run test:run && pnpm run build",
     "ci:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings && cargo test --manifest-path src-tauri/Cargo.toml",
     "ci:local": "pnpm run ci:frontend && pnpm run ci:rust"
   },

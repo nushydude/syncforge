@@ -23,14 +23,13 @@ function Invoke-Agent {
         "-p", $prompt,
         "--model", $Model,
         "--workspace", $Workspace,
-        "--output-format", "text",
-        "-f",
-        "--trust",
-        "--approve-mcps"
+        "--output-format", "text"
     )
 
     if ($ReadOnly -or $Mode -eq "ask") {
         $agentArgs += @("--mode", "ask")
+    } else {
+        $agentArgs += @("-f", "--trust", "--approve-mcps")
     }
 
     $logDir = Split-Path -Parent $LogFile
