@@ -2,7 +2,6 @@
   "project": "SyncForge",
   "model": "composer-2.5",
   "maxReviewIterations": 5,
-  "workspace": "C:\\Users\\CDAND\\Projects\\syncforge",
   "stories": [
     {
       "id": "S01",

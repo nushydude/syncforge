@@ -24,11 +24,13 @@ Reference patterns: LightFrame (`folder_index`, `spawn_blocking`, request-genera
 1. Implement everything in the story acceptance criteria.
 2. Run tests and builds; fix failures before finishing.
 3. Keep changes scoped to this story only.
-4. When done, stage and commit locally with message: `{{STORY_ID}}: {{STORY_TITLE}}`
+4. Inspect `git status` before editing and preserve unrelated worktree changes.
+5. When done, run the relevant tests/builds, stage only story files, and commit locally with message: `{{STORY_ID}}: {{STORY_TITLE}}`
 
 ## Constraints
 
 - No GitHub push or remote operations.
+- Do not reset, force-checkout, or overwrite an existing branch.
 - Match existing code style in the repo.
 - Add Vitest/Rust tests where the story requires them.
 

@@ -33,9 +33,12 @@ This runs frontend format/lint/test/build and Rust fmt/clippy/test.
 
 SyncForge uses GitHub Actions to build and publish Windows installers (mirroring [LightFrame](https://github.com/nushydude/lightframe)).
 
-1. **Bump version numbers** on a branch — keep these in sync (e.g. `0.1.0` → `0.2.0`):
+Follow the detailed, deterministic [release guide](docs/RELEASE_GUIDE.md), including the version consistency, release-note, validation, and asset verification checklists below.
+
+1. **Bump version numbers** on a branch — keep all four sources in sync (e.g. `0.1.0` → `0.2.0`):
    - `package.json`
    - `src-tauri/Cargo.toml`
+   - `src-tauri/Cargo.lock` (`syncforge` package entry)
    - `src-tauri/tauri.conf.json`
 2. **Merge to `main`** via pull request.
 3. **Tag and push** to trigger the release workflow:

@@ -73,13 +73,27 @@ function Invoke-Git {
     return $code
 }
 
-if ((Invoke-Git @("rev-parse", "--verify", "main")) -ne 0) {
-    Invoke-Git @("checkout", "-b", "main") | Out-Null
-    Invoke-Git @("commit", "--allow-empty", "-m", "chore: initialize main") | Out-Null
+function Assert-CleanWorktree {
+    $status = @(git status --porcelain)
+    if ($LASTEXITCODE -ne 0) { throw "Unable to inspect git worktree." }
+    if ($status.Count -gt 0) {
+        throw "Worktree is not clean. Commit or stash unrelated changes before running the orchestrator."
+    }
 }
 
-Invoke-Git @("checkout", "main") | Out-Null
-Invoke-Git @("checkout", "-B", $branch) | Out-Null
+Assert-CleanWorktree
+if ((Invoke-Git @("rev-parse", "--verify", "main")) -ne 0) {
+    throw "Local main branch does not exist; refusing to initialize or rewrite repository history."
+}
+if ((Invoke-Git @("switch", "main")) -ne 0) { throw "Could not switch to main." }
+Assert-CleanWorktree
+
+if ((Invoke-Git @("show-ref", "--verify", "--quiet", "refs/heads/$branch")) -eq 0) {
+    if ((Invoke-Git @("switch", $branch)) -ne 0) { throw "Could not switch to existing story branch $branch." }
+} else {
+    if ((Invoke-Git @("switch", "-c", $branch)) -ne 0) { throw "Could not create story branch $branch." }
+}
+Assert-CleanWorktree
 
 Update-State @{ status = "implementing"; branch = $branch; iteration = 0 }
 
@@ -115,6 +129,15 @@ for ($iter = 1; $iter -le $maxIter; $iter++) {
         Update-State @{ status = "blocked"; lastLog = $implLog }
         throw "Implementer blocked on $StoryId. See $implLog"
     }
+    if ($implStatus -ne "DONE") {
+        Update-State @{ status = "invalid_implement_verdict"; lastLog = $implLog }
+        throw "Implementer did not end with an exact DONE or BLOCKED verdict. See $implLog"
+    }
+    Assert-CleanWorktree
+    $storyCommitCount = [int](git rev-list --count "main..HEAD")
+    if ($LASTEXITCODE -ne 0 -or $storyCommitCount -lt 1) {
+        throw "Implementer reported DONE without a commit on $branch."
+    }
 
     Update-State @{ status = "reviewing"; iteration = $iter }
 
@@ -131,9 +154,15 @@ for ($iter = 1; $iter -le $maxIter; $iter++) {
     $reviewerOutput = $revOut
     $revVerdict = Parse-Verdict -Output $revOut -Kind review
 
+    Assert-CleanWorktree
+
     if ($revVerdict -eq "APPROVED") {
         $approved = $true
         break
+    }
+    if ($revVerdict -eq "UNKNOWN") {
+        Update-State @{ status = "invalid_review_verdict"; lastLog = $revLog }
+        throw "Reviewer did not end with an exact verdict. See $revLog"
     }
 
     $tail = if ($revOut.Length -gt 4000) { $revOut.Substring($revOut.Length - 4000) } else { $revOut }
@@ -173,9 +202,11 @@ $appOut = Invoke-Agent -PromptFile $appPrompt -LogFile $appLog -Model $model -Wo
 $appVerdict = Parse-Verdict -Output $appOut -Kind approve
 
 if ($appVerdict -ne "YES") {
-    Update-State @{ status = "approve_denied" }
+    $approvalStatus = if ($appVerdict -eq "UNKNOWN") { "invalid_approve_verdict" } else { "approve_denied" }
+    Update-State @{ status = $approvalStatus }
     throw "Approver denied $StoryId. See $appLog"
 }
+Assert-CleanWorktree
 
 # Merge story branch into main locally
 Invoke-Git @("checkout", "main") | Out-Null

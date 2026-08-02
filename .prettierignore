@@ -2,3 +2,4 @@ dist
 node_modules
 src-tauri/target
 orchestrator/logs
+src-tauri/gen/schemas

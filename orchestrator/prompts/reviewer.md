@@ -25,6 +25,8 @@ Do **not** implement fixes. Do **not** edit files.
 3. Scope creep — anything unrelated to this story?
 4. Windows path handling correct for a sync tool?
 5. Security: no secrets committed, safe file operations?
+6. Worktree safety: no unrelated changes, and the implementer committed the scoped work?
+7. Validation evidence: the reported tests and builds are reproducible and relevant?
 
 ## Required verdict format
 
