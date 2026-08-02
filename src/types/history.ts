@@ -1,4 +1,4 @@
-export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 
 export interface RunReport {
   runId: string;

@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { HistoryView } from "../history/HistoryView";
 import { usePairsStore } from "../../hooks/usePairsStore";
 import { useRunStore } from "../../hooks/useRunStore";
 import { loadPairs, startNewPair } from "../../store/pairsStore";
@@ -24,6 +25,7 @@ const selectPairsPanel = (s: PairsStoreState) => ({
 const selectWatchSkipped = (s: RunStoreState) => s.watchSkipped;
 
 export function PairsPanel() {
+  const [section, setSection] = useState<"pairs" | "history">("pairs");
   const { pairs, editing, editorOpen, selectedId, loading, error } =
     usePairsStore(selectPairsPanel);
   const watchSkipped = useRunStore(selectWatchSkipped);
@@ -41,6 +43,11 @@ export function PairsPanel() {
 
   return (
     <>
+      <div className="pairs-workspace-tabs" role="tablist" aria-label="Sync folder pairs">
+        <button type="button" role="tab" aria-selected={section === "pairs"} className={section === "pairs" ? "active" : ""} onClick={() => setSection("pairs")}>Folder pairs</button>
+        <button type="button" role="tab" aria-selected={section === "history"} className={section === "history" ? "active" : ""} onClick={() => setSection("history")}>Sync history</button>
+      </div>
+      {section === "history" ? <HistoryView active /> : <>
       {watchSkipped && (
         <div className="watch-skipped-banner" role="alert">
           <p>
@@ -93,6 +100,7 @@ export function PairsPanel() {
           )}
         </section>
       </div>
+      </>}
     </>
   );
 }
