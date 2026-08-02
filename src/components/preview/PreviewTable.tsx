@@ -73,7 +73,10 @@ function VirtualizedPreviewRows({ rows }: { rows: FormattedAction[] }) {
     <PreviewTableShell scrollRef={scrollRef}>
       {paddingTop > 0 && (
         <tr aria-hidden="true">
-          <td colSpan={3} style={{ height: paddingTop, padding: 0, border: 0 }} />
+          <td
+            colSpan={3}
+            style={{ height: paddingTop, padding: 0, border: 0 }}
+          />
         </tr>
       )}
       {virtualRows.map((virtualRow) => {
@@ -183,7 +186,9 @@ export function PreviewTable({ plan, loading, error }: PreviewTableProps) {
       ) : null}
 
       {rows.length === 0 ? (
-        <p className="preview-empty">No changes needed — folders are in sync.</p>
+        <p className="preview-empty">
+          No changes needed — folders are in sync.
+        </p>
       ) : (
         <PreviewRowsBody rows={rows} />
       )}

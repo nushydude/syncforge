@@ -90,10 +90,12 @@ export function FilterEditor({
     <fieldset className="filter-editor" disabled={disabled}>
       <legend>Include / exclude filters</legend>
       <p className="field-hint">
-        Glob patterns (e.g. <code>*.txt</code>). One per line when adding. Example{" "}
-        <code>notes.txt</code>{" "}
-        {pathMatchesFilters("notes.txt", filters) ? "matches" : "does not match"} the
-        rules below (used when you run Preview sync).
+        Glob patterns (e.g. <code>*.txt</code>). One per line when adding.
+        Example <code>notes.txt</code>{" "}
+        {pathMatchesFilters("notes.txt", filters)
+          ? "matches"
+          : "does not match"}{" "}
+        the rules below (used when you run Preview sync).
       </p>
 
       <div className="filter-add">

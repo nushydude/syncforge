@@ -44,7 +44,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isConflictPolicy(value: unknown): value is AppSettings["defaultConflictPolicy"] {
+function isConflictPolicy(
+  value: unknown,
+): value is AppSettings["defaultConflictPolicy"] {
   return (
     value === "newerWins" ||
     value === "left" ||

@@ -114,10 +114,10 @@ pub fn show_sniffer_item_properties(path: String) -> Result<(), String> {
         use windows_sys::Win32::UI::Shell::{SHObjectProperties, SHOP_FILEPATH};
 
         let trimmed = path.trim();
-        let shell_path = if trimmed.starts_with("\\\\?\\UNC\\") {
-            format!("\\\\{}", &trimmed[8..])
-        } else if trimmed.starts_with("\\\\?\\") {
-            trimmed[4..].to_string()
+        let shell_path = if let Some(stripped) = trimmed.strip_prefix("\\\\?\\UNC\\") {
+            format!("\\\\{}", stripped)
+        } else if let Some(stripped) = trimmed.strip_prefix("\\\\?\\") {
+            stripped.to_string()
         } else {
             trimmed.to_string()
         };

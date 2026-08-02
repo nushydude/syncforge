@@ -33,6 +33,7 @@ struct DiffContext<'a> {
     options: &'a DiffOptions,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_sync_plan(
     pair_id: &str,
     mode: SyncMode,
@@ -169,9 +170,7 @@ fn plan_synchronize(
             if !entries_differ(l, r, ctx) {
                 return;
             }
-            if snapshot_changed_both(l, r, snapshot, ctx) {
-                apply_conflict_policy(actions, path, l, r, conflict_policy);
-            } else if snapshot.is_none() {
+            if snapshot_changed_both(l, r, snapshot, ctx) || snapshot.is_none() {
                 apply_conflict_policy(actions, path, l, r, conflict_policy);
             } else {
                 push_newer_wins_copy(actions, path, l, r);
@@ -381,7 +380,7 @@ fn parent_paths(path: &str) -> Vec<String> {
     parents
 }
 
-fn sort_actions(actions: &mut Vec<SyncAction>) {
+fn sort_actions(actions: &mut [SyncAction]) {
     actions.sort_by(|a, b| action_path(a).cmp(action_path(b)));
 }
 

@@ -10,7 +10,11 @@ import { FolderSnifferView } from "./components/sniffer/FolderSnifferView";
 type AppView = "pairs" | "sniffer" | "duplicates" | "settings";
 
 function NavIcon({ children }: { children: string }) {
-  return <span className="nav-icon" aria-hidden="true">{children}</span>;
+  return (
+    <span className="nav-icon" aria-hidden="true">
+      {children}
+    </span>
+  );
 }
 
 function App() {
@@ -24,7 +28,9 @@ function App() {
           <div>
             <div className="app-brand-line">
               <h1>SyncForge</h1>
-              {import.meta.env.DEV && <span className="dev-build-badge">DEV BUILD</span>}
+              {import.meta.env.DEV && (
+                <span className="dev-build-badge">DEV BUILD</span>
+              )}
             </div>
             <p className="tagline">Modern folder sync for your desktop</p>
           </div>
@@ -41,7 +47,9 @@ function App() {
             </button>
             <button
               type="button"
-              className={view === "sniffer" ? "app-nav-btn active" : "app-nav-btn"}
+              className={
+                view === "sniffer" ? "app-nav-btn active" : "app-nav-btn"
+              }
               onClick={() => setView("sniffer")}
               disabled={running}
             >
@@ -60,7 +68,11 @@ function App() {
             <span className="app-nav-divider" aria-hidden="true" />
             <button
               type="button"
-              className={view === "settings" ? "app-nav-btn app-nav-settings active" : "app-nav-btn app-nav-settings"}
+              className={
+                view === "settings"
+                  ? "app-nav-btn app-nav-settings active"
+                  : "app-nav-btn app-nav-settings"
+              }
               onClick={() => setView("settings")}
               disabled={running}
             >

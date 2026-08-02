@@ -5,6 +5,7 @@
 const MAX_PATH: usize = 260;
 
 /// Returns true when `path` is a UNC path (`\\server\share\...`).
+#[allow(dead_code)]
 pub fn is_unc(path: &str) -> bool {
     let path = path.trim();
     if path.starts_with(r"\\?\UNC\") {
@@ -25,7 +26,7 @@ pub fn normalize_path(path: &str) -> String {
 
     #[cfg(windows)]
     {
-        return normalize_windows_path(trimmed);
+        normalize_windows_path(trimmed)
     }
 
     #[cfg(not(windows))]
@@ -53,7 +54,7 @@ pub fn path_is_within_root(path: &str, root: &str) -> bool {
         if !root_lower.ends_with('\\') {
             root_lower.push('\\');
         }
-        return path_lower.starts_with(&root_lower);
+        path_lower.starts_with(&root_lower)
     }
 
     #[cfg(not(windows))]

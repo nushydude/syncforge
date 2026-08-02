@@ -1,12 +1,12 @@
-import type { ConflictChoice } from './pair';
-import type { RunReport } from './history';
+import type { ConflictChoice } from "./pair";
+import type { RunReport } from "./history";
 
 export type SyncProgressPhase =
-  | 'scanning'
-  | 'running'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
+  | "scanning"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 export interface SyncProgress {
   runId: string;

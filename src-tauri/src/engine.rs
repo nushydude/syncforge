@@ -273,6 +273,7 @@ where
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_pair_impl_inner<F>(
     db: &Mutex<Database>,
     pair: &FolderPair,

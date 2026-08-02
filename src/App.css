@@ -1552,13 +1552,21 @@ button:disabled {
 }
 
 @keyframes sniffer-spin {
-  to { transform: rotate(360deg); }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 @keyframes sniffer-progress-slide {
-  0% { transform: translateX(-120%); }
-  50% { transform: translateX(170%); }
-  100% { transform: translateX(300%); }
+  0% {
+    transform: translateX(-120%);
+  }
+  50% {
+    transform: translateX(170%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
 }
 
 .sniffer-error {
@@ -1743,7 +1751,6 @@ button:disabled {
   white-space: nowrap;
 }
 
-
 .sniffer-legend span {
   display: inline-flex;
   align-items: center;
@@ -1801,11 +1808,21 @@ button:disabled {
   color: #1e3a8a;
 }
 
-.sniffer-tile.tone-1.folder { background: #38bdf8; }
-.sniffer-tile.tone-2.folder { background: #818cf8; }
-.sniffer-tile.tone-3.folder { background: #2dd4bf; }
-.sniffer-tile.tone-4.folder { background: #a78bfa; }
-.sniffer-tile.tone-5.folder { background: #fbbf24; }
+.sniffer-tile.tone-1.folder {
+  background: #38bdf8;
+}
+.sniffer-tile.tone-2.folder {
+  background: #818cf8;
+}
+.sniffer-tile.tone-3.folder {
+  background: #2dd4bf;
+}
+.sniffer-tile.tone-4.folder {
+  background: #a78bfa;
+}
+.sniffer-tile.tone-5.folder {
+  background: #fbbf24;
+}
 
 .sniffer-tile:hover {
   filter: brightness(0.96) saturate(1.08);

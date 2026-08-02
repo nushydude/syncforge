@@ -4,19 +4,19 @@ import type {
   FileEntry,
   SyncAction,
   SyncPlan,
-} from '../types';
+} from "../types";
 
 export type PathChangeKind =
-  | 'inSync'
-  | 'newOnLeft'
-  | 'newOnRight'
-  | 'deletedOnLeft'
-  | 'deletedOnRight'
-  | 'leftChanged'
-  | 'rightChanged'
-  | 'bothChanged';
+  | "inSync"
+  | "newOnLeft"
+  | "newOnRight"
+  | "deletedOnLeft"
+  | "deletedOnRight"
+  | "leftChanged"
+  | "rightChanged"
+  | "bothChanged";
 
-export type ConflictAction = Extract<SyncAction, { kind: 'conflict' }>;
+export type ConflictAction = Extract<SyncAction, { kind: "conflict" }>;
 
 export const CONFLICT_POLICY_OPTIONS: {
   value: ConflictPolicy;
@@ -24,29 +24,29 @@ export const CONFLICT_POLICY_OPTIONS: {
   hint: string;
 }[] = [
   {
-    value: 'newerWins',
-    label: 'Newer wins',
-    hint: 'Copy the file with the latest modification time.',
+    value: "newerWins",
+    label: "Newer wins",
+    hint: "Copy the file with the latest modification time.",
   },
   {
-    value: 'left',
-    label: 'Prefer left',
-    hint: 'Always copy from the left folder.',
+    value: "left",
+    label: "Prefer left",
+    hint: "Always copy from the left folder.",
   },
   {
-    value: 'right',
-    label: 'Prefer right',
-    hint: 'Always copy from the right folder.',
+    value: "right",
+    label: "Prefer right",
+    hint: "Always copy from the right folder.",
   },
   {
-    value: 'keepBoth',
-    label: 'Keep both',
-    hint: 'Skip conflicting paths and leave both copies in place.',
+    value: "keepBoth",
+    label: "Keep both",
+    hint: "Skip conflicting paths and leave both copies in place.",
   },
   {
-    value: 'ask',
-    label: 'Ask me',
-    hint: 'Prompt before each conflict when you run a sync.',
+    value: "ask",
+    label: "Ask me",
+    hint: "Prompt before each conflict when you run a sync.",
   },
 ];
 
@@ -70,66 +70,66 @@ export function classifyPathChange(
 ): PathChangeKind {
   if (left && right) {
     if (entriesEqual(left, right)) {
-      return 'inSync';
+      return "inSync";
     }
     if (!snapshot) {
-      return 'bothChanged';
+      return "bothChanged";
     }
     const leftChanged = !entriesEqual(left, snapshot);
     const rightChanged = !entriesEqual(right, snapshot);
     if (leftChanged && rightChanged) {
-      return 'bothChanged';
+      return "bothChanged";
     }
     if (leftChanged) {
-      return 'leftChanged';
+      return "leftChanged";
     }
     if (rightChanged) {
-      return 'rightChanged';
+      return "rightChanged";
     }
-    return 'inSync';
+    return "inSync";
   }
 
   if (left && !right) {
     if (!snapshot) {
-      return 'newOnLeft';
+      return "newOnLeft";
     }
     if (entriesEqual(left, snapshot)) {
-      return 'deletedOnRight';
+      return "deletedOnRight";
     }
-    return 'bothChanged';
+    return "bothChanged";
   }
 
   if (!left && right) {
     if (!snapshot) {
-      return 'newOnRight';
+      return "newOnRight";
     }
     if (entriesEqual(right, snapshot)) {
-      return 'deletedOnLeft';
+      return "deletedOnLeft";
     }
-    return 'bothChanged';
+    return "bothChanged";
   }
 
-  return 'inSync';
+  return "inSync";
 }
 
 export function pathChangeKindLabel(kind: PathChangeKind): string {
   switch (kind) {
-    case 'newOnLeft':
-      return 'New on left';
-    case 'newOnRight':
-      return 'New on right';
-    case 'deletedOnLeft':
-      return 'Deleted on left';
-    case 'deletedOnRight':
-      return 'Deleted on right';
-    case 'leftChanged':
-      return 'Updated on left';
-    case 'rightChanged':
-      return 'Updated on right';
-    case 'bothChanged':
-      return 'Conflict';
+    case "newOnLeft":
+      return "New on left";
+    case "newOnRight":
+      return "New on right";
+    case "deletedOnLeft":
+      return "Deleted on left";
+    case "deletedOnRight":
+      return "Deleted on right";
+    case "leftChanged":
+      return "Updated on left";
+    case "rightChanged":
+      return "Updated on right";
+    case "bothChanged":
+      return "Conflict";
     default:
-      return 'In sync';
+      return "In sync";
   }
 }
 
@@ -140,39 +140,38 @@ export function resolveConflictAction(
   right: FileEntry,
 ): SyncAction {
   switch (policy) {
-    case 'ask':
-      return { kind: 'conflict', path, left, right };
-    case 'left':
-      return { kind: 'copyLeftToRight', path };
-    case 'right':
-      return { kind: 'copyRightToLeft', path };
-    case 'keepBoth':
+    case "ask":
+      return { kind: "conflict", path, left, right };
+    case "left":
+      return { kind: "copyLeftToRight", path };
+    case "right":
+      return { kind: "copyRightToLeft", path };
+    case "keepBoth":
       return {
-        kind: 'skip',
+        kind: "skip",
         path,
-        reason: 'keep both (conflict policy)',
+        reason: "keep both (conflict policy)",
       };
-    case 'newerWins':
+    case "newerWins":
     default: {
       const leftNanos = left.modifiedNanos ?? 0;
       const rightNanos = right.modifiedNanos ?? 0;
       if (
         left.modifiedSecs > right.modifiedSecs ||
-        (left.modifiedSecs === right.modifiedSecs &&
-          leftNanos > rightNanos) ||
+        (left.modifiedSecs === right.modifiedSecs && leftNanos > rightNanos) ||
         (left.modifiedSecs === right.modifiedSecs &&
           leftNanos === rightNanos &&
           left.size !== right.size)
       ) {
-        return { kind: 'copyLeftToRight', path };
+        return { kind: "copyLeftToRight", path };
       }
       if (
         right.modifiedSecs > left.modifiedSecs ||
         (right.modifiedSecs === left.modifiedSecs && rightNanos > leftNanos)
       ) {
-        return { kind: 'copyRightToLeft', path };
+        return { kind: "copyRightToLeft", path };
       }
-      return { kind: 'copyLeftToRight', path };
+      return { kind: "copyLeftToRight", path };
     }
   }
 }
@@ -183,22 +182,22 @@ export function applyConflictChoice(
 ): SyncAction {
   const { path, left, right } = action;
   switch (choice) {
-    case 'left':
-      return { kind: 'copyLeftToRight', path };
-    case 'right':
-      return { kind: 'copyRightToLeft', path };
-    case 'keepBoth':
-      return { kind: 'skip', path, reason: 'keep both (user choice)' };
-    case 'skip':
-      return { kind: 'skip', path, reason: 'skipped by user' };
+    case "left":
+      return { kind: "copyLeftToRight", path };
+    case "right":
+      return { kind: "copyRightToLeft", path };
+    case "keepBoth":
+      return { kind: "skip", path, reason: "keep both (user choice)" };
+    case "skip":
+      return { kind: "skip", path, reason: "skipped by user" };
     default:
-      return resolveConflictAction('newerWins', path, left, right);
+      return resolveConflictAction("newerWins", path, left, right);
   }
 }
 
 export function listConflictActions(plan: SyncPlan): ConflictAction[] {
   return plan.actions.filter(
-    (action): action is ConflictAction => action.kind === 'conflict',
+    (action): action is ConflictAction => action.kind === "conflict",
   );
 }
 
@@ -209,7 +208,7 @@ export function applyResolutionsToPlan(
   return {
     ...plan,
     actions: plan.actions.map((action) => {
-      if (action.kind !== 'conflict') {
+      if (action.kind !== "conflict") {
         return action;
       }
       const choice = resolutions[action.path];

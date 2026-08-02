@@ -1,5 +1,5 @@
-import * as historyApi from '../api/history';
-import type { RunDetail, RunReport } from '../types';
+import * as historyApi from "../api/history";
+import type { RunDetail, RunReport } from "../types";
 
 export interface HistoryStoreState {
   runs: RunReport[];
@@ -100,7 +100,7 @@ export async function selectRun(runId: string): Promise<void> {
       ...state,
       detail,
       detailLoading: false,
-      error: detail ? null : 'Run not found',
+      error: detail ? null : "Run not found",
     };
   } catch (e) {
     if (requestId !== historyDetailRequestId) {

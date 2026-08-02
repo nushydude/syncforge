@@ -243,7 +243,7 @@ impl Database {
                 created_at,
                 updated_at,
             ) = row?;
-            Ok(row_to_pair(
+            row_to_pair(
                 id,
                 name,
                 left_path,
@@ -257,7 +257,7 @@ impl Database {
                 schedule_cron,
                 created_at,
                 updated_at,
-            )?)
+            )
         })
         .collect()
     }
@@ -617,6 +617,7 @@ pub fn new_pair_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn row_to_pair(
     id: String,
     name: String,

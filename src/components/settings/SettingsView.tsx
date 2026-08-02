@@ -26,7 +26,10 @@ export function SettingsView() {
       <header className="workspace-header">
         <div>
           <h2 id="settings-title">Settings</h2>
-          <p>Choose the defaults SyncForge uses for new pairs and manual sync runs.</p>
+          <p>
+            Choose the defaults SyncForge uses for new pairs and manual sync
+            runs.
+          </p>
         </div>
       </header>
 
@@ -103,7 +106,8 @@ export function SettingsView() {
       </div>
 
       <p className="settings-saved" role="status">
-        Settings are saved automatically on this computer when local storage is available.
+        Settings are saved automatically on this computer when local storage is
+        available.
       </p>
     </section>
   );
