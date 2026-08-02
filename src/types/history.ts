@@ -1,4 +1,9 @@
-export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
 
 export interface RunReport {
   runId: string;
@@ -31,5 +36,5 @@ export interface Snapshot {
   id: string;
   pairId: string;
   capturedAt: number;
-  entries: import('./plan').FileEntry[];
+  entries: import("./plan").FileEntry[];
 }

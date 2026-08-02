@@ -88,7 +88,9 @@ function parseFieldToken(
   return null;
 }
 
-export function validateCronExpression(expression: string): CronValidationResult {
+export function validateCronExpression(
+  expression: string,
+): CronValidationResult {
   const trimmed = expression.trim();
   if (!trimmed) {
     return { valid: false, error: "Cron expression is required" };
@@ -98,13 +100,19 @@ export function validateCronExpression(expression: string): CronValidationResult
   if (fields.length !== 5) {
     return {
       valid: false,
-      error: "Cron expression must have exactly 5 fields (minute hour day month weekday)",
+      error:
+        "Cron expression must have exactly 5 fields (minute hour day month weekday)",
     };
   }
 
   for (let index = 0; index < fields.length; index += 1) {
     const field = FIELD_RANGES[index];
-    const error = parseFieldToken(fields[index], field.min, field.max, field.name);
+    const error = parseFieldToken(
+      fields[index],
+      field.min,
+      field.max,
+      field.name,
+    );
     if (error) {
       return { valid: false, error };
     }
@@ -147,7 +155,13 @@ export function describeCronExpression(expression: string): string {
 
   const [minute, hour, day, month, weekday] = expression.trim().split(/\s+/);
 
-  if (minute.startsWith("*/") && hour === "*" && day === "*" && month === "*" && weekday === "*") {
+  if (
+    minute.startsWith("*/") &&
+    hour === "*" &&
+    day === "*" &&
+    month === "*" &&
+    weekday === "*"
+  ) {
     return `Every ${minute.slice(2)} minutes`;
   }
 

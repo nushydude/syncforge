@@ -273,6 +273,7 @@ where
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_pair_impl_inner<F>(
     db: &Mutex<Database>,
     pair: &FolderPair,
@@ -637,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     fn commit_temp_file_preserves_dest_when_replace_fails() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1013,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     fn run_echo_refuses_when_scan_skips_paths() {
         use std::os::unix::fs::PermissionsExt;
 

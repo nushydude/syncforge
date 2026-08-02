@@ -1,13 +1,21 @@
 import { useState } from "react";
 import "./App.css";
-import { HistoryView } from "./components/history/HistoryView";
 import { DuplicatesView } from "./components/duplicates/DuplicatesView";
 import { PairsPanel } from "./components/pairs/PairsPanel";
 import { SettingsView } from "./components/settings/SettingsView";
 import { useRunStore } from "./hooks/useRunStore";
 import type { RunStoreState } from "./store/runStore";
+import { FolderSnifferView } from "./components/sniffer/FolderSnifferView";
 
-type AppView = "pairs" | "duplicates" | "history" | "settings";
+type AppView = "pairs" | "sniffer" | "duplicates" | "settings";
+
+function NavIcon({ children }: { children: string }) {
+  return (
+    <span className="nav-icon" aria-hidden="true">
+      {children}
+    </span>
+  );
+}
 
 function App() {
   const [view, setView] = useState<AppView>("pairs");
@@ -18,7 +26,12 @@ function App() {
       <header className="app-header">
         <div className="app-header-row">
           <div>
-            <h1>SyncForge</h1>
+            <div className="app-brand-line">
+              <h1>SyncForge</h1>
+              {import.meta.env.DEV && (
+                <span className="dev-build-badge">DEV BUILD</span>
+              )}
+            </div>
             <p className="tagline">Modern folder sync for your desktop</p>
           </div>
           <nav className="app-nav" aria-label="Main">
@@ -30,17 +43,17 @@ function App() {
               onClick={() => setView("pairs")}
               disabled={running}
             >
-              Pairs
+              <NavIcon>⇄</NavIcon>Sync folder pairs
             </button>
             <button
               type="button"
               className={
-                view === "history" ? "app-nav-btn active" : "app-nav-btn"
+                view === "sniffer" ? "app-nav-btn active" : "app-nav-btn"
               }
-              onClick={() => setView("history")}
+              onClick={() => setView("sniffer")}
               disabled={running}
             >
-              History
+              <NavIcon>◈</NavIcon>Folder sniffer
             </button>
             <button
               type="button"
@@ -50,17 +63,20 @@ function App() {
               onClick={() => setView("duplicates")}
               disabled={running}
             >
-              Duplicates
+              <NavIcon>⊞</NavIcon>Duplicates
             </button>
+            <span className="app-nav-divider" aria-hidden="true" />
             <button
               type="button"
               className={
-                view === "settings" ? "app-nav-btn active" : "app-nav-btn"
+                view === "settings"
+                  ? "app-nav-btn app-nav-settings active"
+                  : "app-nav-btn app-nav-settings"
               }
               onClick={() => setView("settings")}
               disabled={running}
             >
-              Settings
+              <NavIcon>⚙</NavIcon>Settings
             </button>
           </nav>
         </div>
@@ -68,8 +84,8 @@ function App() {
       <div className="app-view" hidden={view !== "pairs"}>
         <PairsPanel />
       </div>
-      <div className="app-view" hidden={view !== "history"}>
-        <HistoryView active={view === "history"} />
+      <div className="app-view" hidden={view !== "sniffer"}>
+        <FolderSnifferView />
       </div>
       <div className="app-view" hidden={view !== "duplicates"}>
         <DuplicatesView />

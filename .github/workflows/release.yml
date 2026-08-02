@@ -2,10 +2,10 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   publish-tauri:
@@ -23,7 +23,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: '24'
+          node-version: "24"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
@@ -44,7 +44,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: app-v__VERSION__
-          releaseName: 'SyncForge v__VERSION__'
-          releaseBody: 'See the assets to download the installer.'
+          releaseName: "SyncForge v__VERSION__"
+          releaseBody: "See the assets to download the installer."
           releaseDraft: true
           prerelease: false

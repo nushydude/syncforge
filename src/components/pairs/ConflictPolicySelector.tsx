@@ -1,5 +1,5 @@
-import { CONFLICT_POLICY_OPTIONS } from '../../lib/conflictPolicy';
-import type { ConflictPolicy } from '../../types';
+import { CONFLICT_POLICY_OPTIONS } from "../../lib/conflictPolicy";
+import type { ConflictPolicy } from "../../types";
 
 interface ConflictPolicySelectorProps {
   value: ConflictPolicy;

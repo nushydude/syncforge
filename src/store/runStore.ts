@@ -1,16 +1,19 @@
-import { listen } from '@tauri-apps/api/event';
-import * as previewApi from '../api/preview';
-import * as runApi from '../api/run';
-import { listConflictActions, type ConflictAction } from '../lib/conflictPolicy';
-import { isPreviewLoading } from './pairsStore';
+import { listen } from "@tauri-apps/api/event";
+import * as previewApi from "../api/preview";
+import * as runApi from "../api/run";
+import {
+  listConflictActions,
+  type ConflictAction,
+} from "../lib/conflictPolicy";
+import { isPreviewLoading } from "./pairsStore";
 import type {
   ConflictChoice,
   FolderPair,
   RunReport,
   SyncProgress,
   WatchSkippedNotice,
-} from '../types';
-import { getAppSettings } from './settingsStore';
+} from "../types";
+import { getAppSettings } from "./settingsStore";
 
 export interface PendingConflicts {
   pair: FolderPair;
@@ -67,7 +70,7 @@ async function ensureProgressListener(): Promise<void> {
   if (unlistenProgress) {
     return;
   }
-  unlistenProgress = await listen<SyncProgress>('sync://progress', (event) => {
+  unlistenProgress = await listen<SyncProgress>("sync://progress", (event) => {
     const progress = event.payload;
     if (!state.running || !activePairId) {
       return;
@@ -95,7 +98,7 @@ export async function ensureWatchSkippedListener(): Promise<void> {
     return;
   }
   unlistenWatchSkipped = await listen<WatchSkippedNotice>(
-    'sync://watch-skipped',
+    "sync://watch-skipped",
     (event) => {
       state = { ...state, watchSkipped: event.payload };
       emit();
@@ -171,14 +174,16 @@ async function executeRun(
   }
 }
 
-export async function runSelectedPair(pair: FolderPair): Promise<RunReport | null> {
+export async function runSelectedPair(
+  pair: FolderPair,
+): Promise<RunReport | null> {
   if (!pair.id || state.running || runInFlight || isPreviewLoading()) {
     return null;
   }
 
   runInFlight = true;
   try {
-    if (pair.conflictPolicy === 'ask') {
+    if (pair.conflictPolicy === "ask") {
       try {
         const plan = await previewApi.previewPair(pair);
         const conflicts = listConflictActions(plan);

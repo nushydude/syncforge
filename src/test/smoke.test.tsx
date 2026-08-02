@@ -9,7 +9,9 @@ vi.mock("@tauri-apps/api/core", () => ({
 describe("App", () => {
   it("renders SyncForge with folder pairs UI", async () => {
     render(<App />);
-    expect(screen.getByRole("heading", { name: /syncforge/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: /syncforge/i }),
+    ).toBeInTheDocument();
     await waitFor(() => {
       expect(
         screen.getByRole("heading", { name: /folder pairs/i }),

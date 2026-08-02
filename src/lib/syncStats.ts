@@ -1,4 +1,4 @@
-import type { RunItem, RunReport } from '../types';
+import type { RunItem, RunReport } from "../types";
 
 export interface SyncStats {
   filesCopied: number;
@@ -26,19 +26,16 @@ export function statsFromReport(report: RunReport): SyncStats {
 }
 
 /** Sum bytes from per-item records (falls back to report totals when no items). */
-export function statsFromItems(
-  report: RunReport,
-  items: RunItem[],
-): SyncStats {
+export function statsFromItems(report: RunReport, items: RunItem[]): SyncStats {
   const base = statsFromReport(report);
   if (items.length === 0) {
     return base;
   }
 
   const bytesFromItems = items
-    .filter((item) => item.status === 'completed')
+    .filter((item) => item.status === "completed")
     .reduce((sum, item) => sum + (item.bytes ?? 0), 0);
-  const completedItems = items.filter((item) => item.status === 'completed');
+  const completedItems = items.filter((item) => item.status === "completed");
 
   return {
     ...base,
@@ -50,7 +47,7 @@ export function statsFromItems(
 
 export function formatDuration(durationMs: number | null): string {
   if (durationMs == null || durationMs < 0) {
-    return '—';
+    return "—";
   }
   if (durationMs < 1000) {
     return `${durationMs} ms`;

@@ -22,6 +22,8 @@ function statusLabel(status: string): string {
       return "Failed";
     case "cancelled":
       return "Cancelled";
+    case "interrupted":
+      return "Interrupted";
     case "running":
       return "Running";
     default:

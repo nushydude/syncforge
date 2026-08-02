@@ -43,12 +43,12 @@ Create `orchestrator/STOP` — the current story exits cleanly; remove the file 
 
 ## State and logs
 
-| Path | Purpose |
-|------|---------|
-| `orchestrator/state.json` | Per-story status, iteration count |
-| `orchestrator/logs/<story>/` | Prompts + agent output per role |
-| `docs/stories/` | Story specs and acceptance criteria |
-| `orchestrator/stories.json` | Machine-readable story order |
+| Path                         | Purpose                             |
+| ---------------------------- | ----------------------------------- |
+| `orchestrator/state.json`    | Per-story status, iteration count   |
+| `orchestrator/logs/<story>/` | Prompts + agent output per role     |
+| `docs/stories/`              | Story specs and acceptance criteria |
+| `orchestrator/stories.json`  | Machine-readable story order        |
 
 ## Git workflow
 

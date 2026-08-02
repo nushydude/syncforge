@@ -131,6 +131,10 @@ pub fn run() {
             commands::history::get_history,
             commands::history::get_run_detail,
             commands::schedule::set_schedule,
+            commands::sniffer::scan_folder_sizes,
+            commands::sniffer::rename_sniffer_item,
+            commands::sniffer::delete_sniffer_item,
+            commands::sniffer::show_sniffer_item_properties,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

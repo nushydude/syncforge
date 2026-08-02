@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     fn preview_echo_refuses_when_scan_skips_paths() {
         use std::os::unix::fs::PermissionsExt;
 

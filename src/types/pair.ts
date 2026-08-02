@@ -1,13 +1,13 @@
-export type SyncMode = 'synchronize' | 'echo' | 'contribute';
+export type SyncMode = "synchronize" | "echo" | "contribute";
 
 export type ConflictPolicy =
-  | 'newerWins'
-  | 'left'
-  | 'right'
-  | 'keepBoth'
-  | 'ask';
+  | "newerWins"
+  | "left"
+  | "right"
+  | "keepBoth"
+  | "ask";
 
-export type ConflictChoice = 'left' | 'right' | 'keepBoth' | 'skip';
+export type ConflictChoice = "left" | "right" | "keepBoth" | "skip";
 
 export interface Filters {
   include: string[];

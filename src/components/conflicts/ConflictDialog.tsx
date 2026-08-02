@@ -3,12 +3,12 @@ import {
   classifyPathChange,
   pathChangeKindLabel,
   type ConflictAction,
-} from '../../lib/conflictPolicy';
-import type { ConflictChoice, FileEntry } from '../../types';
+} from "../../lib/conflictPolicy";
+import type { ConflictChoice, FileEntry } from "../../types";
 
 function formatEntry(entry: FileEntry): string {
   if (entry.isDir) {
-    return 'folder';
+    return "folder";
   }
   return `${entry.size} B · mtime ${entry.modifiedSecs}`;
 }
@@ -80,10 +80,10 @@ export function ConflictDialog({
                 >
                   {(
                     [
-                      ['left', 'Use left'],
-                      ['right', 'Use right'],
-                      ['keepBoth', 'Keep both'],
-                      ['skip', 'Skip'],
+                      ["left", "Use left"],
+                      ["right", "Use right"],
+                      ["keepBoth", "Keep both"],
+                      ["skip", "Skip"],
                     ] as const
                   ).map(([value, label]) => (
                     <label key={value} className="conflict-choice">

@@ -23,7 +23,7 @@ pub fn notify_sync_report(app: &AppHandle, pair_name: &str, report: &RunReport) 
         RunStatus::Cancelled => {
             (format!("Sync cancelled: {pair_name}"), "The sync run was cancelled.".into())
         }
-        RunStatus::Running => return,
+        RunStatus::Running | RunStatus::Interrupted => return,
     };
 
     let _ = app.notification().builder().title(title).body(body).show();

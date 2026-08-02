@@ -9,7 +9,8 @@ vi.mock("../store/historyStore", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../store/historyStore")>();
   return {
     ...actual,
-    loadHistory: (...args: Parameters<typeof loadHistory>) => loadHistory(...args),
+    loadHistory: (...args: Parameters<typeof loadHistory>) =>
+      loadHistory(...args),
   };
 });
 

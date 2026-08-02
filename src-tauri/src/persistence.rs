@@ -243,7 +243,7 @@ impl Database {
                 created_at,
                 updated_at,
             ) = row?;
-            Ok(row_to_pair(
+            row_to_pair(
                 id,
                 name,
                 left_path,
@@ -257,7 +257,7 @@ impl Database {
                 schedule_cron,
                 created_at,
                 updated_at,
-            )?)
+            )
         })
         .collect()
     }
@@ -498,6 +498,19 @@ impl Database {
         Ok(())
     }
 
+    /// Runs left as `running` after an app/process interruption are not active anymore.
+    pub fn mark_sync_runs_interrupted(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs
+             SET status = 'interrupted',
+                 finished_at = COALESCE(finished_at, CAST(strftime('%s','now') AS INTEGER) * 1000),
+                 summary_json = json_set(summary_json, '$.status', 'interrupted')
+             WHERE status = 'running'",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Convenience wrapper around [`Self::insert_run_items`].
     #[allow(dead_code)]
     pub fn insert_run_item(&self, item: &RunItem) -> Result<()> {
@@ -604,6 +617,7 @@ pub fn new_pair_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn row_to_pair(
     id: String,
     name: String,
@@ -716,6 +730,7 @@ fn run_status_to_str(status: RunStatus) -> &'static str {
         RunStatus::Completed => "completed",
         RunStatus::Failed => "failed",
         RunStatus::Cancelled => "cancelled",
+        RunStatus::Interrupted => "interrupted",
     }
 }
 
