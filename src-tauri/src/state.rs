@@ -34,6 +34,7 @@ impl AppState {
         let db_path = data_dir.join("syncforge.db");
         let db = Database::open(&db_path)?;
         db.mark_duplicate_scans_interrupted()?;
+        db.mark_sync_runs_interrupted()?;
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             duplicate_scan_cancels: Mutex::new(HashMap::new()),

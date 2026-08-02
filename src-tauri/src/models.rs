@@ -90,6 +90,7 @@ pub enum RunStatus {
     Completed,
     Failed,
     Cancelled,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
