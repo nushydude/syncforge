@@ -2,6 +2,7 @@
 //!
 //! On Windows: long-path (`\\?\`) prefixes, UNC handling, and case-insensitive equality.
 
+#[cfg(windows)]
 const MAX_PATH: usize = 260;
 
 /// Returns true when `path` is a UNC path (`\\server\share\...`).
