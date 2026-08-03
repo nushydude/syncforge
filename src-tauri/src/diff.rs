@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::hashing;
@@ -68,33 +68,26 @@ pub fn build_sync_plan(
         hashes: RefCell::new(HashMap::new()),
         hash_warnings: RefCell::new(Vec::new()),
     };
-    let left_map = entries_map(left);
-    let right_map = entries_map(right);
-    let snapshot_map = snapshot.map(entries_map).unwrap_or_default();
-
-    let paths = collect_paths(&left_map, &right_map, &snapshot_map);
     let mut actions = Vec::new();
+    let empty_snapshot = [];
+    let snapshot = snapshot.unwrap_or(&empty_snapshot);
 
-    for path in paths {
-        let l = left_map.get(&path);
-        let r = right_map.get(&path);
-        let s = snapshot_map.get(&path);
-
+    for (path, l, r, s) in ThreeWayMerge::new(left, right, snapshot) {
         match mode {
             SyncMode::Echo => {
                 // Echo mirrors left → right; snapshot is not used for planning.
-                plan_echo(&mut actions, &path, l, r, &ctx);
+                plan_echo(&mut actions, path, l, r, &ctx);
             }
             SyncMode::Contribute => {
-                plan_contribute(&mut actions, &path, l, r, &ctx);
+                plan_contribute(&mut actions, path, l, r, &ctx);
             }
             SyncMode::Synchronize => {
-                plan_synchronize(&mut actions, &path, l, r, s, conflict_policy, &ctx);
+                plan_synchronize(&mut actions, path, l, r, s, conflict_policy, &ctx);
             }
         }
     }
 
-    ensure_parent_dirs(&mut actions, mode, &left_map, &right_map);
+    ensure_parent_dirs(&mut actions, mode, left, right);
     sort_actions(&mut actions);
 
     let hash_warnings = ctx.hash_warnings.borrow().clone();
@@ -363,25 +356,32 @@ fn compare_newer(left: &FileEntry, right: &FileEntry) -> Option<bool> {
 fn ensure_parent_dirs(
     actions: &mut Vec<SyncAction>,
     mode: SyncMode,
-    left: &HashMap<String, FileEntry>,
-    right: &HashMap<String, FileEntry>,
+    left: &[FileEntry],
+    right: &[FileEntry],
 ) {
-    let mut needed_right: BTreeSet<String> = BTreeSet::new();
-    let mut needed_left: BTreeSet<String> = BTreeSet::new();
+    let mut planned_right = HashSet::new();
+    let mut planned_left = HashSet::new();
+    let mut additions = Vec::new();
 
     for action in actions.iter() {
         match action {
             SyncAction::CopyLeftToRight { path } | SyncAction::CreateDirRight { path } => {
                 for parent in parent_paths(path) {
-                    if !right.contains_key(&parent) && left.get(&parent).is_some_and(|e| e.is_dir) {
-                        needed_right.insert(parent);
+                    if !contains_entry(right, &parent)
+                        && contains_directory(left, &parent)
+                        && planned_right.insert(parent.clone())
+                    {
+                        additions.push(SyncAction::CreateDirRight { path: parent });
                     }
                 }
             }
             SyncAction::CopyRightToLeft { path } | SyncAction::CreateDirLeft { path } => {
                 for parent in parent_paths(path) {
-                    if !left.contains_key(&parent) && right.get(&parent).is_some_and(|e| e.is_dir) {
-                        needed_left.insert(parent);
+                    if !contains_entry(left, &parent)
+                        && contains_directory(right, &parent)
+                        && planned_left.insert(parent.clone())
+                    {
+                        additions.push(SyncAction::CreateDirLeft { path: parent });
                     }
                 }
             }
@@ -389,25 +389,26 @@ fn ensure_parent_dirs(
         }
     }
 
-    for path in needed_right {
-        if !has_action_for_path(actions, &path, true) {
-            actions.push(SyncAction::CreateDirRight { path });
-        }
-    }
-
-    for path in needed_left {
-        if mode == SyncMode::Synchronize && !has_action_for_path(actions, &path, false) {
-            actions.push(SyncAction::CreateDirLeft { path });
-        }
+    if mode == SyncMode::Synchronize {
+        actions.extend(additions);
+    } else {
+        actions.extend(
+            additions
+                .into_iter()
+                .filter(|action| matches!(action, SyncAction::CreateDirRight { .. })),
+        );
     }
 }
 
-fn has_action_for_path(actions: &[SyncAction], path: &str, right: bool) -> bool {
-    actions.iter().any(|a| match a {
-        SyncAction::CreateDirRight { path: p } if right => p == path,
-        SyncAction::CreateDirLeft { path: p } if !right => p == path,
-        _ => false,
-    })
+fn contains_entry(entries: &[FileEntry], path: &str) -> bool {
+    entries.binary_search_by(|entry| entry.relative_path.as_str().cmp(path)).is_ok()
+}
+
+fn contains_directory(entries: &[FileEntry], path: &str) -> bool {
+    entries
+        .binary_search_by(|entry| entry.relative_path.as_str().cmp(path))
+        .ok()
+        .is_some_and(|index| entries[index].is_dir)
 }
 
 fn parent_paths(path: &str) -> Vec<String> {
@@ -440,20 +441,50 @@ fn action_path(action: &SyncAction) -> &str {
     }
 }
 
-fn entries_map(entries: &[FileEntry]) -> HashMap<String, FileEntry> {
-    entries.iter().map(|e| (e.relative_path.clone(), e.clone())).collect()
+struct ThreeWayMerge<'a> {
+    left: &'a [FileEntry],
+    right: &'a [FileEntry],
+    snapshot: &'a [FileEntry],
+    left_index: usize,
+    right_index: usize,
+    snapshot_index: usize,
 }
 
-fn collect_paths(
-    left: &HashMap<String, FileEntry>,
-    right: &HashMap<String, FileEntry>,
-    snapshot: &HashMap<String, FileEntry>,
-) -> Vec<String> {
-    let mut set = BTreeSet::new();
-    for key in left.keys().chain(right.keys()).chain(snapshot.keys()) {
-        set.insert(key.clone());
+impl<'a> ThreeWayMerge<'a> {
+    fn new(left: &'a [FileEntry], right: &'a [FileEntry], snapshot: &'a [FileEntry]) -> Self {
+        Self { left, right, snapshot, left_index: 0, right_index: 0, snapshot_index: 0 }
     }
-    set.into_iter().collect()
+}
+
+impl<'a> Iterator for ThreeWayMerge<'a> {
+    type Item = (&'a str, Option<&'a FileEntry>, Option<&'a FileEntry>, Option<&'a FileEntry>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let path = [
+            self.left.get(self.left_index),
+            self.right.get(self.right_index),
+            self.snapshot.get(self.snapshot_index),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.relative_path.as_str())
+        .min()?;
+
+        let left = self.left.get(self.left_index).filter(|entry| entry.relative_path == path);
+        let right = self.right.get(self.right_index).filter(|entry| entry.relative_path == path);
+        let snapshot =
+            self.snapshot.get(self.snapshot_index).filter(|entry| entry.relative_path == path);
+        if left.is_some() {
+            self.left_index += 1;
+        }
+        if right.is_some() {
+            self.right_index += 1;
+        }
+        if snapshot.is_some() {
+            self.snapshot_index += 1;
+        }
+        Some((path, left, right, snapshot))
+    }
 }
 
 fn entries_differ(
