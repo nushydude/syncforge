@@ -33,3 +33,20 @@ export interface SyncPlan {
   scanWarnings?: string[];
   requiresAttention?: boolean;
 }
+
+export interface PreviewSummary extends SyncPlan {
+  planId?: string;
+  configFingerprint?: string;
+  createdAt?: number;
+  actionCounts?: Record<string, number>;
+  actionCount?: number;
+  conflictCount?: number;
+  nextCursor?: number;
+}
+
+export interface PreviewActionPage {
+  planId: string;
+  cursor: number;
+  nextCursor?: number;
+  actions: SyncAction[];
+}

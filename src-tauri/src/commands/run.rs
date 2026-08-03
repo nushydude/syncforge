@@ -6,7 +6,8 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
-use crate::engine::{run_pair_impl, RunOptions};
+use crate::commands::preview::config_fingerprint;
+use crate::engine::{run_pair_impl, PlanPreconditions, RunOptions};
 use crate::models::{ConflictResolution, FolderPair, RunReport, RunStatus};
 use crate::notifications::notify_sync_report;
 use crate::progress::ProgressCoalescer;
@@ -34,6 +35,8 @@ pub struct RunPairOptions {
     pub conflict_resolutions: HashMap<String, ConflictResolution>,
     #[serde(default = "default_stop_on_error")]
     pub stop_on_error: bool,
+    #[serde(default)]
+    pub plan_id: Option<String>,
 }
 
 fn default_stop_on_error() -> bool {
@@ -42,6 +45,13 @@ fn default_stop_on_error() -> bool {
 
 fn default_recycle_bin() -> bool {
     true
+}
+
+fn current_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[tauri::command]
@@ -56,6 +66,21 @@ pub async fn run_pair(
         return Err("pair id required".into());
     }
 
+    let (plan, plan_preconditions) = if let Some(plan_id) = options.plan_id.as_deref() {
+        let fingerprint = config_fingerprint(&pair);
+        let (plan, left_preconditions, right_preconditions) = state
+            .preview_plans
+            .lock()
+            .map_err(|e| e.to_string())?
+            .take(plan_id, &pair.id, &fingerprint, current_millis())?;
+        (
+            Some(plan),
+            Some(PlanPreconditions { left: left_preconditions, right: right_preconditions }),
+        )
+    } else {
+        (None, None)
+    };
+
     let cancel = try_acquire_pair_run(&state, &pair_id)?;
 
     let run_options = RunOptions {
@@ -63,6 +88,8 @@ pub async fn run_pair(
         use_recycle_bin: options.use_recycle_bin,
         conflict_resolutions: options.conflict_resolutions,
         stop_on_error: options.stop_on_error,
+        plan,
+        plan_preconditions,
         ..Default::default()
     };
 

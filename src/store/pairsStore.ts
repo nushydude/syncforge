@@ -5,7 +5,12 @@ import {
   validateCronExpression,
   describeCronExpression,
 } from "../lib/scheduleParsing";
-import type { ConflictPolicy, FolderPair, SyncMode, SyncPlan } from "../types";
+import type {
+  ConflictPolicy,
+  FolderPair,
+  PreviewSummary,
+  SyncMode,
+} from "../types";
 import { defaultFilters } from "../types";
 import { getAppSettings } from "./settingsStore";
 
@@ -18,7 +23,7 @@ export interface PairsStoreState {
   saving: boolean;
   error: string | null;
   validationErrors: string[];
-  previewPlan: SyncPlan | null;
+  previewPlan: PreviewSummary | null;
   previewLoading: boolean;
   previewError: string | null;
   watchWarning: string | null;

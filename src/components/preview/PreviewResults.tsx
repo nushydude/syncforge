@@ -1,22 +1,58 @@
 import { useEffect, useMemo, useState, type RefObject } from "react";
+import { getPreviewActions } from "../../api/preview";
 import { formatAction, formatPlanSummary } from "../../lib/planFormatting";
-import type { SyncPlan } from "../../types";
+import type { FolderPair, PreviewSummary, SyncAction } from "../../types";
 
 const PAGE_SIZE = 50;
+const BACKEND_PAGE_SIZE = 200;
 
 export function PreviewResults({
   plan,
+  pair,
   resultsTitleRef,
 }: {
-  plan: SyncPlan;
+  plan: PreviewSummary;
+  pair?: FolderPair;
   resultsTitleRef?: RefObject<HTMLHeadingElement | null>;
 }) {
   const [page, setPage] = useState(1);
-  const rows = useMemo(() => plan.actions.map(formatAction), [plan]);
-  const pageCount = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
-  const visibleRows = rows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const [actions, setActions] = useState<SyncAction[]>(plan.actions);
+  const [loading, setLoading] = useState(false);
+  const visibleActions = plan.planId
+    ? actions.slice(0, BACKEND_PAGE_SIZE)
+    : actions.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const rows = useMemo(
+    () => visibleActions.map(formatAction),
+    [visibleActions],
+  );
+  const totalActions = plan.actionCount ?? plan.actions.length;
+  const pageCount = Math.max(
+    1,
+    Math.ceil(totalActions / (plan.planId ? BACKEND_PAGE_SIZE : PAGE_SIZE)),
+  );
 
-  useEffect(() => setPage(1), [plan]);
+  useEffect(() => {
+    setPage(1);
+    setActions(plan.actions);
+  }, [plan]);
+
+  async function changePage(nextPage: number): Promise<void> {
+    if (nextPage < 1 || nextPage > pageCount || nextPage === page) return;
+    setPage(nextPage);
+    if (!plan.planId || !pair) return;
+    setLoading(true);
+    try {
+      const result = await getPreviewActions(
+        pair,
+        plan.planId,
+        (nextPage - 1) * BACKEND_PAGE_SIZE,
+        BACKEND_PAGE_SIZE,
+      );
+      setActions(result.actions);
+    } finally {
+      setLoading(false);
+    }
+  }
 
   return (
     <section
@@ -29,12 +65,16 @@ export function PreviewResults({
           <h3 id="preview-results-title" tabIndex={-1} ref={resultsTitleRef}>
             Review changes
           </h3>
-          <p className="preview-summary">{formatPlanSummary(plan)}</p>
+          <p className="preview-summary">
+            {plan.actionCount !== undefined
+              ? `${plan.actionCount} action${plan.actionCount === 1 ? "" : "s"}`
+              : formatPlanSummary(plan)}
+          </p>
         </div>
         <span className="preview-results-count">
-          {rows.length === 0
+          {totalActions === 0
             ? "No changes"
-            : `${rows.length} change${rows.length === 1 ? "" : "s"}`}
+            : `${totalActions} change${totalActions === 1 ? "" : "s"}`}
         </span>
       </header>
 
@@ -46,9 +86,9 @@ export function PreviewResults({
         </ul>
       )}
 
-      {visibleRows.length === 0 ? (
+      {rows.length === 0 ? (
         <p className="preview-empty">
-          No changes needed — folders are in sync.
+          No changes needed â€” folders are in sync.
         </p>
       ) : (
         <div className="preview-results-table-wrap">
@@ -61,14 +101,14 @@ export function PreviewResults({
               </tr>
             </thead>
             <tbody>
-              {visibleRows.map((row, index) => (
+              {rows.map((row, index) => (
                 <tr
                   key={`${row.label}-${row.path}-${index}`}
                   className={`tone-${row.tone}`}
                 >
                   <td>{row.label}</td>
                   <td className="preview-path">{row.path}</td>
-                  <td className="preview-detail">{row.detail || "—"}</td>
+                  <td className="preview-detail">{row.detail || "â€”"}</td>
                 </tr>
               ))}
             </tbody>
@@ -80,8 +120,8 @@ export function PreviewResults({
         <nav className="preview-pagination" aria-label="Preview results pages">
           <button
             type="button"
-            onClick={() => setPage((current) => Math.max(1, current - 1))}
-            disabled={page === 1}
+            onClick={() => void changePage(page - 1)}
+            disabled={page === 1 || loading}
           >
             Previous
           </button>
@@ -90,12 +130,10 @@ export function PreviewResults({
           </span>
           <button
             type="button"
-            onClick={() =>
-              setPage((current) => Math.min(pageCount, current + 1))
-            }
-            disabled={page === pageCount}
+            onClick={() => void changePage(page + 1)}
+            disabled={page === pageCount || loading}
           >
-            Next
+            {loading ? "Loading..." : "Next"}
           </button>
         </nav>
       )}

@@ -292,6 +292,7 @@ export function PairEditor() {
           </button>
           <PreviewResults
             plan={previewPlan}
+            pair={editing}
             resultsTitleRef={resultsTitleRef}
           />
         </>

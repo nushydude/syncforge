@@ -131,6 +131,7 @@ export function PairDetails({ pair }: PairDetailsProps) {
           </button>
           <PreviewResults
             plan={previewPlan}
+            pair={pair}
             resultsTitleRef={resultsTitleRef}
           />
         </>

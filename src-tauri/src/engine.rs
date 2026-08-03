@@ -47,6 +47,12 @@ const TEMP_SUFFIX: &str = ".syncforge.tmp";
 pub const RUN_ITEM_BATCH_SIZE: usize = 1_000;
 
 #[derive(Debug, Clone)]
+pub struct PlanPreconditions {
+    pub left: Vec<FileEntry>,
+    pub right: Vec<FileEntry>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunOptions {
     pub verify_hashes: bool,
     pub use_recycle_bin: bool,
@@ -59,6 +65,7 @@ pub struct RunOptions {
     pub content_hash_max_bytes: u64,
     /// Precomputed plan from preview; skips the initial left/right directory scan when set.
     pub plan: Option<SyncPlan>,
+    pub plan_preconditions: Option<PlanPreconditions>,
 }
 
 impl Default for RunOptions {
@@ -71,6 +78,7 @@ impl Default for RunOptions {
             content_hash_compare: true,
             content_hash_max_bytes: 50 * 1024 * 1024,
             plan: None,
+            plan_preconditions: None,
         }
     }
 }
@@ -348,6 +356,7 @@ where
         content_hash_compare,
         content_hash_max_bytes,
         plan: provided_plan,
+        plan_preconditions,
     } = options;
 
     let mut progress =
@@ -411,6 +420,10 @@ where
         && matches!(pair.mode, crate::models::SyncMode::Echo | crate::models::SyncMode::Synchronize)
     {
         return Err("Cannot run sync: content verification requires attention. Preview again after fixing file access.".into());
+    }
+
+    if let Some(preconditions) = plan_preconditions {
+        validate_plan_preconditions(&plan, left_root, right_root, &preconditions)?;
     }
 
     if !conflict_resolutions.is_empty() {
@@ -547,6 +560,80 @@ where
     }));
 
     Ok(report.clone())
+}
+
+fn validate_plan_preconditions(
+    plan: &SyncPlan,
+    left_root: &Path,
+    right_root: &Path,
+    preconditions: &PlanPreconditions,
+) -> Result<(), String> {
+    let left: HashMap<&str, &FileEntry> =
+        preconditions.left.iter().map(|entry| (entry.relative_path.as_str(), entry)).collect();
+    let right: HashMap<&str, &FileEntry> =
+        preconditions.right.iter().map(|entry| (entry.relative_path.as_str(), entry)).collect();
+    for action in &plan.actions {
+        let path = action_path(action);
+        match action {
+            SyncAction::CopyLeftToRight { .. } => {
+                validate_precondition(left_root, left.get(path).copied(), path, "source")?;
+                validate_precondition(right_root, right.get(path).copied(), path, "target")?;
+            }
+            SyncAction::CopyRightToLeft { .. } => {
+                validate_precondition(right_root, right.get(path).copied(), path, "source")?;
+                validate_precondition(left_root, left.get(path).copied(), path, "target")?;
+            }
+            SyncAction::DeleteLeft { .. } => {
+                validate_precondition(left_root, left.get(path).copied(), path, "delete target")?;
+            }
+            SyncAction::DeleteRight { .. } => {
+                validate_precondition(right_root, right.get(path).copied(), path, "delete target")?;
+            }
+            SyncAction::CreateDirLeft { .. } => {
+                validate_precondition(left_root, None, path, "directory target")?;
+            }
+            SyncAction::CreateDirRight { .. } => {
+                validate_precondition(right_root, None, path, "directory target")?;
+            }
+            SyncAction::Conflict { .. } => {
+                validate_precondition(left_root, left.get(path).copied(), path, "conflict source")?;
+                validate_precondition(
+                    right_root,
+                    right.get(path).copied(),
+                    path,
+                    "conflict source",
+                )?;
+            }
+            SyncAction::Skip { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_precondition(
+    root: &Path,
+    expected: Option<&FileEntry>,
+    relative_path: &str,
+    label: &str,
+) -> Result<(), String> {
+    let path = join_relative(root, relative_path);
+    let actual = fs::metadata(&path).ok();
+    match (expected, actual) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(format!("Preview is stale: {label} changed at {relative_path}")),
+        (Some(_), None) => Err(format!("Preview is stale: {label} disappeared at {relative_path}")),
+        (Some(expected), Some(actual)) => {
+            let (modified_secs, modified_nanos) = crate::scanner::metadata_modified(&actual);
+            if expected.is_dir != actual.is_dir()
+                || expected.size != if actual.is_file() { actual.len() } else { 0 }
+                || expected.modified_secs != modified_secs
+                || expected.modified_nanos != modified_nanos
+            {
+                return Err(format!("Preview is stale: {label} changed at {relative_path}"));
+            }
+            Ok(())
+        }
+    }
 }
 
 struct ActionStats {
@@ -716,6 +803,42 @@ mod tests {
         fs::write(&dest, "old").expect("write dest");
         safe_copy_file(&src, &dest, false).expect("copy");
         assert_eq!(fs::read_to_string(&dest).expect("read"), "new");
+    }
+
+    #[test]
+    fn stale_preview_precondition_rejects_changed_source_before_apply() {
+        let dir = TempDir::new().expect("tempdir");
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        fs::create_dir_all(&left).expect("left");
+        fs::create_dir_all(&right).expect("right");
+        fs::write(left.join("file.txt"), "new content").expect("write");
+        let plan = SyncPlan {
+            pair_id: "pair-a".into(),
+            actions: vec![SyncAction::CopyLeftToRight { path: "file.txt".into() }],
+            scanned_left: 1,
+            scanned_right: 0,
+            scan_skipped_left: 0,
+            scan_skipped_right: 0,
+            scan_warnings: vec![],
+            requires_attention: false,
+        };
+        let expected = FileEntry {
+            relative_path: "file.txt".into(),
+            size: 3,
+            modified_secs: 1,
+            modified_nanos: 0,
+            is_dir: false,
+            hash: None,
+        };
+        let result = validate_plan_preconditions(
+            &plan,
+            &left,
+            &right,
+            &PlanPreconditions { left: vec![expected], right: vec![] },
+        );
+        assert!(result.expect_err("changed source must reject").contains("Preview is stale"));
+        assert!(!right.join("file.txt").exists());
     }
 
     /// On Windows, `rename(temp, dest)` fails when `dest` exists or paths are on

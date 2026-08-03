@@ -5,7 +5,7 @@ import {
   listConflictActions,
   type ConflictAction,
 } from "../lib/conflictPolicy";
-import { isPreviewLoading } from "./pairsStore";
+import { getPairsState, isPreviewLoading } from "./pairsStore";
 import type {
   ConflictChoice,
   FolderPair,
@@ -18,6 +18,7 @@ import { getAppSettings } from "./settingsStore";
 export interface PendingConflicts {
   pair: FolderPair;
   conflicts: ConflictAction[];
+  planId?: string;
 }
 
 export interface RunStoreState {
@@ -119,6 +120,7 @@ function clearActiveRunOwnership(): void {
 async function executeRun(
   pair: FolderPair,
   conflictResolutions: Record<string, ConflictChoice>,
+  planId?: string,
 ): Promise<RunReport | null> {
   const settings = getAppSettings();
   if (
@@ -148,6 +150,7 @@ async function executeRun(
       verifyHashes: settings.verifyHashesAfterCopy,
       useRecycleBin: settings.moveDeletesToRecycleBin,
       conflictResolutions,
+      planId,
     });
     clearActiveRunOwnership();
     state = {
@@ -190,7 +193,7 @@ export async function runSelectedPair(
         if (conflicts.length > 0) {
           state = {
             ...state,
-            pendingConflicts: { pair, conflicts },
+            pendingConflicts: { pair, conflicts, planId: plan.planId },
             conflictResolutions: {},
             error: null,
           };
@@ -207,7 +210,12 @@ export async function runSelectedPair(
       }
     }
 
-    return await executeRun(pair, {});
+    const reusablePlan = getPairsState().previewPlan;
+    return await executeRun(
+      pair,
+      {},
+      reusablePlan?.pairId === pair.id ? reusablePlan.planId : undefined,
+    );
   } finally {
     if (!state.pendingConflicts) {
       runInFlight = false;
@@ -242,7 +250,11 @@ export async function confirmConflictResolutionAndRun(): Promise<RunReport | nul
     return null;
   }
   try {
-    return await executeRun(pending.pair, state.conflictResolutions);
+    return await executeRun(
+      pending.pair,
+      state.conflictResolutions,
+      pending.planId,
+    );
   } finally {
     runInFlight = false;
   }
