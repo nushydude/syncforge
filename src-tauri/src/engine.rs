@@ -407,6 +407,12 @@ where
         )
     };
 
+    if plan.requires_attention
+        && matches!(pair.mode, crate::models::SyncMode::Echo | crate::models::SyncMode::Synchronize)
+    {
+        return Err("Cannot run sync: content verification requires attention. Preview again after fixing file access.".into());
+    }
+
     if !conflict_resolutions.is_empty() {
         apply_conflict_resolutions(&mut plan.actions, &conflict_resolutions);
     }

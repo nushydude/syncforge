@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
@@ -29,8 +30,26 @@ impl Default for DiffOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum EntrySide {
+    Left,
+    Right,
+    Snapshot,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct HashKey {
+    side: EntrySide,
+    relative_path: String,
+    size: u64,
+    modified_secs: i64,
+    modified_nanos: u32,
+}
+
 struct DiffContext<'a> {
     options: &'a DiffOptions,
+    hashes: RefCell<HashMap<HashKey, Result<String, String>>>,
+    hash_warnings: RefCell<Vec<String>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -44,7 +63,11 @@ pub fn build_sync_plan(
     scan: ScanIntegrity,
     diff_options: DiffOptions,
 ) -> SyncPlan {
-    let ctx = DiffContext { options: &diff_options };
+    let ctx = DiffContext {
+        options: &diff_options,
+        hashes: RefCell::new(HashMap::new()),
+        hash_warnings: RefCell::new(Vec::new()),
+    };
     let left_map = entries_map(left);
     let right_map = entries_map(right);
     let snapshot_map = snapshot.map(entries_map).unwrap_or_default();
@@ -74,6 +97,7 @@ pub fn build_sync_plan(
     ensure_parent_dirs(&mut actions, mode, &left_map, &right_map);
     sort_actions(&mut actions);
 
+    let hash_warnings = ctx.hash_warnings.borrow().clone();
     SyncPlan {
         pair_id: pair_id.to_string(),
         actions,
@@ -81,8 +105,8 @@ pub fn build_sync_plan(
         scanned_right: right.len() as u32,
         scan_skipped_left: scan.skipped_left,
         scan_skipped_right: scan.skipped_right,
-        scan_warnings: scan.warnings,
-        requires_attention: scan.requires_attention,
+        scan_warnings: scan.warnings.into_iter().chain(hash_warnings.iter().cloned()).collect(),
+        requires_attention: scan.requires_attention || !hash_warnings.is_empty(),
     }
 }
 
@@ -100,7 +124,9 @@ fn plan_echo(
         (Some(l), None) if !l.is_dir => {
             actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
-        (Some(l), Some(r)) if entries_differ(l, r, ctx) && !l.is_dir => {
+        (Some(l), Some(r))
+            if entries_differ(l, EntrySide::Left, r, EntrySide::Right, ctx) && !l.is_dir =>
+        {
             actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
         (Some(l), Some(r)) if l.is_dir && !r.is_dir => {
@@ -127,7 +153,9 @@ fn plan_contribute(
         (Some(l), None) if !l.is_dir => {
             actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
-        (Some(l), Some(r)) if entries_differ(l, r, ctx) && !l.is_dir => {
+        (Some(l), Some(r))
+            if entries_differ(l, EntrySide::Left, r, EntrySide::Right, ctx) && !l.is_dir =>
+        {
             actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
         (Some(l), Some(r)) if l.is_dir && !r.is_dir => {
@@ -167,7 +195,7 @@ fn plan_synchronize(
         }
         (Some(l), Some(r)) if l.is_dir && r.is_dir => {}
         (Some(l), Some(r)) if !l.is_dir && !r.is_dir => {
-            if !entries_differ(l, r, ctx) {
+            if !entries_differ(l, EntrySide::Left, r, EntrySide::Right, ctx) {
                 return;
             }
             if snapshot_changed_both(l, r, snapshot, ctx) || snapshot.is_none() {
@@ -204,7 +232,15 @@ fn plan_one_sided_file(
                 actions.push(SyncAction::CopyRightToLeft { path: path.to_string() });
             }
         }
-        Some(snap) if entries_match(snap, present, ctx) => {
+        Some(snap)
+            if entries_match(
+                present,
+                if present_is_left { EntrySide::Left } else { EntrySide::Right },
+                snap,
+                EntrySide::Snapshot,
+                ctx,
+            ) =>
+        {
             if present_is_left {
                 actions.push(SyncAction::DeleteRight { path: path.to_string() });
             } else {
@@ -222,8 +258,14 @@ fn plan_one_sided_file(
     }
 }
 
-fn entries_match(a: &FileEntry, b: &FileEntry, ctx: &DiffContext<'_>) -> bool {
-    !entries_differ(a, b, ctx)
+fn entries_match(
+    a: &FileEntry,
+    a_side: EntrySide,
+    b: &FileEntry,
+    b_side: EntrySide,
+    ctx: &DiffContext<'_>,
+) -> bool {
+    !entries_differ(a, a_side, b, b_side, ctx)
 }
 
 fn snapshot_changed_both(
@@ -235,7 +277,8 @@ fn snapshot_changed_both(
     let Some(snap) = snapshot else {
         return false;
     };
-    entries_differ(left, snap, ctx) && entries_differ(right, snap, ctx)
+    entries_differ(left, EntrySide::Left, snap, EntrySide::Snapshot, ctx)
+        && entries_differ(right, EntrySide::Right, snap, EntrySide::Snapshot, ctx)
 }
 
 fn apply_conflict_policy(
@@ -413,7 +456,13 @@ fn collect_paths(
     set.into_iter().collect()
 }
 
-fn entries_differ(a: &FileEntry, b: &FileEntry, ctx: &DiffContext<'_>) -> bool {
+fn entries_differ(
+    a: &FileEntry,
+    a_side: EntrySide,
+    b: &FileEntry,
+    b_side: EntrySide,
+    ctx: &DiffContext<'_>,
+) -> bool {
     if a.is_dir != b.is_dir {
         return true;
     }
@@ -432,23 +481,67 @@ fn entries_differ(a: &FileEntry, b: &FileEntry, ctx: &DiffContext<'_>) -> bool {
     if a.size == 0 {
         return false;
     }
-    content_differs_if_enabled(a, b, ctx)
+    content_differs_if_enabled(a, a_side, b, b_side, ctx)
 }
 
-fn content_differs_if_enabled(a: &FileEntry, b: &FileEntry, ctx: &DiffContext<'_>) -> bool {
+fn content_differs_if_enabled(
+    a: &FileEntry,
+    a_side: EntrySide,
+    b: &FileEntry,
+    b_side: EntrySide,
+    ctx: &DiffContext<'_>,
+) -> bool {
     let opts = ctx.options;
     if !opts.content_hash_compare || a.size >= opts.content_hash_max_bytes {
         return false;
     }
-    let (Some(left_root), Some(right_root)) = (&opts.left_root, &opts.right_root) else {
+    // Metadata-only snapshots have no physical path or content hash. Metadata is
+    // the documented comparison semantics; never infer a snapshot path.
+    if (a_side == EntrySide::Snapshot && a.hash.is_none())
+        || (b_side == EntrySide::Snapshot && b.hash.is_none())
+    {
         return false;
-    };
-    let left_path = join_relative(left_root, &a.relative_path);
-    let right_path = join_relative(right_root, &b.relative_path);
-    match (hashing::hash_file(&left_path), hashing::hash_file(&right_path)) {
-        (Ok(lh), Ok(rh)) => lh != rh,
-        _ => false,
     }
+    let left_hash = hash_entry(a, a_side, ctx);
+    let right_hash = hash_entry(b, b_side, ctx);
+    match (left_hash, right_hash) {
+        (Some(Ok(lh)), Some(Ok(rh))) => lh != rh,
+        (Some(Err(_)), _) | (_, Some(Err(_))) => true,
+        (Some(Ok(_)), None) | (None, Some(Ok(_))) | (None, None) => false,
+    }
+}
+
+fn hash_entry(
+    entry: &FileEntry,
+    side: EntrySide,
+    ctx: &DiffContext<'_>,
+) -> Option<Result<String, String>> {
+    if let Some(hash) = &entry.hash {
+        return Some(Ok(hash.clone()));
+    }
+    let root = match side {
+        EntrySide::Left => ctx.options.left_root.as_ref(),
+        EntrySide::Right => ctx.options.right_root.as_ref(),
+        EntrySide::Snapshot => return None,
+    }?;
+    let key = HashKey {
+        side,
+        relative_path: entry.relative_path.clone(),
+        size: entry.size,
+        modified_secs: entry.modified_secs,
+        modified_nanos: entry.modified_nanos,
+    };
+    if let Some(cached) = ctx.hashes.borrow().get(&key) {
+        return Some(cached.clone());
+    }
+    let path = join_relative(root, &entry.relative_path);
+    let result = hashing::hash_file(&path)
+        .map_err(|error| format!("{}: content hash failed: {error}", entry.relative_path));
+    if let Err(error) = &result {
+        ctx.hash_warnings.borrow_mut().push(error.clone());
+    }
+    ctx.hashes.borrow_mut().insert(key, result.clone());
+    Some(result)
 }
 
 fn join_relative(base: &std::path::Path, relative: &str) -> PathBuf {
@@ -928,6 +1021,112 @@ mod tests {
             },
         );
         assert!(has_copy_ltr(&with_hash, "doc.txt"));
+    }
+
+    #[test]
+    fn equal_metadata_hashes_each_current_side_once_per_plan() {
+        use crate::hashing::{hash_invocation_count, reset_hash_invocations};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let left_root = dir.path().join("left");
+        let right_root = dir.path().join("right");
+        fs::create_dir_all(&left_root).expect("mkdir left");
+        fs::create_dir_all(&right_root).expect("mkdir right");
+        fs::write(left_root.join("doc.txt"), "left-content").expect("write left");
+        fs::write(right_root.join("doc.txt"), "right-content").expect("write right");
+
+        let left = vec![file_with_nanos("doc.txt", 12, 100, 0)];
+        let right = vec![file_with_nanos("doc.txt", 12, 100, 0)];
+        let snapshot = vec![file_with_nanos("doc.txt", 12, 100, 0)];
+        reset_hash_invocations();
+
+        let plan = build_sync_plan(
+            "p1",
+            SyncMode::Synchronize,
+            ConflictPolicy::Ask,
+            &left,
+            &right,
+            Some(&snapshot),
+            ScanIntegrity::default(),
+            DiffOptions {
+                left_root: Some(left_root),
+                right_root: Some(right_root),
+                ..DiffOptions::default()
+            },
+        );
+
+        assert_eq!(hash_invocation_count(), 2);
+        assert!(!plan.requires_attention);
+    }
+
+    #[test]
+    fn metadata_only_snapshot_does_not_trigger_physical_hashing() {
+        use crate::hashing::{hash_invocation_count, reset_hash_invocations};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let left_root = dir.path().join("left");
+        let right_root = dir.path().join("right");
+        fs::create_dir_all(&left_root).expect("mkdir left");
+        fs::create_dir_all(&right_root).expect("mkdir right");
+        fs::write(left_root.join("doc.txt"), "left-content").expect("write left");
+
+        let left = vec![file_with_nanos("doc.txt", 12, 100, 0)];
+        let snapshot = vec![file_with_nanos("doc.txt", 12, 100, 0)];
+        reset_hash_invocations();
+
+        let plan = build_sync_plan(
+            "p1",
+            SyncMode::Synchronize,
+            ConflictPolicy::Ask,
+            &left,
+            &[],
+            Some(&snapshot),
+            ScanIntegrity::default(),
+            DiffOptions {
+                left_root: Some(left_root),
+                right_root: Some(right_root),
+                ..DiffOptions::default()
+            },
+        );
+
+        assert_eq!(hash_invocation_count(), 0);
+        assert!(plan.actions.iter().any(|action| matches!(
+            action,
+            SyncAction::DeleteRight { path } if path == "doc.txt"
+        )));
+    }
+
+    #[test]
+    fn hash_failure_marks_plan_as_needing_attention() {
+        use crate::hashing::reset_hash_invocations;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let left = vec![file_with_nanos("missing.txt", 12, 100, 0)];
+        let right = vec![file_with_nanos("missing.txt", 12, 100, 0)];
+        reset_hash_invocations();
+
+        let plan = build_sync_plan(
+            "p1",
+            SyncMode::Echo,
+            ConflictPolicy::NewerWins,
+            &left,
+            &right,
+            None,
+            ScanIntegrity::default(),
+            DiffOptions {
+                left_root: Some(dir.path().join("left")),
+                right_root: Some(dir.path().join("right")),
+                ..DiffOptions::default()
+            },
+        );
+
+        assert!(plan.requires_attention);
+        assert!(plan.scan_warnings.iter().any(|warning| warning.contains("hash failed")));
     }
 
     #[test]

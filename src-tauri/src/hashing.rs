@@ -3,19 +3,18 @@ use std::io::{self, Read};
 use std::path::Path;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-#[cfg(test)]
-static HASH_INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static HASH_INVOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub fn hash_invocation_count() -> usize {
-    HASH_INVOCATIONS.load(Ordering::Relaxed)
+    HASH_INVOCATIONS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
 pub fn reset_hash_invocations() {
-    HASH_INVOCATIONS.store(0, Ordering::Relaxed);
+    HASH_INVOCATIONS.with(|count| count.set(0));
 }
 
 /// Returns a lowercase hex BLAKE3 digest of the file at `path`.
@@ -29,7 +28,7 @@ pub fn hash_file_with_progress(
     mut on_progress: impl FnMut(u64, u64) -> bool,
 ) -> io::Result<String> {
     #[cfg(test)]
-    HASH_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+    HASH_INVOCATIONS.with(|count| count.set(count.get() + 1));
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];

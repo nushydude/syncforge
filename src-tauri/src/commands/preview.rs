@@ -43,7 +43,7 @@ pub(crate) fn preview_pair_impl(
 
     let scan = ScanIntegrity::from_sides(&left_scan, &right_scan);
 
-    Ok(build_sync_plan(
+    let plan = build_sync_plan(
         &pair.id,
         pair.mode,
         pair.conflict_policy,
@@ -56,7 +56,13 @@ pub(crate) fn preview_pair_impl(
             right_root: Some(Path::new(&right_path).to_path_buf()),
             ..DiffOptions::default()
         },
-    ))
+    );
+    if plan.requires_attention
+        && matches!(pair.mode, crate::models::SyncMode::Echo | crate::models::SyncMode::Synchronize)
+    {
+        return Err("Preview requires attention: a content hash could not be read safely. Fix access and preview again.".into());
+    }
+    Ok(plan)
 }
 
 fn load_preview_snapshot(db: &Database, pair_id: &str) -> Result<Option<Vec<FileEntry>>, String> {
