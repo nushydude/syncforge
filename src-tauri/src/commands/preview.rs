@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::State;
@@ -8,7 +8,16 @@ use crate::models::{FileEntry, FolderPair, SyncPlan};
 use crate::path_normalization;
 use crate::persistence::Database;
 use crate::scanner::{assert_destructive_scan_allowed, scan_directory, ScanIntegrity};
-use crate::state::AppState;
+use crate::state::{
+    canonical_job_roots, AppState, HeavyJobKind, HeavyJobPermit, WorkCoordinator, WorkRequest,
+};
+
+pub(crate) fn admit_preview(
+    coordinator: &Arc<WorkCoordinator>,
+    roots: Vec<PathBuf>,
+) -> Result<HeavyJobPermit, String> {
+    coordinator.acquire_manual(WorkRequest::new(roots, false, HeavyJobKind::Preview))
+}
 
 /// Core preview logic shared by the Tauri command, watcher, scheduler, and tests.
 ///
@@ -70,7 +79,10 @@ pub async fn preview_pair(
         load_preview_snapshot(&db, &pair.id)?
     };
 
+    let work_coordinator = Arc::clone(&state.work_coordinator);
+    let roots = canonical_job_roots(&[&pair.left_path, &pair.right_path]);
     tauri::async_runtime::spawn_blocking(move || {
+        let _permit = admit_preview(&work_coordinator, roots)?;
         preview_pair_impl(&pair, snapshot_entries.as_deref())
     })
     .await

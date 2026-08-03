@@ -1,15 +1,27 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 use crate::engine::{run_pair_impl, RunOptions};
 use crate::models::{ConflictResolution, FolderPair, RunReport, RunStatus};
 use crate::notifications::notify_sync_report;
-use crate::run_coordinator::release_sync_slot;
-use crate::state::{try_acquire_pair_run, AppState};
+use crate::progress::ProgressCoalescer;
+use crate::run_coordinator::{emit_event, release_sync_slot};
+use crate::state::{
+    canonical_job_roots, try_acquire_pair_run, AppState, HeavyJobKind, HeavyJobPermit,
+    WorkCoordinator, WorkRequest,
+};
+
+pub(crate) fn admit_manual_run(
+    coordinator: &Arc<WorkCoordinator>,
+    roots: Vec<PathBuf>,
+) -> Result<HeavyJobPermit, String> {
+    coordinator.acquire_manual(WorkRequest::new(roots, true, HeavyJobKind::ManualRun))
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,11 +71,19 @@ pub async fn run_pair(
     let app_emit = app.clone();
     let cancel_for_run = Arc::clone(&cancel);
     let state_inner = Arc::clone(&state);
+    let work_coordinator = Arc::clone(&state.work_coordinator);
+    let roots = canonical_job_roots(&[&pair.left_path, &pair.right_path]);
 
     let result = tauri::async_runtime::spawn_blocking(move || {
-        run_pair_impl(db.as_ref(), &pair, run_options, &cancel_for_run, |progress| {
-            let _ = app_emit.emit("sync://progress", &progress);
-        })
+        let _permit = admit_manual_run(&work_coordinator, roots)?;
+        let mut progress_sink = ProgressCoalescer::system(|progress| {
+            let _ = emit_event(&app_emit, "sync://progress", &progress);
+        });
+        let result = run_pair_impl(db.as_ref(), &pair, run_options, &cancel_for_run, |progress| {
+            progress_sink.push_event(progress);
+        });
+        progress_sink.flush();
+        result
     })
     .await
     .map_err(|e| format!("sync run task failed: {e}"))?;

@@ -18,7 +18,33 @@ use crate::path_normalization;
 use crate::persistence::Database;
 use crate::scanner::{assert_destructive_scan_allowed, scan_directory, ScanIntegrity};
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
+#[cfg(test)]
+static PROGRESS_EMITS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static MAX_RUN_ITEM_BUFFER: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub fn reset_progress_emit_counter() {
+    PROGRESS_EMITS.store(0, Ordering::Relaxed);
+    MAX_RUN_ITEM_BUFFER.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn progress_emit_count() -> usize {
+    PROGRESS_EMITS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn max_run_item_buffer() -> usize {
+    MAX_RUN_ITEM_BUFFER.load(Ordering::Relaxed)
+}
+
 const TEMP_SUFFIX: &str = ".syncforge.tmp";
+/// Bounds run-item memory and SQLite transaction duration during large runs.
+pub const RUN_ITEM_BATCH_SIZE: usize = 1_000;
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -63,6 +89,22 @@ pub struct SyncProgress {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<RunReport>,
+}
+
+/// Borrowed progress fields used before the bridge sink decides to deliver an event.
+pub struct ProgressUpdate<'a> {
+    pub run_id: &'a str,
+    pub pair_id: &'a str,
+    pub phase: &'a str,
+    pub current: u32,
+    pub total: u32,
+    pub path: Option<&'a str>,
+    pub message: Option<&'a str>,
+}
+
+pub enum ProgressEvent<'a> {
+    Update(ProgressUpdate<'a>),
+    Owned(SyncProgress),
 }
 
 pub fn join_relative(base: &Path, relative: &str) -> PathBuf {
@@ -214,7 +256,11 @@ fn flush_run_items(db: &Mutex<Database>, items: &mut Vec<RunItem>) -> Result<(),
     if items.is_empty() {
         return Ok(());
     }
-    with_db(db, |db| db.insert_run_items(items).map_err(|e| e.to_string()))?;
+    with_db(db, |db| {
+        db.insert_run_items(items).map_err(|e| {
+            format!("history persistence failed while flushing {} run items: {e}", items.len())
+        })
+    })?;
     items.clear();
     Ok(())
 }
@@ -227,7 +273,7 @@ pub fn run_pair_impl<F>(
     mut emit: F,
 ) -> Result<RunReport, String>
 where
-    F: FnMut(SyncProgress),
+    F: FnMut(ProgressEvent<'_>),
 {
     if pair.id.is_empty() {
         return Err("pair id required for run".into());
@@ -252,13 +298,19 @@ where
 
     with_db(db, |db| db.save_run(&report).map_err(|e| e.to_string()))?;
 
+    let mut counted_emit = |progress: ProgressEvent<'_>| {
+        #[cfg(test)]
+        PROGRESS_EMITS.fetch_add(1, Ordering::Relaxed);
+        emit(progress);
+    };
+
     let result = run_pair_impl_inner(
         db,
         pair,
         options,
         cancel,
         &mut report,
-        &mut emit,
+        &mut counted_emit,
         &run_id,
         &left_root,
         &right_root,
@@ -266,7 +318,7 @@ where
 
     if let Err(ref error) = result {
         if report.finished_at.is_none() {
-            finish_failed(db, &mut report, &mut emit, error)?;
+            finish_failed(db, &mut report, &mut counted_emit, error)?;
         }
     }
 
@@ -286,7 +338,7 @@ fn run_pair_impl_inner<F>(
     right_root: &Path,
 ) -> Result<RunReport, String>
 where
-    F: FnMut(SyncProgress),
+    F: FnMut(ProgressEvent<'_>),
 {
     let RunOptions {
         verify_hashes,
@@ -300,16 +352,15 @@ where
 
     let mut progress =
         |phase: &str, current: u32, total: u32, path: Option<&str>, message: Option<&str>| {
-            emit(SyncProgress {
-                run_id: run_id.to_string(),
-                pair_id: pair.id.clone(),
-                phase: phase.into(),
+            emit(ProgressEvent::Update(ProgressUpdate {
+                run_id,
+                pair_id: &pair.id,
+                phase,
                 current,
                 total,
-                path: path.map(str::to_string),
-                message: message.map(str::to_string),
-                report: None,
-            });
+                path,
+                message,
+            }));
         };
 
     progress("scanning", 0, 0, None, Some("Scanning folders"));
@@ -318,7 +369,7 @@ where
 
     if cancel.load(Ordering::Relaxed) {
         flush_run_items(db, &mut run_items)?;
-        return finish_cancelled(db, pair, left_root, right_root, report, emit);
+        return finish_cancelled(db, pair, left_root, right_root, report, emit, 0, 0, None);
     }
 
     let mut plan = if let Some(plan) = provided_plan {
@@ -360,25 +411,40 @@ where
         apply_conflict_resolutions(&mut plan.actions, &conflict_resolutions);
     }
 
-    let executable: Vec<&SyncAction> =
-        plan.actions.iter().filter(|a| !matches!(a, SyncAction::Skip { .. })).collect();
-    let total = executable.len() as u32;
+    let total =
+        plan.actions.iter().filter(|a| !matches!(a, SyncAction::Skip { .. })).count() as u32;
 
     progress("running", 0, total, None, Some("Applying sync actions"));
 
     let mut stopped_on_error = false;
-    for (index, action) in executable.iter().enumerate() {
+    let mut last_executed_path = None;
+    let mut last_current = 0;
+    for (index, action) in
+        plan.actions.iter().filter(|a| !matches!(a, SyncAction::Skip { .. })).enumerate()
+    {
         if cancel.load(Ordering::Relaxed) {
             flush_run_items(db, &mut run_items)?;
-            return finish_cancelled(db, pair, left_root, right_root, report, emit);
+            return finish_cancelled(
+                db,
+                pair,
+                left_root,
+                right_root,
+                report,
+                emit,
+                index as u32,
+                total,
+                last_executed_path.map(str::to_owned),
+            );
         }
 
         let current = index as u32 + 1;
+        last_current = current;
         let path = action_path(action);
         progress("running", current, total, Some(path), None);
 
         let item_id = Uuid::new_v4().to_string();
         let kind = action_kind(action);
+        last_executed_path = Some(path);
         let result = execute_action(action, left_root, right_root, verify_hashes, use_recycle_bin);
 
         match result {
@@ -396,6 +462,11 @@ where
                     bytes: if stats.bytes > 0 { Some(stats.bytes) } else { None },
                 };
                 run_items.push(run_item);
+                #[cfg(test)]
+                MAX_RUN_ITEM_BUFFER.fetch_max(run_items.len(), Ordering::Relaxed);
+                if run_items.len() >= RUN_ITEM_BATCH_SIZE {
+                    flush_run_items(db, &mut run_items)?;
+                }
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -411,6 +482,11 @@ where
                     bytes: None,
                 };
                 run_items.push(run_item);
+                #[cfg(test)]
+                MAX_RUN_ITEM_BUFFER.fetch_max(run_items.len(), Ordering::Relaxed);
+                if run_items.len() >= RUN_ITEM_BATCH_SIZE {
+                    flush_run_items(db, &mut run_items)?;
+                }
                 if !is_conflict && stop_on_error {
                     stopped_on_error = true;
                     break;
@@ -421,7 +497,17 @@ where
 
     if cancel.load(Ordering::Relaxed) {
         flush_run_items(db, &mut run_items)?;
-        return finish_cancelled(db, pair, left_root, right_root, report, emit);
+        return finish_cancelled(
+            db,
+            pair,
+            left_root,
+            right_root,
+            report,
+            emit,
+            last_current,
+            total,
+            last_executed_path.map(str::to_owned),
+        );
     }
 
     flush_run_items(db, &mut run_items)?;
@@ -437,8 +523,9 @@ where
     };
     report.finished_at = Some(now_millis());
     with_db(db, |db| db.save_run(report).map_err(|e| e.to_string()))?;
+    let final_path = last_executed_path.map(str::to_owned);
 
-    emit(SyncProgress {
+    emit(ProgressEvent::Owned(SyncProgress {
         run_id: run_id.to_string(),
         pair_id: pair.id.clone(),
         phase: if report.status == RunStatus::Completed {
@@ -446,12 +533,12 @@ where
         } else {
             "failed".into()
         },
-        current: total,
+        current: last_current,
         total,
-        path: None,
+        path: final_path,
         message: None,
         report: Some(report.clone()),
-    });
+    }));
 
     Ok(report.clone())
 }
@@ -527,7 +614,7 @@ fn finish_failed<F>(
     error: &str,
 ) -> Result<(), String>
 where
-    F: FnMut(SyncProgress),
+    F: FnMut(ProgressEvent<'_>),
 {
     if !report.errors.iter().any(|e| e == error) {
         report.errors.push(error.to_string());
@@ -535,7 +622,7 @@ where
     report.status = RunStatus::Failed;
     report.finished_at = Some(now_millis());
     with_db(db, |db| db.save_run(report).map_err(|e| e.to_string()))?;
-    emit(SyncProgress {
+    emit(ProgressEvent::Owned(SyncProgress {
         run_id: report.run_id.clone(),
         pair_id: report.pair_id.clone(),
         phase: "failed".into(),
@@ -544,10 +631,11 @@ where
         path: None,
         message: Some(error.to_string()),
         report: Some(report.clone()),
-    });
+    }));
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_cancelled<F>(
     db: &Mutex<Database>,
     pair: &FolderPair,
@@ -555,9 +643,12 @@ fn finish_cancelled<F>(
     right_root: &Path,
     report: &mut RunReport,
     emit: &mut F,
+    current: u32,
+    total: u32,
+    path: Option<String>,
 ) -> Result<RunReport, String>
 where
-    F: FnMut(SyncProgress),
+    F: FnMut(ProgressEvent<'_>),
 {
     if actions_were_applied(report) {
         save_post_run_snapshot(db, pair, left_root, right_root)?;
@@ -565,16 +656,16 @@ where
     report.status = RunStatus::Cancelled;
     report.finished_at = Some(now_millis());
     with_db(db, |db| db.save_run(report).map_err(|e| e.to_string()))?;
-    emit(SyncProgress {
+    emit(ProgressEvent::Owned(SyncProgress {
         run_id: report.run_id.clone(),
         pair_id: report.pair_id.clone(),
         phase: "cancelled".into(),
-        current: 0,
-        total: 0,
-        path: None,
+        current,
+        total,
+        path,
         message: Some("Run cancelled".into()),
         report: Some(report.clone()),
-    });
+    }));
     Ok(report.clone())
 }
 
@@ -794,7 +885,10 @@ mod tests {
             &pair,
             RunOptions { verify_hashes: true, use_recycle_bin: false, ..Default::default() },
             &cancel,
-            |p| events.push(p.phase.clone()),
+            |p| match p {
+                ProgressEvent::Owned(p) => events.push(p.phase),
+                ProgressEvent::Update(p) => events.push(p.phase.to_owned()),
+            },
         )
         .expect("run");
 
@@ -840,8 +934,10 @@ mod tests {
             RunOptions { use_recycle_bin: false, ..Default::default() },
             &cancel,
             |p| {
-                if p.phase == "failed" {
-                    failed_report = p.report.clone();
+                if let ProgressEvent::Owned(p) = p {
+                    if p.phase == "failed" {
+                        failed_report = p.report.clone();
+                    }
                 }
             },
         )
@@ -929,8 +1025,10 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         let report = run_pair_impl(&db, &pair, RunOptions::default(), &cancel, |p| {
-            if p.phase == "running" && p.current >= 1 {
-                cancel.store(true, Ordering::Relaxed);
+            if let ProgressEvent::Update(p) = p {
+                if p.phase == "running" && p.current >= 1 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
             }
         })
         .expect("cancelled run returns report");
@@ -1011,6 +1109,82 @@ mod tests {
 
         let items = db.lock().expect("lock").list_run_items(&report.run_id).expect("items");
         assert_eq!(items.len(), 1, "only the failing action should be recorded");
+    }
+
+    #[test]
+    fn large_run_flushes_run_items_in_bounded_batches() {
+        let data_dir = TempDir::new().expect("tempdir");
+        let db = Mutex::new(
+            crate::persistence::Database::open(&data_dir.path().join("test.db")).expect("db"),
+        );
+        let left_dir = data_dir.path().join("left");
+        let right_dir = data_dir.path().join("right");
+        fs::create_dir_all(&left_dir).expect("mkdir");
+        fs::create_dir_all(&right_dir).expect("mkdir");
+        let pair = crate::models::FolderPair {
+            id: crate::persistence::new_pair_id(),
+            name: "Batching".into(),
+            left_path: left_dir.to_string_lossy().into_owned(),
+            right_path: right_dir.to_string_lossy().into_owned(),
+            mode: crate::models::SyncMode::Echo,
+            filters: crate::models::Filters::default(),
+            conflict_policy: crate::models::ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 2,
+        };
+        db.lock().expect("lock").save_pair(&pair).expect("save pair");
+        let action_count = RUN_ITEM_BATCH_SIZE * 2 + RUN_ITEM_BATCH_SIZE / 2 + 1;
+        let plan = SyncPlan {
+            pair_id: pair.id.clone(),
+            actions: (0..action_count)
+                .map(|index| SyncAction::CreateDirRight { path: format!("dir-{index}") })
+                .collect(),
+            scanned_left: 0,
+            scanned_right: 0,
+            scan_skipped_left: 0,
+            scan_skipped_right: 0,
+            scan_warnings: vec![],
+            requires_attention: false,
+        };
+        crate::persistence::reset_run_item_batch_counter();
+        reset_progress_emit_counter();
+        let report = run_pair_impl(
+            &db,
+            &pair,
+            RunOptions { plan: Some(plan), use_recycle_bin: false, ..Default::default() },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .expect("run");
+        let items = db.lock().expect("lock").list_run_items(&report.run_id).expect("items");
+        assert_eq!(items.len(), action_count);
+        assert_eq!(crate::persistence::run_item_batch_insert_count(), 3);
+        assert!(max_run_item_buffer() <= RUN_ITEM_BATCH_SIZE);
+
+        let failing_plan = SyncPlan {
+            pair_id: pair.id.clone(),
+            actions: vec![SyncAction::CreateDirRight { path: "failure-dir".into() }],
+            scanned_left: 0,
+            scanned_right: 0,
+            scan_skipped_left: 0,
+            scan_skipped_right: 0,
+            scan_warnings: vec![],
+            requires_attention: false,
+        };
+        crate::persistence::fail_next_run_item_batch();
+        let error = run_pair_impl(
+            &db,
+            &pair,
+            RunOptions { plan: Some(failing_plan), use_recycle_bin: false, ..Default::default() },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .expect_err("injected history batch failure");
+        assert!(error.contains("history persistence failed"));
     }
 
     #[test]

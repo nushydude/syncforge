@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -7,11 +8,52 @@ use crate::commands::preview::preview_pair_impl;
 use crate::engine::{run_pair_impl, RunOptions};
 use crate::models::{ConflictPolicy, RunStatus, SyncAction};
 use crate::notifications::{notify_sync_error, notify_sync_report};
+use crate::progress::ProgressCoalescer;
 use crate::state::{
+    canonical_job_roots, dequeue_pending_schedule_sync, dequeue_pending_watch_sync,
     enqueue_pending_schedule_sync, enqueue_pending_watch_sync, release_pair_run_slot,
-    try_acquire_pair_run, AppState,
+    try_acquire_pair_run, AppState, HeavyJobKind, HeavyJobPermit, WorkCoordinator, WorkRequest,
 };
 use serde::Serialize;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static TAURI_EVENT_EMITS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub fn reset_tauri_event_counter() {
+    TAURI_EVENT_EMITS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn tauri_event_count() -> usize {
+    TAURI_EVENT_EMITS.load(Ordering::Relaxed)
+}
+
+fn emit_event_with<T, F>(event: &str, payload: &T, emit: F) -> Result<(), tauri::Error>
+where
+    T: Serialize,
+    F: FnOnce(&str, &T) -> Result<(), tauri::Error>,
+{
+    #[cfg(test)]
+    TAURI_EVENT_EMITS.fetch_add(1, Ordering::Relaxed);
+    emit(event, payload)
+}
+
+pub(crate) fn emit_event<T: Serialize>(
+    app: &AppHandle,
+    event: &str,
+    payload: &T,
+) -> Result<(), tauri::Error> {
+    emit_event_with(event, payload, |event, payload| app.emit(event, payload))
+}
+
+#[cfg(test)]
+pub fn emit_test_event<T: Serialize>(event: &str, payload: &T) {
+    let _ = emit_event_with(event, payload, |_, _| Ok(()));
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +65,20 @@ pub struct WatchSkippedPayload {
 /// Returns true when the preview plan has nothing to apply (avoids watch feedback loops).
 pub fn watch_plan_is_empty(actions: &[SyncAction]) -> bool {
     actions.is_empty()
+}
+
+pub(crate) fn admit_watch(
+    coordinator: &Arc<WorkCoordinator>,
+    roots: Vec<PathBuf>,
+) -> Result<Option<HeavyJobPermit>, String> {
+    coordinator.try_acquire(WorkRequest::new(roots, true, HeavyJobKind::Watch))
+}
+
+pub(crate) fn admit_scheduled(
+    coordinator: &Arc<WorkCoordinator>,
+    roots: Vec<PathBuf>,
+) -> Result<Option<HeavyJobPermit>, String> {
+    coordinator.try_acquire(WorkRequest::new(roots, true, HeavyJobKind::Scheduled))
 }
 
 fn plan_has_conflicts(actions: &[SyncAction]) -> bool {
@@ -48,6 +104,35 @@ pub(crate) fn release_sync_slot(
     }
 }
 
+pub(crate) fn retry_pending_syncs(app: AppHandle, state: &Arc<AppState>) {
+    let watch = state.pending_watch_syncs.lock().ok().and_then(|mut pending| {
+        let id = pending.iter().next().cloned();
+        if let Some(ref id) = id {
+            pending.remove(id);
+            if let Ok(mut automatic) = state.pending_automatic_syncs.lock() {
+                automatic.remove(id);
+            }
+        }
+        id
+    });
+    if let Some(pair_id) = watch {
+        run_watch_sync(app.clone(), Arc::clone(state), pair_id);
+    }
+    let scheduled = state.pending_schedule_syncs.lock().ok().and_then(|mut pending| {
+        let id = pending.iter().next().cloned();
+        if let Some(ref id) = id {
+            pending.remove(id);
+            if let Ok(mut automatic) = state.pending_automatic_syncs.lock() {
+                automatic.remove(id);
+            }
+        }
+        id
+    });
+    if let Some(pair_id) = scheduled {
+        run_scheduled_sync(app, Arc::clone(state), pair_id);
+    }
+}
+
 pub(crate) fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: String) {
     let cancel = match try_acquire_pair_run(&state, &pair_id) {
         Ok(c) => c,
@@ -56,21 +141,55 @@ pub(crate) fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: Stri
             return;
         }
     };
+    dequeue_pending_watch_sync(&state, &pair_id);
+
+    let pair = match state
+        .db
+        .lock()
+        .map_err(|e| e.to_string())
+        .and_then(|guard| guard.get_pair(&pair_id).map_err(|e| e.to_string()))
+        .ok()
+        .flatten()
+        .filter(|p| p.enabled && p.watch_enabled)
+    {
+        Some(pair) => pair,
+        None => {
+            let _ = release_pair_run_slot(&state, &pair_id, &cancel);
+            return;
+        }
+    };
+    let roots = canonical_job_roots(&[&pair.left_path, &pair.right_path]);
+    let permit = match admit_watch(&state.work_coordinator, roots.clone()) {
+        Ok(Some(permit)) => permit,
+        Ok(None) => {
+            let _ = release_pair_run_slot(&state, &pair_id, &cancel);
+            if enqueue_pending_watch_sync(&state, pair_id.clone()) {
+                let retry_state = Arc::clone(&state);
+                let retry_coordinator = Arc::clone(&state.work_coordinator);
+                let retry_id = pair_id.clone();
+                let retry_roots = roots.clone();
+                tauri::async_runtime::spawn(async move {
+                    retry_coordinator
+                        .wait_for_release(WorkRequest::new(retry_roots, true, HeavyJobKind::Watch))
+                        .await;
+                    run_watch_sync(app, retry_state, retry_id);
+                });
+            }
+            return;
+        }
+        Err(_) => {
+            let _ = release_pair_run_slot(&state, &pair_id, &cancel);
+            return;
+        }
+    };
 
     let db = Arc::clone(&state.db);
     let app_emit = app.clone();
     let pair_id_for_release = pair_id.clone();
 
-    let _ = std::thread::spawn(move || {
+    std::mem::drop(tauri::async_runtime::spawn_blocking(move || {
         let run_result = (|| -> Result<(), String> {
-            let pair = {
-                let guard = db.lock().map_err(|e| e.to_string())?;
-                guard
-                    .get_pair(&pair_id)
-                    .map_err(|e| e.to_string())?
-                    .filter(|p| p.enabled && p.watch_enabled)
-                    .ok_or_else(|| "pair not found or watch disabled".to_string())?
-            };
+            let _permit = permit;
 
             let snapshot_entries = {
                 let guard = db.lock().map_err(|e| e.to_string())?;
@@ -83,7 +202,8 @@ pub(crate) fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: Stri
             }
 
             if pair.conflict_policy == ConflictPolicy::Ask && plan_has_conflicts(&plan.actions) {
-                let _ = app_emit.emit(
+                let _ = emit_event(
+                    &app_emit,
                     "sync://watch-skipped",
                     &WatchSkippedPayload {
                         pair_id: pair.id.clone(),
@@ -102,21 +222,27 @@ pub(crate) fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: Stri
                 ..Default::default()
             };
 
-            run_pair_impl(db.as_ref(), &pair, options, &cancel, |progress| {
-                let _ = app_emit.emit("sync://progress", &progress);
-            })?;
+            let mut progress_sink = ProgressCoalescer::system(|progress| {
+                let _ = emit_event(&app_emit, "sync://progress", &progress);
+            });
+            let result = run_pair_impl(db.as_ref(), &pair, options, &cancel, |progress| {
+                progress_sink.push_event(progress);
+            });
+            progress_sink.flush();
+            result?;
             Ok(())
         })();
 
         release_sync_slot(app_emit.clone(), &state, &pair_id_for_release, &cancel);
 
         if let Err(e) = run_result {
-            let _ = app_emit.emit(
+            let _ = emit_event(
+                &app_emit,
                 "sync://watch-skipped",
                 &WatchSkippedPayload { pair_id: pair_id_for_release, reason: e },
             );
         }
-    });
+    }));
 }
 
 pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: String) {
@@ -127,21 +253,59 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
             return;
         }
     };
+    dequeue_pending_schedule_sync(&state, &pair_id);
+
+    let pair = match state
+        .db
+        .lock()
+        .map_err(|e| e.to_string())
+        .and_then(|guard| guard.get_pair(&pair_id).map_err(|e| e.to_string()))
+        .ok()
+        .flatten()
+        .filter(|p| p.enabled && p.schedule_enabled)
+    {
+        Some(pair) => pair,
+        None => {
+            let _ = release_pair_run_slot(&state, &pair_id, &cancel);
+            return;
+        }
+    };
+    let roots = canonical_job_roots(&[&pair.left_path, &pair.right_path]);
+    let permit = match admit_scheduled(&state.work_coordinator, roots.clone()) {
+        Ok(Some(permit)) => permit,
+        Ok(None) => {
+            let _ = release_pair_run_slot(&state, &pair_id, &cancel);
+            if enqueue_pending_schedule_sync(&state, pair_id.clone()) {
+                let retry_state = Arc::clone(&state);
+                let retry_coordinator = Arc::clone(&state.work_coordinator);
+                let retry_id = pair_id.clone();
+                let retry_roots = roots.clone();
+                tauri::async_runtime::spawn(async move {
+                    retry_coordinator
+                        .wait_for_release(WorkRequest::new(
+                            retry_roots,
+                            true,
+                            HeavyJobKind::Scheduled,
+                        ))
+                        .await;
+                    run_scheduled_sync(app, retry_state, retry_id);
+                });
+            }
+            return;
+        }
+        Err(_) => {
+            let _ = release_pair_run_slot(&state, &pair_id, &cancel);
+            return;
+        }
+    };
 
     let db = Arc::clone(&state.db);
     let app_emit = app.clone();
     let pair_id_for_release = pair_id.clone();
 
-    let _ = std::thread::spawn(move || {
+    std::mem::drop(tauri::async_runtime::spawn_blocking(move || {
         let run_result = (|| -> Result<(), String> {
-            let pair = {
-                let guard = db.lock().map_err(|e| e.to_string())?;
-                guard
-                    .get_pair(&pair_id)
-                    .map_err(|e| e.to_string())?
-                    .filter(|p| p.enabled && p.schedule_enabled)
-                    .ok_or_else(|| "pair not found or schedule disabled".to_string())?
-            };
+            let _permit = permit;
             let pair_name = pair.name.clone();
 
             let snapshot_entries = {
@@ -168,9 +332,14 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
                 ..Default::default()
             };
 
-            let report = run_pair_impl(db.as_ref(), &pair, options, &cancel, |progress| {
-                let _ = app_emit.emit("sync://progress", &progress);
-            })?;
+            let mut progress_sink = ProgressCoalescer::system(|progress| {
+                let _ = emit_event(&app_emit, "sync://progress", &progress);
+            });
+            let result = run_pair_impl(db.as_ref(), &pair, options, &cancel, |progress| {
+                progress_sink.push_event(progress);
+            });
+            progress_sink.flush();
+            let report = result?;
 
             if report.status == RunStatus::Completed || report.status == RunStatus::Failed {
                 notify_sync_report(&app_emit, &pair_name, &report);
@@ -189,7 +358,7 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
                 .unwrap_or_else(|| pair_id_for_release.clone());
             notify_sync_error(&app_emit, &pair_name, &e);
         }
-    });
+    }));
 }
 
 #[cfg(test)]

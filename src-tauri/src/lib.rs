@@ -7,11 +7,15 @@ mod models;
 mod notifications;
 mod path_normalization;
 mod persistence;
+mod progress;
 mod run_coordinator;
 mod scanner;
 mod scheduler;
 mod state;
 mod watcher;
+
+#[cfg(test)]
+mod perf_harness;
 
 use std::sync::Arc;
 

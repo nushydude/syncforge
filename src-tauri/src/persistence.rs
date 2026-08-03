@@ -3,6 +3,30 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 use uuid::Uuid;
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static RUN_ITEM_BATCH_INSERTS: Cell<usize> = const { Cell::new(0) };
+    static FAIL_NEXT_RUN_ITEM_BATCH: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub fn reset_run_item_batch_counter() {
+    RUN_ITEM_BATCH_INSERTS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub fn run_item_batch_insert_count() -> usize {
+    RUN_ITEM_BATCH_INSERTS.with(Cell::get)
+}
+
+#[cfg(test)]
+pub fn fail_next_run_item_batch() {
+    FAIL_NEXT_RUN_ITEM_BATCH.with(|fail| fail.set(true));
+}
+
 use crate::duplicates::{self, DuplicateScanJob};
 use crate::models::{
     ConflictPolicy, FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot, SyncMode,
@@ -521,6 +545,13 @@ impl Database {
         if items.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        {
+            if FAIL_NEXT_RUN_ITEM_BATCH.with(|fail| fail.replace(false)) {
+                return Err(rusqlite::Error::InvalidQuery.into());
+            }
+            RUN_ITEM_BATCH_INSERTS.with(|count| count.set(count.get() + 1));
+        }
         let tx = self.conn.unchecked_transaction()?;
         for item in items {
             tx.execute(
@@ -892,6 +923,10 @@ mod tests {
         db.insert_run_items(&items).expect("insert batch");
         let loaded = db.list_run_items(&run_id).expect("list");
         assert_eq!(loaded.len(), 3);
+
+        fail_next_run_item_batch();
+        let error = db.insert_run_items(&items).expect_err("injected batch failure");
+        assert!(matches!(error, PersistenceError::Database(rusqlite::Error::InvalidQuery)));
     }
 
     #[test]

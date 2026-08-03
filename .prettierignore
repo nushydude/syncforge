@@ -3,3 +3,4 @@ node_modules
 src-tauri/target
 orchestrator/logs
 src-tauri/gen/schemas
+docs/performance-scalability-audit-2026-08-02.md
