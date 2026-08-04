@@ -33,12 +33,7 @@ fn current_millis() -> i64 {
 }
 
 fn save_job(state: &Arc<AppState>, job: &DuplicateScanJob) -> Result<(), String> {
-    state
-        .db
-        .lock()
-        .map_err(|error| error.to_string())?
-        .save_duplicate_scan(job)
-        .map_err(|error| error.to_string())
+    state.db.save_duplicate_scan(job).map_err(|error| error.to_string())
 }
 
 fn publish_job(app: &AppHandle, job: &DuplicateScanJob) {
@@ -304,12 +299,7 @@ pub async fn start_duplicate_scan(
 ) -> Result<DuplicateScanJob, String> {
     let state = state.inner().clone();
     let root = canonical_root(&root)?;
-    let current = state
-        .db
-        .lock()
-        .map_err(|error| error.to_string())?
-        .latest_duplicate_scan()
-        .map_err(|error| error.to_string())?;
+    let current = state.db.latest_duplicate_scan().map_err(|error| error.to_string())?;
     if current.is_some_and(|job| job.status == DuplicateScanStatus::Running) {
         return Err("A duplicate scan is already running.".into());
     }
@@ -320,12 +310,7 @@ pub async fn start_duplicate_scan(
 pub fn get_duplicate_scan(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<DuplicateScanJob>, String> {
-    state
-        .db
-        .lock()
-        .map_err(|error| error.to_string())?
-        .latest_duplicate_scan()
-        .map_err(|error| error.to_string())
+    state.db.latest_duplicate_scan().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -337,8 +322,6 @@ pub async fn resume_duplicate_scan(
     let state = state.inner().clone();
     let mut job = state
         .db
-        .lock()
-        .map_err(|error| error.to_string())?
         .get_duplicate_scan(&id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Duplicate scan was not found.".to_string())?;
@@ -377,22 +360,12 @@ pub fn cancel_duplicate_scan(
             flag.store(true, Ordering::Relaxed);
         }
     }
-    let mut job = state
-        .db
-        .lock()
-        .map_err(|error| error.to_string())?
-        .get_duplicate_scan(&id)
-        .map_err(|error| error.to_string())?;
+    let mut job = state.db.get_duplicate_scan(&id).map_err(|error| error.to_string())?;
     if let Some(job) = job.as_mut() {
         if job.status == DuplicateScanStatus::Running {
             job.cancel_requested = true;
             job.updated_at = current_millis();
-            state
-                .db
-                .lock()
-                .map_err(|error| error.to_string())?
-                .save_duplicate_scan(job)
-                .map_err(|error| error.to_string())?;
+            state.db.save_duplicate_scan(job).map_err(|error| error.to_string())?;
             publish_job(&app, job);
         }
     }

@@ -26,8 +26,6 @@ pub fn set_schedule(
 
     let mut pair = state
         .db
-        .lock()
-        .map_err(|e| e.to_string())?
         .get_pair(&pair_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("pair not found: {pair_id}"))?;
@@ -36,7 +34,7 @@ pub fn set_schedule(
     pair.schedule_cron = if enabled { cron } else { None };
     pair.updated_at = current_millis();
 
-    let saved = state.db.lock().map_err(|e| e.to_string())?.save_pair(&pair).map_err(|e| {
+    let saved = state.db.save_pair(&pair).map_err(|e| {
         if matches!(e, PersistenceError::PairNotFound(_)) {
             format!("pair not found: {pair_id}")
         } else {

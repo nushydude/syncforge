@@ -91,8 +91,7 @@ pub struct WatchService {
 
 impl WatchService {
     pub fn start(app: AppHandle, state: Arc<AppState>) -> Result<Self, String> {
-        let pairs =
-            state.db.lock().map_err(|e| e.to_string())?.list_pairs().map_err(|e| e.to_string())?;
+        let pairs = state.db.list_pairs().map_err(|e| e.to_string())?;
         let roots = Arc::new(Mutex::new(build_roots(&pairs)));
         let (event_tx, event_rx) = mpsc::channel::<String>();
 

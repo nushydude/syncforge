@@ -3,7 +3,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
@@ -15,7 +14,7 @@ use crate::models::{
     SyncPlan,
 };
 use crate::path_normalization;
-use crate::persistence::Database;
+use crate::persistence::DatabaseHandle;
 use crate::scanner::{assert_destructive_scan_allowed, scan_directory, ScanIntegrity};
 
 #[cfg(test)]
@@ -222,7 +221,7 @@ fn actions_were_applied(report: &RunReport) -> bool {
 /// anything keep the previous snapshot. Run status may still be `Failed` or
 /// `Cancelled` when a snapshot is saved.
 fn save_post_run_snapshot(
-    db: &Mutex<Database>,
+    db: &dyn DatabaseHandle,
     pair: &FolderPair,
     left_root: &Path,
     right_root: &Path,
@@ -252,15 +251,14 @@ fn build_snapshot_entries(left: &[FileEntry], right: &[FileEntry]) -> Vec<FileEn
     map.into_values().collect()
 }
 
-fn with_db<T, F>(db: &Mutex<Database>, f: F) -> Result<T, String>
+fn with_db<T, F>(db: &dyn DatabaseHandle, f: F) -> Result<T, String>
 where
-    F: FnOnce(&Database) -> Result<T, String>,
+    F: FnOnce(&dyn DatabaseHandle) -> Result<T, String>,
 {
-    let guard = db.lock().map_err(|e| e.to_string())?;
-    f(&guard)
+    f(db)
 }
 
-fn flush_run_items(db: &Mutex<Database>, items: &mut Vec<RunItem>) -> Result<(), String> {
+fn flush_run_items(db: &dyn DatabaseHandle, items: &mut Vec<RunItem>) -> Result<(), String> {
     if items.is_empty() {
         return Ok(());
     }
@@ -274,7 +272,7 @@ fn flush_run_items(db: &Mutex<Database>, items: &mut Vec<RunItem>) -> Result<(),
 }
 
 pub fn run_pair_impl<F>(
-    db: &Mutex<Database>,
+    db: &dyn DatabaseHandle,
     pair: &FolderPair,
     options: RunOptions,
     cancel: &AtomicBool,
@@ -335,7 +333,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn run_pair_impl_inner<F>(
-    db: &Mutex<Database>,
+    db: &dyn DatabaseHandle,
     pair: &FolderPair,
     options: RunOptions,
     cancel: &AtomicBool,
@@ -701,7 +699,7 @@ fn action_path(action: &SyncAction) -> &str {
 }
 
 fn finish_failed<F>(
-    db: &Mutex<Database>,
+    db: &dyn DatabaseHandle,
     report: &mut RunReport,
     emit: &mut F,
     error: &str,
@@ -730,7 +728,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn finish_cancelled<F>(
-    db: &Mutex<Database>,
+    db: &dyn DatabaseHandle,
     pair: &FolderPair,
     left_root: &Path,
     right_root: &Path,
@@ -765,6 +763,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     #[test]

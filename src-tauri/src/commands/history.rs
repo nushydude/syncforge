@@ -14,27 +14,31 @@ pub struct RunDetail {
 }
 
 #[tauri::command]
-pub fn get_history(
+pub async fn get_history(
     pair_id: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<RunReport>, String> {
-    state
-        .db
-        .lock()
-        .map_err(|e| e.to_string())?
-        .list_runs(pair_id.as_deref())
-        .map_err(|e| e.to_string())
+    let db = std::sync::Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        db.list_runs(pair_id.as_deref()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("history task failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_run_detail(
+pub async fn get_run_detail(
     run_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<RunDetail>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let Some(report) = db.get_run(&run_id).map_err(|e| e.to_string())? else {
-        return Ok(None);
-    };
-    let items = db.list_run_items(&run_id).map_err(|e| e.to_string())?;
-    Ok(Some(RunDetail { report, items }))
+    let db = std::sync::Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(report) = db.get_run(&run_id).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        let items = db.list_run_items(&run_id).map_err(|e| e.to_string())?;
+        Ok(Some(RunDetail { report, items }))
+    })
+    .await
+    .map_err(|e| format!("history detail task failed: {e}"))?
 }

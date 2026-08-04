@@ -173,16 +173,10 @@ impl ScheduleService {
             wake_task,
             deadline_state_task,
             clock,
-            move || match load_state.db.lock() {
-                Ok(guard) => match guard.list_pairs() {
-                    Ok(pairs) => build_scheduled_pairs(&pairs, (load_clock)()),
-                    Err(e) => {
-                        eprintln!("scheduler: list pairs failed: {e}");
-                        Vec::new()
-                    }
-                },
+            move || match load_state.db.list_pairs() {
+                Ok(pairs) => build_scheduled_pairs(&pairs, (load_clock)()),
                 Err(e) => {
-                    eprintln!("scheduler: db lock failed: {e}");
+                    eprintln!("scheduler: list pairs failed: {e}");
                     Vec::new()
                 }
             },

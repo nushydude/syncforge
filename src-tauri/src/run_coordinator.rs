@@ -145,9 +145,8 @@ pub(crate) fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: Stri
 
     let pair = match state
         .db
-        .lock()
+        .get_pair(&pair_id)
         .map_err(|e| e.to_string())
-        .and_then(|guard| guard.get_pair(&pair_id).map_err(|e| e.to_string()))
         .ok()
         .flatten()
         .filter(|p| p.enabled && p.watch_enabled)
@@ -191,10 +190,8 @@ pub(crate) fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: Stri
         let run_result = (|| -> Result<(), String> {
             let _permit = permit;
 
-            let snapshot_entries = {
-                let guard = db.lock().map_err(|e| e.to_string())?;
-                guard.latest_snapshot(&pair.id).map_err(|e| e.to_string())?.map(|s| s.entries)
-            };
+            let snapshot_entries =
+                db.latest_snapshot(&pair.id).map_err(|e| e.to_string())?.map(|s| s.entries);
             let plan = preview_pair_impl(&pair, snapshot_entries.as_deref())?;
 
             if watch_plan_is_empty(&plan.actions) {
@@ -257,9 +254,8 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
 
     let pair = match state
         .db
-        .lock()
+        .get_pair(&pair_id)
         .map_err(|e| e.to_string())
-        .and_then(|guard| guard.get_pair(&pair_id).map_err(|e| e.to_string()))
         .ok()
         .flatten()
         .filter(|p| p.enabled && p.schedule_enabled)
@@ -308,10 +304,8 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
             let _permit = permit;
             let pair_name = pair.name.clone();
 
-            let snapshot_entries = {
-                let guard = db.lock().map_err(|e| e.to_string())?;
-                guard.latest_snapshot(&pair.id).map_err(|e| e.to_string())?.map(|s| s.entries)
-            };
+            let snapshot_entries =
+                db.latest_snapshot(&pair.id).map_err(|e| e.to_string())?.map(|s| s.entries);
             let plan = preview_pair_impl(&pair, snapshot_entries.as_deref())?;
 
             if pair.conflict_policy == ConflictPolicy::Ask && plan_has_conflicts(&plan.actions) {
@@ -351,9 +345,9 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
 
         if let Err(e) = run_result {
             let pair_name = db
-                .lock()
+                .get_pair(&pair_id_for_release)
                 .ok()
-                .and_then(|g| g.get_pair(&pair_id_for_release).ok().flatten())
+                .flatten()
                 .map(|p| p.name)
                 .unwrap_or_else(|| pair_id_for_release.clone());
             notify_sync_error(&app_emit, &pair_name, &e);

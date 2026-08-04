@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use crate::models::{PreviewActionPage, SyncPlan};
-use crate::persistence::{Database, PersistenceError};
+use crate::persistence::{DatabaseManager, PersistenceError};
 use crate::scheduler::ScheduleService;
 use crate::watcher::WatchService;
 
@@ -325,7 +325,7 @@ impl Drop for HeavyJobPermit {
 
 pub struct AppState {
     pub work_coordinator: Arc<WorkCoordinator>,
-    pub db: Arc<Mutex<Database>>,
+    pub db: Arc<DatabaseManager>,
     /// Cancellation flags for active duplicate analysis jobs.
     pub duplicate_scan_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Roots with an active legacy duplicate operation; rejecting repeats bounds queued work.
@@ -352,12 +352,12 @@ pub struct AppState {
 impl AppState {
     pub fn new(data_dir: PathBuf) -> Result<Self, PersistenceError> {
         let db_path = data_dir.join("syncforge.db");
-        let db = Database::open(&db_path)?;
+        let db = DatabaseManager::open(&db_path)?;
         db.mark_duplicate_scans_interrupted()?;
         db.mark_sync_runs_interrupted()?;
         Ok(Self {
             work_coordinator: Arc::new(WorkCoordinator::new()),
-            db: Arc::new(Mutex::new(db)),
+            db: Arc::new(db),
             duplicate_scan_cancels: Mutex::new(HashMap::new()),
             active_duplicate_jobs: Mutex::new(HashSet::new()),
             active_sniffer_jobs: Mutex::new(HashSet::new()),

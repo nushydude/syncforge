@@ -8,7 +8,7 @@ use crate::models::{
     FileEntry, FolderPair, PreviewActionPage, PreviewSummary, SyncAction, SyncPlan,
 };
 use crate::path_normalization;
-use crate::persistence::Database;
+use crate::persistence::DatabaseHandle;
 use crate::scanner::{assert_destructive_scan_allowed, scan_directory, ScanIntegrity};
 use crate::state::{
     canonical_job_roots, AppState, HeavyJobKind, HeavyJobPermit, WorkCoordinator, WorkRequest,
@@ -122,7 +122,10 @@ pub(crate) fn build_preview(
     Ok((plan, left_scan.entries, right_scan.entries))
 }
 
-fn load_preview_snapshot(db: &Database, pair_id: &str) -> Result<Option<Vec<FileEntry>>, String> {
+fn load_preview_snapshot(
+    db: &dyn DatabaseHandle,
+    pair_id: &str,
+) -> Result<Option<Vec<FileEntry>>, String> {
     db.latest_snapshot(pair_id)
         .map_err(|e| e.to_string())
         .map(|snapshot| snapshot.map(|s| s.entries))
@@ -137,16 +140,13 @@ pub async fn preview_pair(
         return Err("pair id required for preview".into());
     }
 
-    let snapshot_entries = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        load_preview_snapshot(&db, &pair.id)?
-    };
-
     let work_coordinator = Arc::clone(&state.work_coordinator);
     let app_state = Arc::clone(&state);
+    let db = Arc::clone(&state.db);
     let roots = canonical_job_roots(&[&pair.left_path, &pair.right_path]);
     tauri::async_runtime::spawn_blocking(move || {
         let _permit = admit_preview(&work_coordinator, roots)?;
+        let snapshot_entries = load_preview_snapshot(db.as_ref(), &pair.id)?;
         let (plan, left_preconditions, right_preconditions) =
             build_preview(&pair, snapshot_entries.as_deref())?;
         let created_at = now_millis();

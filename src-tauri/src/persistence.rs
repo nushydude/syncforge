@@ -1,6 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -54,20 +55,42 @@ pub struct Database {
     conn: Connection,
 }
 
+/// Database access facade used by the application. Writes share one short-lived
+/// serialized connection, while reads open independent WAL connections.
+pub struct DatabaseManager {
+    path: PathBuf,
+    writer: Mutex<Database>,
+}
+
+/// Small compatibility surface for synchronous engine code and unit tests.
+/// Implementations must keep filesystem work and JSON processing outside their
+/// own database critical section where possible.
+pub trait DatabaseHandle {
+    fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>>;
+    fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()>;
+    fn save_run(&self, report: &RunReport) -> Result<()>;
+    fn insert_run_items(&self, items: &[RunItem]) -> Result<()>;
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let conn = Self::open_connection(path)?;
+        let db = Self { conn };
+        db.migrate()?;
+        Ok(db)
+    }
+
+    fn open_connection(path: &Path) -> Result<Connection> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;",
         )?;
-        let db = Self { conn };
-        db.migrate()?;
-        Ok(db)
+        Ok(conn)
     }
 
     fn migrate(&self) -> Result<()> {
@@ -130,11 +153,28 @@ impl Database {
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_snapshots_pair_id ON snapshots(pair_id);
+                CREATE INDEX IF NOT EXISTS idx_snapshots_pair_captured
+                    ON snapshots(pair_id, captured_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_runs_pair_id ON runs(pair_id);
+                CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_runs_pair_started
+                    ON runs(pair_id, started_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_run_items_run_id ON run_items(run_id);
+                CREATE INDEX IF NOT EXISTS idx_run_items_run_path
+                    ON run_items(run_id, path COLLATE NOCASE, id);
                 ",
             )?;
         }
+
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_snapshots_pair_captured
+                 ON snapshots(pair_id, captured_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_runs_pair_started
+                 ON runs(pair_id, started_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_run_items_run_path
+                 ON run_items(run_id, path COLLATE NOCASE, id);",
+        )?;
 
         self.migrate_watch_enabled()?;
         self.migrate_schedule_fields()?;
@@ -334,6 +374,38 @@ impl Database {
         Ok(())
     }
 
+    fn save_snapshot_json(&self, snapshot: &Snapshot, entries_json: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO snapshots (id, pair_id, captured_at, entries_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET pair_id = excluded.pair_id,
+                captured_at = excluded.captured_at, entries_json = excluded.entries_json",
+            params![snapshot.id, snapshot.pair_id, snapshot.captured_at, entries_json],
+        )?;
+        Self::prune_snapshots_for_pair(&tx, &snapshot.pair_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn save_run_json(&self, report: &RunReport, summary_json: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO runs (id, pair_id, started_at, finished_at, status, summary_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET finished_at = excluded.finished_at,
+                status = excluded.status, summary_json = excluded.summary_json",
+            params![
+                report.run_id,
+                report.pair_id,
+                report.started_at,
+                report.finished_at,
+                run_status_to_str(report.status),
+                summary_json
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn get_duplicate_scan(&self, id: &str) -> Result<Option<DuplicateScanJob>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, root, mode, status, phase, files_found, total_files,
@@ -501,6 +573,18 @@ impl Database {
         Ok(None)
     }
 
+    fn latest_snapshot_json(&self, pair_id: &str) -> Result<Option<(String, String, i64, String)>> {
+        self.conn
+            .query_row(
+                "SELECT id, pair_id, captured_at, entries_json FROM snapshots
+                 WHERE pair_id = ?1 ORDER BY captured_at DESC LIMIT 1",
+                params![pair_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn save_run(&self, report: &RunReport) -> Result<()> {
         let summary_json = serde_json::to_string(report)?;
         self.conn.execute(
@@ -573,6 +657,7 @@ impl Database {
     }
 
     /// Past runs, newest first. When `pair_id` is set, only runs for that pair.
+    #[allow(dead_code)]
     pub fn list_runs(&self, pair_id: Option<&str>) -> Result<Vec<RunReport>> {
         let mut reports = Vec::new();
         match pair_id {
@@ -603,6 +688,42 @@ impl Database {
         Ok(reports)
     }
 
+    fn list_run_json(&self, pair_id: Option<&str>) -> Result<Vec<String>> {
+        let mut stmt = match pair_id {
+            Some(_) => self.conn.prepare(
+                "SELECT summary_json FROM runs WHERE pair_id = ?1
+                 ORDER BY started_at DESC LIMIT ?2",
+            )?,
+            None => self
+                .conn
+                .prepare("SELECT summary_json FROM runs ORDER BY started_at DESC LIMIT ?1")?,
+        };
+        let mut values = Vec::new();
+        match pair_id {
+            Some(id) => {
+                for row in stmt.query_map(params![id, HISTORY_RUNS_LIMIT], |row| row.get(0))? {
+                    values.push(row?);
+                }
+            }
+            None => {
+                for row in stmt.query_map(params![HISTORY_RUNS_LIMIT], |row| row.get(0))? {
+                    values.push(row?);
+                }
+            }
+        }
+        Ok(values)
+    }
+
+    fn get_run_json(&self, run_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT summary_json FROM runs WHERE id = ?1", params![run_id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)]
     pub fn get_run(&self, run_id: &str) -> Result<Option<RunReport>> {
         let mut stmt = self.conn.prepare("SELECT summary_json FROM runs WHERE id = ?1")?;
         let mut rows = stmt.query(params![run_id])?;
@@ -641,6 +762,126 @@ impl Database {
 impl std::convert::From<std::io::Error> for PersistenceError {
     fn from(value: std::io::Error) -> Self {
         PersistenceError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(value)))
+    }
+}
+
+impl DatabaseManager {
+    pub fn open(path: &Path) -> Result<Self> {
+        let path = path.to_path_buf();
+        let writer = Database::open(&path)?;
+        Ok(Self { path, writer: Mutex::new(writer) })
+    }
+
+    fn read<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Database) -> Result<T>,
+    {
+        let conn = Database::open_connection(&self.path)?;
+        let db = Database { conn };
+        f(&db)
+    }
+
+    fn write<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Database) -> Result<T>,
+    {
+        let db = self.writer.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+        f(&db)
+    }
+
+    pub fn list_pairs(&self) -> Result<Vec<FolderPair>> {
+        self.read(Database::list_pairs)
+    }
+    pub fn save_pair(&self, pair: &FolderPair) -> Result<FolderPair> {
+        self.write(|db| db.save_pair(pair))
+    }
+    pub fn delete_pair(&self, id: &str) -> Result<()> {
+        self.write(|db| db.delete_pair(id))
+    }
+    pub fn get_pair(&self, id: &str) -> Result<Option<FolderPair>> {
+        self.read(|db| db.get_pair(id))
+    }
+    pub fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
+        let raw = self.read(|db| db.latest_snapshot_json(pair_id))?;
+        raw.map(|(id, pair_id, captured_at, entries_json)| {
+            Ok(Snapshot { id, pair_id, captured_at, entries: serde_json::from_str(&entries_json)? })
+        })
+        .transpose()
+    }
+    pub fn save_duplicate_scan(&self, job: &DuplicateScanJob) -> Result<()> {
+        self.write(|db| db.save_duplicate_scan(job))
+    }
+    pub fn get_duplicate_scan(&self, id: &str) -> Result<Option<DuplicateScanJob>> {
+        self.read(|db| db.get_duplicate_scan(id))
+    }
+    pub fn latest_duplicate_scan(&self) -> Result<Option<DuplicateScanJob>> {
+        self.read(Database::latest_duplicate_scan)
+    }
+    pub fn mark_duplicate_scans_interrupted(&self) -> Result<()> {
+        self.write(Database::mark_duplicate_scans_interrupted)
+    }
+    pub fn mark_sync_runs_interrupted(&self) -> Result<()> {
+        self.write(Database::mark_sync_runs_interrupted)
+    }
+    pub fn list_runs(&self, pair_id: Option<&str>) -> Result<Vec<RunReport>> {
+        let json = self.read(|db| db.list_run_json(pair_id))?;
+        json.into_iter().map(|value| serde_json::from_str(&value).map_err(Into::into)).collect()
+    }
+    pub fn get_run(&self, run_id: &str) -> Result<Option<RunReport>> {
+        self.read(|db| db.get_run_json(run_id))?
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+    pub fn list_run_items(&self, run_id: &str) -> Result<Vec<RunItem>> {
+        self.read(|db| db.list_run_items(run_id))
+    }
+}
+
+impl DatabaseHandle for Database {
+    fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
+        Database::latest_snapshot(self, pair_id)
+    }
+    fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+        Database::save_snapshot(self, snapshot)
+    }
+    fn save_run(&self, report: &RunReport) -> Result<()> {
+        Database::save_run(self, report)
+    }
+    fn insert_run_items(&self, items: &[RunItem]) -> Result<()> {
+        Database::insert_run_items(self, items)
+    }
+}
+
+impl DatabaseHandle for DatabaseManager {
+    fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
+        self.latest_snapshot(pair_id)
+    }
+    fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+        let entries_json = serde_json::to_string(&snapshot.entries)?;
+        self.write(|db| db.save_snapshot_json(snapshot, &entries_json))
+    }
+    fn save_run(&self, report: &RunReport) -> Result<()> {
+        let summary_json = serde_json::to_string(report)?;
+        self.write(|db| db.save_run_json(report, &summary_json))
+    }
+    fn insert_run_items(&self, items: &[RunItem]) -> Result<()> {
+        self.write(|db| db.insert_run_items(items))
+    }
+}
+
+#[cfg(test)]
+impl DatabaseHandle for Mutex<Database> {
+    fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
+        self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.latest_snapshot(pair_id)
+    }
+    fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+        self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.save_snapshot(snapshot)
+    }
+    fn save_run(&self, report: &RunReport) -> Result<()> {
+        self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.save_run(report)
+    }
+    fn insert_run_items(&self, items: &[RunItem]) -> Result<()> {
+        self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.insert_run_items(items)
     }
 }
 
@@ -772,6 +1013,9 @@ mod tests {
         DuplicateMatchMode, DuplicateScanJob, DuplicateScanPhase, DuplicateScanStatus,
     };
     use crate::models::Filters;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn temp_db() -> (tempfile::TempDir, Database) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -799,6 +1043,87 @@ mod tests {
         let busy_timeout: i64 =
             db.conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0)).expect("busy_timeout");
         assert_eq!(busy_timeout, 5000);
+    }
+
+    #[test]
+    fn manager_reader_runs_while_writer_connection_is_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = Arc::new(DatabaseManager::open(&dir.path().join("test.db")).expect("open"));
+        manager
+            .save_pair(&FolderPair {
+                id: new_pair_id(),
+                name: "concurrent".into(),
+                left_path: "/a".into(),
+                right_path: "/b".into(),
+                mode: SyncMode::Echo,
+                filters: Filters::default(),
+                conflict_policy: ConflictPolicy::NewerWins,
+                enabled: true,
+                watch_enabled: false,
+                schedule_enabled: false,
+                schedule_cron: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("seed pair");
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_manager = Arc::clone(&manager);
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            let db = writer_manager.writer.lock().expect("writer lock");
+            db.conn.execute_batch("BEGIN IMMEDIATE").expect("begin");
+            writer_barrier.wait();
+            thread::sleep(Duration::from_millis(150));
+            db.conn.execute_batch("COMMIT").expect("commit");
+        });
+        barrier.wait();
+        let start = Instant::now();
+        assert_eq!(manager.list_pairs().expect("read").len(), 1);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        writer.join().expect("writer");
+    }
+
+    #[test]
+    fn paging_queries_use_ordered_indexes() {
+        let (_dir, db) = temp_db();
+        let pair_id = new_pair_id();
+        db.save_pair(&FolderPair {
+            id: pair_id.clone(),
+            name: "indexed".into(),
+            left_path: "/a".into(),
+            right_path: "/b".into(),
+            mode: SyncMode::Echo,
+            filters: Filters::default(),
+            conflict_policy: ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .expect("pair");
+        let run_id = new_pair_id();
+        db.save_run(&RunReport {
+            run_id: run_id.clone(),
+            pair_id: pair_id.clone(),
+            started_at: 1,
+            finished_at: Some(2),
+            status: RunStatus::Completed,
+            files_copied: 0,
+            files_deleted: 0,
+            bytes_transferred: 0,
+            errors: vec![],
+        })
+        .expect("run");
+        let pair_plan: String = db.conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT summary_json FROM runs WHERE pair_id = ?1 ORDER BY started_at DESC LIMIT 100",
+            params![pair_id], |row| row.get(3)).expect("history plan");
+        assert!(pair_plan.contains("idx_runs_pair_started"), "{pair_plan}");
+        let item_plan: String = db.conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT id FROM run_items WHERE run_id = ?1 ORDER BY path COLLATE NOCASE, id LIMIT 100",
+            params![run_id], |row| row.get(3)).expect("item plan");
+        assert!(item_plan.contains("idx_run_items_run_path"), "{item_plan}");
     }
 
     #[test]
