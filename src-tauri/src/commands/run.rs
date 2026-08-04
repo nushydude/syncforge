@@ -101,7 +101,7 @@ pub async fn run_pair(
     let work_coordinator = Arc::clone(&state.work_coordinator);
     let roots = canonical_job_roots(&[&pair.left_path, &pair.right_path]);
 
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let task_result = tauri::async_runtime::spawn_blocking(move || {
         let _permit = admit_manual_run(&work_coordinator, roots)?;
         let mut progress_sink = ProgressCoalescer::system(|progress| {
             let _ = emit_event(&app_emit, "sync://progress", &progress);
@@ -113,9 +113,11 @@ pub async fn run_pair(
         result
     })
     .await
-    .map_err(|e| format!("sync run task failed: {e}"))?;
+    .map_err(|e| format!("sync run task failed: {e}"));
 
     release_sync_slot(app.clone(), &state_inner, &pair_id, &cancel);
+
+    let result = task_result?;
 
     if let Ok(ref report) = result {
         if report.status == RunStatus::Completed || report.status == RunStatus::Failed {

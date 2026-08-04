@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -91,9 +92,9 @@ pub(crate) fn build_preview(
     let left_path = path_normalization::to_long_path(&pair.left_path);
     let right_path = path_normalization::to_long_path(&pair.right_path);
 
-    let left_scan = scan_directory(Path::new(&left_path), &pair.filters)
+    let mut left_scan = scan_directory(Path::new(&left_path), &pair.filters)
         .map_err(|e| format!("scan left failed: {e}"))?;
-    let right_scan = scan_directory(Path::new(&right_path), &pair.filters)
+    let mut right_scan = scan_directory(Path::new(&right_path), &pair.filters)
         .map_err(|e| format!("scan right failed: {e}"))?;
 
     assert_destructive_scan_allowed(pair.mode, &left_scan, &right_scan)?;
@@ -119,7 +120,93 @@ pub(crate) fn build_preview(
     {
         return Err("Preview requires attention: a content hash could not be read safely. Fix access and preview again.".into());
     }
+    let mut preview_hash_bytes = 0;
+    let mut preview_hash_files = 0;
+    populate_preview_hashes_for_actions(
+        &mut left_scan.entries,
+        Path::new(&left_path),
+        &plan.actions,
+        &mut preview_hash_bytes,
+        &mut preview_hash_files,
+    )?;
+    populate_preview_hashes_for_actions(
+        &mut right_scan.entries,
+        Path::new(&right_path),
+        &plan.actions,
+        &mut preview_hash_bytes,
+        &mut preview_hash_files,
+    )?;
     Ok((plan, left_scan.entries, right_scan.entries))
+}
+
+fn populate_preview_hashes_for_actions(
+    entries: &mut [FileEntry],
+    root: &Path,
+    actions: &[SyncAction],
+    hashed_bytes: &mut u64,
+    hashed_files: &mut usize,
+) -> Result<(), String> {
+    const PREVIEW_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
+    const PREVIEW_SUBTREE_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
+    const PREVIEW_SUBTREE_HASH_MAX_FILES: usize = 10_000;
+    let paths: HashSet<&str> = actions
+        .iter()
+        .map(|action| match action {
+            SyncAction::CopyLeftToRight { path }
+            | SyncAction::CopyRightToLeft { path }
+            | SyncAction::DeleteLeft { path }
+            | SyncAction::DeleteRight { path }
+            | SyncAction::CreateDirLeft { path }
+            | SyncAction::CreateDirRight { path }
+            | SyncAction::Conflict { path, .. }
+            | SyncAction::Skip { path, .. } => path.as_str(),
+        })
+        .collect();
+    let deleted_directories: HashSet<&str> = actions
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::DeleteLeft { path } | SyncAction::DeleteRight { path } => {
+                Some(path.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    for entry in entries.iter_mut() {
+        let under_deleted_directory = entry
+            .relative_path
+            .split('/')
+            .scan(String::new(), |prefix, part| {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+                Some(deleted_directories.contains(prefix.as_str()))
+            })
+            .any(|is_match| is_match);
+        let is_selected = paths.contains(entry.relative_path.as_str()) || under_deleted_directory;
+        if !is_selected || entry.is_dir || entry.size == 0 {
+            continue;
+        }
+        if entry.size > PREVIEW_HASH_MAX_BYTES {
+            return Err(format!(
+                "preview cannot safely validate large file at {}; reduce the workload or preview again",
+                entry.relative_path
+            ));
+        }
+        *hashed_bytes = (*hashed_bytes).saturating_add(entry.size);
+        *hashed_files += 1;
+        if *hashed_bytes > PREVIEW_SUBTREE_HASH_MAX_BYTES
+            || *hashed_files > PREVIEW_SUBTREE_HASH_MAX_FILES
+        {
+            return Err("preview content exceeds the bounded validation budget".into());
+        }
+        let path = root.join(entry.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        entry.hash =
+            Some(crate::hashing::hash_file(&path).map_err(|error| {
+                format!("content hash failed at {}: {error}", entry.relative_path)
+            })?);
+    }
+    Ok(())
 }
 
 fn load_preview_snapshot(
@@ -151,16 +238,18 @@ pub async fn preview_pair(
             build_preview(&pair, snapshot_entries.as_deref())?;
         let created_at = now_millis();
         let fingerprint = config_fingerprint(&pair);
+        let mut summary = preview_summary(&plan, String::new(), fingerprint.clone(), created_at);
         let mut previews = app_state.preview_plans.lock().map_err(|e| e.to_string())?;
         let plan_id = previews.insert(
             pair.id.clone(),
             fingerprint.clone(),
-            plan.clone(),
+            plan,
             left_preconditions,
             right_preconditions,
             created_at,
         )?;
-        Ok(preview_summary(&plan, plan_id, fingerprint, created_at))
+        summary.plan_id = plan_id;
+        Ok(summary)
     })
     .await
     .map_err(|e| format!("preview task failed: {e}"))?
@@ -182,6 +271,25 @@ pub fn get_preview_actions(
         &fingerprint,
         cursor.unwrap_or(0),
         limit,
+        now_millis(),
+    )
+}
+
+#[tauri::command]
+pub fn get_preview_conflicts(
+    plan_id: String,
+    pair: FolderPair,
+    cursor: Option<usize>,
+    limit: Option<usize>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<PreviewActionPage, String> {
+    let fingerprint = config_fingerprint(&pair);
+    state.preview_plans.lock().map_err(|e| e.to_string())?.get_conflicts_page(
+        &plan_id,
+        &pair.id,
+        &fingerprint,
+        cursor.unwrap_or(0),
+        limit.unwrap_or(PREVIEW_PAGE_MAX),
         now_millis(),
     )
 }
@@ -363,6 +471,7 @@ mod tests {
                 modified_nanos: 0,
                 is_dir: false,
                 hash: None,
+                deleted: false,
             }],
         })
         .expect("snapshot");

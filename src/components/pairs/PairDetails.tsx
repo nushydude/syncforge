@@ -10,6 +10,7 @@ import { beginEdit, previewSelectedPair } from "../../store/pairsStore";
 import {
   cancelConflictResolution,
   confirmConflictResolutionAndRun,
+  loadConflictPage,
   runSelectedPair,
   setConflictResolution,
 } from "../../store/runStore";
@@ -214,6 +215,17 @@ export function PairDetails({ pair }: PairDetailsProps) {
           onChoose={setConflictResolution}
           onConfirm={() => void confirmConflictResolutionAndRun()}
           onCancel={cancelConflictResolution}
+          page={Math.floor(pendingConflicts.cursor / 200) + 1}
+          total={pendingConflicts.total}
+          hasNextPage={pendingConflicts.nextCursor != null}
+          hasPreviousPage={pendingConflicts.cursor > 0}
+          loading={pendingConflicts.loading}
+          onNextPage={() =>
+            void loadConflictPage(pendingConflicts.nextCursor ?? 0)
+          }
+          onPreviousPage={() =>
+            void loadConflictPage(Math.max(0, pendingConflicts.cursor - 200))
+          }
         />
       )}
     </section>

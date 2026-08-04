@@ -6,6 +6,7 @@ export interface FileEntry {
   modifiedNanos?: number;
   isDir: boolean;
   hash?: string;
+  deleted?: boolean;
 }
 
 export type SyncAction =

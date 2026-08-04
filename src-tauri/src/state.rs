@@ -28,6 +28,7 @@ struct StoredPreviewPlan {
     plan: SyncPlan,
     left_preconditions: Vec<crate::models::FileEntry>,
     right_preconditions: Vec<crate::models::FileEntry>,
+    conflict_indexes: Vec<usize>,
     estimated_bytes: usize,
 }
 
@@ -52,20 +53,21 @@ impl PreviewPlanStore {
     ) -> Result<String, String> {
         self.remove_expired(now);
         let id = uuid::Uuid::new_v4().to_string();
-        let estimated_bytes = plan
-            .actions
-            .iter()
-            .map(|action| serde_json::to_vec(action).map(|bytes| bytes.len()).unwrap_or(256))
-            .sum::<usize>()
-            + left_preconditions
-                .iter()
-                .chain(right_preconditions.iter())
-                .map(|entry| serde_json::to_vec(entry).map(|bytes| bytes.len()).unwrap_or(128))
-                .sum::<usize>();
+        let estimated_bytes = serde_json::to_vec(&plan).map(|bytes| bytes.len()).unwrap_or(0)
+            + serde_json::to_vec(&left_preconditions).map(|bytes| bytes.len()).unwrap_or(0)
+            + serde_json::to_vec(&right_preconditions).map(|bytes| bytes.len()).unwrap_or(0);
         if estimated_bytes > PREVIEW_PLAN_MAX_BYTES {
             return Err("preview plan exceeds the bounded storage limit".into());
         }
         self.bytes = self.bytes.saturating_add(estimated_bytes);
+        let conflict_indexes = plan
+            .actions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, action)| {
+                matches!(action, crate::models::SyncAction::Conflict { .. }).then_some(index)
+            })
+            .collect();
         self.plans.push_back(StoredPreviewPlan {
             id: id.clone(),
             pair_id,
@@ -74,6 +76,7 @@ impl PreviewPlanStore {
             plan,
             left_preconditions,
             right_preconditions,
+            conflict_indexes,
             estimated_bytes,
         });
         self.trim_to_bounds();
@@ -89,6 +92,9 @@ impl PreviewPlanStore {
         limit: usize,
         now: i64,
     ) -> Result<PreviewActionPage, String> {
+        if limit == 0 {
+            return Err("preview page limit must be greater than zero".into());
+        }
         self.remove_expired(now);
         let stored = self
             .plans
@@ -105,6 +111,42 @@ impl PreviewPlanStore {
             cursor,
             next_cursor: (end < stored.plan.actions.len()).then_some(end),
             actions: stored.plan.actions[cursor..end].to_vec(),
+        })
+    }
+
+    pub fn get_conflicts_page(
+        &mut self,
+        id: &str,
+        pair_id: &str,
+        config_fingerprint: &str,
+        cursor: usize,
+        limit: usize,
+        now: i64,
+    ) -> Result<PreviewActionPage, String> {
+        if limit == 0 {
+            return Err("preview conflict page limit must be greater than zero".into());
+        }
+        self.remove_expired(now);
+        let stored = self
+            .plans
+            .iter()
+            .find(|plan| plan.id == id)
+            .ok_or_else(|| "preview plan expired or not found".to_string())?;
+        if stored.pair_id != pair_id || stored.config_fingerprint != config_fingerprint {
+            return Err("preview plan no longer matches this pair configuration".into());
+        }
+        let page_limit = limit.min(PREVIEW_PAGE_MAX);
+        let cursor = cursor.min(stored.conflict_indexes.len());
+        let end = cursor.saturating_add(page_limit).min(stored.conflict_indexes.len());
+        let actions = stored.conflict_indexes[cursor..end]
+            .iter()
+            .map(|index| stored.plan.actions[*index].clone())
+            .collect();
+        Ok(PreviewActionPage {
+            plan_id: stored.id.clone(),
+            cursor,
+            next_cursor: (end < stored.conflict_indexes.len()).then_some(end),
+            actions,
         })
     }
 

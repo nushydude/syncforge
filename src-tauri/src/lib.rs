@@ -131,6 +131,7 @@ pub fn run() {
             commands::pairs::delete_pair,
             commands::preview::preview_pair,
             commands::preview::get_preview_actions,
+            commands::preview::get_preview_conflicts,
             commands::run::run_pair,
             commands::run::cancel_run,
             commands::history::get_history,

@@ -88,6 +88,7 @@ pub fn build_sync_plan(
     }
 
     ensure_parent_dirs(&mut actions, mode, left, right);
+    collapse_redundant_directory_deletes(&mut actions, left, right);
     sort_actions(&mut actions);
 
     let hash_warnings = ctx.hash_warnings.borrow().clone();
@@ -242,9 +243,13 @@ fn plan_one_sided_file(
         }
         Some(snap) => {
             let (left, right) = if present_is_left {
-                (present.clone(), snap.clone())
+                let mut deleted = snap.clone();
+                deleted.deleted = true;
+                (present.clone(), deleted)
             } else {
-                (snap.clone(), present.clone())
+                let mut deleted = snap.clone();
+                deleted.deleted = true;
+                (deleted, present.clone())
             };
             apply_conflict_policy(actions, path, &left, &right, conflict_policy);
         }
@@ -290,13 +295,22 @@ fn apply_conflict_policy(
             });
         }
         ConflictPolicy::NewerWins => {
-            push_newer_wins_copy(actions, path, left, right);
+            if left.deleted {
+                // A tombstone has no trustworthy deletion timestamp. Preserve
+                // the live file rather than allowing a historical snapshot
+                // time to delete a newer surviving copy.
+                actions.push(SyncAction::CopyRightToLeft { path: path.to_string() });
+            } else if right.deleted {
+                actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
+            } else {
+                push_newer_wins_copy(actions, path, left, right);
+            }
         }
         ConflictPolicy::Left => {
-            actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
+            actions.push(resolve_conflict_action(ConflictResolution::Left, path, left, right));
         }
         ConflictPolicy::Right => {
-            actions.push(SyncAction::CopyRightToLeft { path: path.to_string() });
+            actions.push(resolve_conflict_action(ConflictResolution::Right, path, left, right));
         }
         ConflictPolicy::KeepBoth => {
             actions.push(SyncAction::Skip {
@@ -426,6 +440,32 @@ fn parent_paths(path: &str) -> Vec<String> {
 
 fn sort_actions(actions: &mut [SyncAction]) {
     actions.sort_by(|a, b| action_path(a).cmp(action_path(b)));
+}
+
+fn collapse_redundant_directory_deletes(
+    actions: &mut Vec<SyncAction>,
+    left: &[FileEntry],
+    right: &[FileEntry],
+) {
+    let mut deleted_dirs = HashSet::new();
+    actions.retain(|action| {
+        let (path, side, is_dir) = match action {
+            SyncAction::DeleteLeft { path } => {
+                (path, EntrySide::Left, contains_directory(left, path))
+            }
+            SyncAction::DeleteRight { path } => {
+                (path, EntrySide::Right, contains_directory(right, path))
+            }
+            _ => return true,
+        };
+        if parent_paths(path).into_iter().any(|parent| deleted_dirs.contains(&(side, parent))) {
+            return false;
+        }
+        if is_dir {
+            deleted_dirs.insert((side, path.clone()));
+        }
+        true
+    });
 }
 
 fn action_path(action: &SyncAction) -> &str {
@@ -583,11 +623,23 @@ fn join_relative(base: &std::path::Path, relative: &str) -> PathBuf {
 pub fn resolve_conflict_action(
     resolution: ConflictResolution,
     path: &str,
-    _left: &FileEntry,
-    _right: &FileEntry,
+    left: &FileEntry,
+    right: &FileEntry,
 ) -> SyncAction {
     match resolution {
+        ConflictResolution::Left if left.deleted => {
+            SyncAction::DeleteRight { path: path.to_string() }
+        }
+        ConflictResolution::Left if right.deleted => {
+            SyncAction::CopyLeftToRight { path: path.to_string() }
+        }
         ConflictResolution::Left => SyncAction::CopyLeftToRight { path: path.to_string() },
+        ConflictResolution::Right if right.deleted => {
+            SyncAction::DeleteLeft { path: path.to_string() }
+        }
+        ConflictResolution::Right if left.deleted => {
+            SyncAction::CopyRightToLeft { path: path.to_string() }
+        }
         ConflictResolution::Right => SyncAction::CopyRightToLeft { path: path.to_string() },
         ConflictResolution::KeepBoth => {
             SyncAction::Skip { path: path.to_string(), reason: "keep both (user choice)".into() }
@@ -628,6 +680,7 @@ mod tests {
             modified_nanos: nanos,
             is_dir: false,
             hash: None,
+            deleted: false,
         }
     }
 
@@ -639,6 +692,7 @@ mod tests {
             modified_nanos: 0,
             is_dir: true,
             hash: None,
+            deleted: false,
         }
     }
 
@@ -1170,5 +1224,17 @@ mod tests {
             None,
         );
         assert!(has_copy_ltr(&plan, "both.txt"));
+    }
+
+    #[test]
+    fn newer_wins_keeps_newer_modified_file_against_delete() {
+        let plan = plan(
+            SyncMode::Synchronize,
+            ConflictPolicy::NewerWins,
+            &[file_with_nanos("doc.txt", 20, 200, 0)],
+            &[],
+            Some(&[file_with_nanos("doc.txt", 10, 100, 0)]),
+        );
+        assert!(has_copy_ltr(&plan, "doc.txt"));
     }
 }

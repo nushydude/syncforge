@@ -19,6 +19,10 @@ export interface PendingConflicts {
   pair: FolderPair;
   conflicts: ConflictAction[];
   planId?: string;
+  cursor: number;
+  nextCursor?: number;
+  total: number;
+  loading: boolean;
 }
 
 export interface RunStoreState {
@@ -53,6 +57,7 @@ let unlistenWatchSkipped: (() => void) | null = null;
 let activeRunId: string | null = null;
 let activePairId: string | null = null;
 let runInFlight = false;
+let conflictPageRequestId = 0;
 
 function emit() {
   listeners.forEach((l) => l());
@@ -186,17 +191,34 @@ export async function runSelectedPair(
 
   runInFlight = true;
   try {
+    let discoveredPlanId: string | undefined;
     if (pair.conflictPolicy === "ask") {
       try {
         const plan = await previewApi.previewPair(pair);
-        const conflicts = listConflictActions(plan);
+        discoveredPlanId = plan.planId;
+        const firstPage = plan.conflictCount
+          ? await previewApi.getPreviewConflicts(pair, plan.planId ?? "", 0)
+          : { actions: plan.actions, nextCursor: undefined };
+        const conflicts = listConflictActions({
+          ...plan,
+          actions: firstPage.actions,
+        });
         if (conflicts.length > 0) {
           state = {
             ...state,
-            pendingConflicts: { pair, conflicts, planId: plan.planId },
+            pendingConflicts: {
+              pair,
+              conflicts,
+              planId: plan.planId,
+              cursor: 0,
+              nextCursor: firstPage.nextCursor,
+              total: plan.conflictCount ?? conflicts.length,
+              loading: false,
+            },
             conflictResolutions: {},
             error: null,
           };
+          conflictPageRequestId++;
           emit();
           return null;
         }
@@ -214,13 +236,60 @@ export async function runSelectedPair(
     return await executeRun(
       pair,
       {},
-      reusablePlan?.pairId === pair.id ? reusablePlan.planId : undefined,
+      discoveredPlanId ??
+        (reusablePlan?.pairId === pair.id ? reusablePlan.planId : undefined),
     );
   } finally {
     if (!state.pendingConflicts) {
       runInFlight = false;
     }
   }
+}
+
+export async function loadConflictPage(cursor: number): Promise<void> {
+  const pending = state.pendingConflicts;
+  if (!pending || pending.loading || !pending.planId) return;
+  const requestId = ++conflictPageRequestId;
+  state = { ...state, pendingConflicts: { ...pending, loading: true } };
+  emit();
+  try {
+    const page = await previewApi.getPreviewConflicts(
+      pending.pair,
+      pending.planId,
+      cursor,
+    );
+    if (
+      requestId !== conflictPageRequestId ||
+      state.pendingConflicts?.planId !== pending.planId
+    ) {
+      return;
+    }
+    state = {
+      ...state,
+      pendingConflicts: {
+        ...pending,
+        conflicts: page.actions.filter(
+          (action): action is ConflictAction => action.kind === "conflict",
+        ),
+        cursor,
+        nextCursor: page.nextCursor,
+        loading: false,
+      },
+    };
+  } catch (e) {
+    if (
+      requestId !== conflictPageRequestId ||
+      state.pendingConflicts?.planId !== pending.planId
+    ) {
+      return;
+    }
+    state = {
+      ...state,
+      pendingConflicts: { ...pending, loading: false },
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+  emit();
 }
 
 export function setConflictResolution(
@@ -235,6 +304,7 @@ export function setConflictResolution(
 }
 
 export function cancelConflictResolution(): void {
+  conflictPageRequestId++;
   state = {
     ...state,
     pendingConflicts: null,
@@ -296,6 +366,7 @@ export function resetRunStoreForTests(): void {
   activeRunId = null;
   activePairId = null;
   runInFlight = false;
+  conflictPageRequestId = 0;
   state = {
     running: false,
     runningPairId: null,

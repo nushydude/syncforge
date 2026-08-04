@@ -28,3 +28,17 @@ export function getPreviewActions(
     limit,
   });
 }
+
+export function getPreviewConflicts(
+  pair: FolderPair,
+  planId: string,
+  cursor = 0,
+  limit = 200,
+): Promise<PreviewActionPage> {
+  return invoke<PreviewActionPage>("get_preview_conflicts", {
+    pair,
+    planId,
+    cursor,
+    limit,
+  });
+}

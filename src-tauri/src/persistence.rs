@@ -50,6 +50,7 @@ const SNAPSHOT_RETAIN_COUNT: usize = 3;
 
 /// Default cap for history list queries (newest runs first).
 const HISTORY_RUNS_LIMIT: i64 = 100;
+pub const RUN_ITEMS_PAGE_MAX: usize = 200;
 
 pub struct Database {
     conn: Connection,
@@ -326,8 +327,17 @@ impl Database {
         .collect()
     }
 
+    #[allow(dead_code)]
     pub fn save_duplicate_scan(&self, job: &DuplicateScanJob) -> Result<()> {
         let result_json = job.result.as_ref().map(serde_json::to_string).transpose()?;
+        self.save_duplicate_scan_json(job, result_json.as_deref())
+    }
+
+    fn save_duplicate_scan_json(
+        &self,
+        job: &DuplicateScanJob,
+        result_json: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO duplicate_scans (
                 id, root, mode, status, phase, files_found, total_files,
@@ -734,6 +744,7 @@ impl Database {
         Ok(None)
     }
 
+    #[allow(dead_code)]
     pub fn list_run_items(&self, run_id: &str) -> Result<Vec<RunItem>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, run_id, path, action, status, message, bytes
@@ -756,6 +767,42 @@ impl Database {
             });
         }
         Ok(items)
+    }
+
+    pub fn list_run_items_page(
+        &self,
+        run_id: &str,
+        cursor: usize,
+        limit: usize,
+    ) -> Result<(Vec<RunItem>, bool)> {
+        let limit = limit.min(RUN_ITEMS_PAGE_MAX);
+        if limit == 0 {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
+        let cursor = i64::try_from(cursor).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let query_limit = i64::try_from(limit + 1).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, path, action, status, message, bytes
+             FROM run_items WHERE run_id = ?1
+             ORDER BY path COLLATE NOCASE, id LIMIT ?2 OFFSET ?3",
+        )?;
+        let mut items = Vec::new();
+        let mut rows = stmt.query(params![run_id, query_limit, cursor])?;
+        while let Some(row) = rows.next()? {
+            let bytes: Option<i64> = row.get(6)?;
+            items.push(RunItem {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                path: row.get(2)?,
+                action: row.get(3)?,
+                status: row.get(4)?,
+                message: row.get(5)?,
+                bytes: bytes.map(|b| b as u64),
+            });
+        }
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        Ok((items, has_more))
     }
 }
 
@@ -809,7 +856,8 @@ impl DatabaseManager {
         .transpose()
     }
     pub fn save_duplicate_scan(&self, job: &DuplicateScanJob) -> Result<()> {
-        self.write(|db| db.save_duplicate_scan(job))
+        let result_json = job.result.as_ref().map(serde_json::to_string).transpose()?;
+        self.write(|db| db.save_duplicate_scan_json(job, result_json.as_deref()))
     }
     pub fn get_duplicate_scan(&self, id: &str) -> Result<Option<DuplicateScanJob>> {
         self.read(|db| db.get_duplicate_scan(id))
@@ -832,8 +880,13 @@ impl DatabaseManager {
             .map(|value| serde_json::from_str(&value).map_err(Into::into))
             .transpose()
     }
-    pub fn list_run_items(&self, run_id: &str) -> Result<Vec<RunItem>> {
-        self.read(|db| db.list_run_items(run_id))
+    pub fn list_run_items_page(
+        &self,
+        run_id: &str,
+        cursor: usize,
+        limit: usize,
+    ) -> Result<(Vec<RunItem>, bool)> {
+        self.read(|db| db.list_run_items_page(run_id, cursor, limit))
     }
 }
 
@@ -1372,6 +1425,7 @@ mod tests {
                 modified_nanos: 123,
                 is_dir: false,
                 hash: None,
+                deleted: false,
             }],
         };
         db.save_snapshot(&snapshot).expect("save snapshot");

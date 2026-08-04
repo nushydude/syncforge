@@ -30,6 +30,7 @@ export interface RunItem {
 export interface RunDetail {
   report: RunReport;
   items: RunItem[];
+  nextCursor?: number;
 }
 
 export interface Snapshot {

@@ -8,6 +8,7 @@ export interface HistoryStoreState {
   detail: RunDetail | null;
   loading: boolean;
   detailLoading: boolean;
+  detailPageLoading: boolean;
   error: string | null;
 }
 
@@ -20,6 +21,7 @@ let state: HistoryStoreState = {
   detail: null,
   loading: false,
   detailLoading: false,
+  detailPageLoading: false,
   error: null,
 };
 
@@ -54,6 +56,7 @@ export async function loadHistory(pairFilter?: string | null): Promise<void> {
     selectedRunId: null,
     detail: null,
     detailLoading: false,
+    detailPageLoading: false,
   };
   emit();
 
@@ -86,6 +89,7 @@ export async function selectRun(runId: string): Promise<void> {
     ...state,
     selectedRunId: runId,
     detailLoading: true,
+    detailPageLoading: false,
     detail: null,
     error: null,
   };
@@ -115,12 +119,54 @@ export async function selectRun(runId: string): Promise<void> {
   emit();
 }
 
+export async function loadMoreRunItems(): Promise<void> {
+  const detail = state.detail;
+  const runId = state.selectedRunId;
+  if (!detail || !runId || detail.nextCursor == null || state.detailPageLoading)
+    return;
+  const requestId = historyDetailRequestId;
+  state = { ...state, detailPageLoading: true };
+  emit();
+  try {
+    const next = await historyApi.getRunDetail(runId, detail.nextCursor);
+    if (requestId !== historyDetailRequestId || !next) {
+      if (requestId === historyDetailRequestId) {
+        state = { ...state, detailPageLoading: false };
+        emit();
+      }
+      return;
+    }
+    state = {
+      ...state,
+      detailPageLoading: false,
+      detail: {
+        ...detail,
+        items: [...detail.items, ...next.items],
+        nextCursor: next.nextCursor,
+      },
+    };
+    emit();
+  } catch (e) {
+    if (requestId !== historyDetailRequestId) {
+      return;
+    }
+    state = {
+      ...state,
+      detailPageLoading: false,
+      error: e instanceof Error ? e.message : String(e),
+    };
+    emit();
+  }
+}
+
 export function clearRunSelection(): void {
+  historyDetailRequestId++;
   state = {
     ...state,
     selectedRunId: null,
     detail: null,
     detailLoading: false,
+    detailPageLoading: false,
   };
   emit();
 }
@@ -136,6 +182,7 @@ export function resetHistoryStoreForTests(): void {
     detail: null,
     loading: false,
     detailLoading: false,
+    detailPageLoading: false,
     error: null,
   };
   emit();

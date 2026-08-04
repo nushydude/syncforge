@@ -1,15 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useHistoryStore } from "../../hooks/useHistoryStore";
+import { loadMoreRunItems } from "../../store/historyStore";
 import { selectPairsList, usePairsStore } from "../../hooks/usePairsStore";
 import { exportRunAsCsv, exportRunAsJson } from "../../lib/exportRun";
 import {
   formatBytes,
   formatDuration,
+  statsFromReport,
   statsFromItems,
 } from "../../lib/syncStats";
 import type { HistoryStoreState } from "../../store/historyStore";
-
-const RUN_DETAIL_PAGE_SIZE = 200;
 
 function formatTimestamp(ms: number): string {
   return new Date(ms).toLocaleString();
@@ -18,11 +18,12 @@ function formatTimestamp(ms: number): string {
 const selectRunDetailHistory = (s: HistoryStoreState) => ({
   detail: s.detail,
   detailLoading: s.detailLoading,
+  detailPageLoading: s.detailPageLoading,
   error: s.error,
 });
 
 export function RunDetail() {
-  const { detail, detailLoading, error } = useHistoryStore(
+  const { detail, detailLoading, detailPageLoading, error } = useHistoryStore(
     selectRunDetailHistory,
   );
   const pairs = usePairsStore(selectPairsList);
@@ -30,11 +31,6 @@ export function RunDetail() {
     () => pairs.map((p) => ({ id: p.id, name: p.name })),
     [pairs],
   );
-  const [visibleCount, setVisibleCount] = useState(RUN_DETAIL_PAGE_SIZE);
-
-  useEffect(() => {
-    setVisibleCount(RUN_DETAIL_PAGE_SIZE);
-  }, [detail?.report.runId]);
 
   if (detailLoading) {
     return <p className="history-status">Loading run details…</p>;
@@ -53,12 +49,14 @@ export function RunDetail() {
   }
 
   const { report, items } = detail;
-  const stats = statsFromItems(report, items);
+  const stats =
+    detail.nextCursor != null
+      ? statsFromReport(report)
+      : statsFromItems(report, items);
   const pairName =
     pairNames.find((p) => p.id === report.pairId)?.name ?? report.pairId;
 
-  const visibleItems = items.slice(0, visibleCount);
-  const hasMore = items.length > visibleCount;
+  const hasMore = detail.nextCursor != null;
 
   const handleExportJson = () => exportRunAsJson(detail);
   const handleExportCsv = () => exportRunAsCsv(detail);
@@ -75,10 +73,20 @@ export function RunDetail() {
           </p>
         </div>
         <div className="run-detail-actions">
-          <button type="button" onClick={handleExportJson}>
+          <button
+            type="button"
+            onClick={handleExportJson}
+            disabled={hasMore}
+            title={hasMore ? "Load all items before exporting" : undefined}
+          >
             Export JSON
           </button>
-          <button type="button" onClick={handleExportCsv}>
+          <button
+            type="button"
+            onClick={handleExportCsv}
+            disabled={hasMore}
+            title={hasMore ? "Load all items before exporting" : undefined}
+          >
             Export CSV
           </button>
         </div>
@@ -107,7 +115,10 @@ export function RunDetail() {
         </div>
         <div>
           <dt>Item records</dt>
-          <dd>{items.length}</dd>
+          <dd>
+            {items.length}
+            {hasMore ? " loaded" : ""}
+          </dd>
         </div>
       </dl>
 
@@ -123,7 +134,10 @@ export function RunDetail() {
       )}
 
       <section className="run-detail-items">
-        <h4>Items ({items.length})</h4>
+        <h4>
+          Items ({items.length}
+          {hasMore ? "+" : ""})
+        </h4>
         {items.length === 0 ? (
           <p className="history-status">No per-file records for this run.</p>
         ) : (
@@ -140,7 +154,7 @@ export function RunDetail() {
                   </tr>
                 </thead>
                 <tbody>
-                  {visibleItems.map((item) => (
+                  {items.map((item) => (
                     <tr key={item.id}>
                       <td className="run-detail-path">{item.path}</td>
                       <td>{item.action}</td>
@@ -158,13 +172,10 @@ export function RunDetail() {
               <button
                 type="button"
                 className="run-detail-load-more"
-                onClick={() =>
-                  setVisibleCount((n) =>
-                    Math.min(n + RUN_DETAIL_PAGE_SIZE, items.length),
-                  )
-                }
+                disabled={detailPageLoading}
+                onClick={() => void loadMoreRunItems()}
               >
-                Load more ({items.length - visibleCount} remaining)
+                {detailPageLoading ? "Loading…" : "Load more"}
               </button>
             )}
           </>

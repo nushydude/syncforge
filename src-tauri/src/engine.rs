@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use jwalk::WalkDir;
 use uuid::Uuid;
 
 use crate::diff::{apply_conflict_resolutions, build_sync_plan, DiffOptions};
@@ -161,8 +162,29 @@ pub(crate) fn commit_temp_file(temp: &Path, dest: &Path) -> io::Result<()> {
     if fs::rename(temp, dest).is_ok() {
         return Ok(());
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let temp_wide: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let dest_wide: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
+        let replaced = unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                temp_wide.as_ptr(),
+                dest_wide.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+                    | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if replaced != 0 {
+            return Ok(());
+        }
+        Err(io::Error::last_os_error())
+    }
+    #[cfg(not(windows))]
     fs::copy(temp, dest)?;
+    #[cfg(not(windows))]
     fs::remove_file(temp)?;
+    #[cfg(not(windows))]
     Ok(())
 }
 
@@ -210,16 +232,10 @@ pub fn create_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)
 }
 
-fn actions_were_applied(report: &RunReport) -> bool {
-    report.files_copied > 0 || report.files_deleted > 0
-}
-
-/// Persist a snapshot from fresh scans so the DB matches disk after partial runs.
+/// Persist a snapshot from fresh scans after a fully successful run.
 ///
-/// Snapshot policy: whenever one or more file operations were applied (including
-/// cancel or stop-on-error), we save a post-run snapshot. Runs that never applied
-/// anything keep the previous snapshot. Run status may still be `Failed` or
-/// `Cancelled` when a snapshot is saved.
+/// Cancelled, failed, partially applied, and explicitly skipped runs retain the
+/// previous baseline so the next run can reconcile unresolved paths safely.
 fn save_post_run_snapshot(
     db: &dyn DatabaseHandle,
     pair: &FolderPair,
@@ -420,12 +436,29 @@ where
         return Err("Cannot run sync: content verification requires attention. Preview again after fixing file access.".into());
     }
 
-    if let Some(preconditions) = plan_preconditions {
-        validate_plan_preconditions(&plan, left_root, right_root, &preconditions)?;
+    let precondition_index = plan_preconditions.as_ref().map(PreconditionIndex::new);
+    let mut initial_validation_budget = ValidationBudget::default();
+    if let Some(index) = precondition_index.as_ref() {
+        for action in &plan.actions {
+            validate_action_precondition(
+                action,
+                left_root,
+                right_root,
+                index,
+                &mut initial_validation_budget,
+            )?;
+        }
     }
 
     if !conflict_resolutions.is_empty() {
         apply_conflict_resolutions(&mut plan.actions, &conflict_resolutions);
+    }
+
+    if plan.actions.iter().any(|action| matches!(action, SyncAction::Conflict { .. })) {
+        return Err(
+            "Cannot run sync: unresolved conflicts remain. Resolve every conflict and try again."
+                .into(),
+        );
     }
 
     let total =
@@ -436,6 +469,7 @@ where
     let mut stopped_on_error = false;
     let mut last_executed_path = None;
     let mut last_current = 0;
+    let mut action_validation_budget = ValidationBudget::default();
     for (index, action) in
         plan.actions.iter().filter(|a| !matches!(a, SyncAction::Skip { .. })).enumerate()
     {
@@ -457,6 +491,18 @@ where
         let current = index as u32 + 1;
         last_current = current;
         let path = action_path(action);
+        if let Some(index) = precondition_index.as_ref() {
+            if let Err(error) = validate_action_precondition(
+                action,
+                left_root,
+                right_root,
+                index,
+                &mut action_validation_budget,
+            ) {
+                let _ = flush_run_items(db, &mut run_items);
+                return Err(error);
+            }
+        }
         progress("running", current, total, Some(path), None);
 
         let item_id = Uuid::new_v4().to_string();
@@ -529,9 +575,13 @@ where
 
     flush_run_items(db, &mut run_items)?;
 
-    progress("scanning", total, total, None, Some("Capturing snapshot"));
-
-    save_post_run_snapshot(db, pair, left_root, right_root)?;
+    let can_advance_snapshot = report.errors.is_empty()
+        && !stopped_on_error
+        && !plan.actions.iter().any(|action| matches!(action, SyncAction::Skip { .. }));
+    if can_advance_snapshot {
+        progress("scanning", total, total, None, Some("Capturing snapshot"));
+        save_post_run_snapshot(db, pair, left_root, right_root)?;
+    }
 
     report.status = if report.errors.is_empty() && !stopped_on_error {
         RunStatus::Completed
@@ -560,50 +610,173 @@ where
     Ok(report.clone())
 }
 
+#[cfg(test)]
 fn validate_plan_preconditions(
     plan: &SyncPlan,
     left_root: &Path,
     right_root: &Path,
     preconditions: &PlanPreconditions,
 ) -> Result<(), String> {
-    let left: HashMap<&str, &FileEntry> =
-        preconditions.left.iter().map(|entry| (entry.relative_path.as_str(), entry)).collect();
-    let right: HashMap<&str, &FileEntry> =
-        preconditions.right.iter().map(|entry| (entry.relative_path.as_str(), entry)).collect();
+    let index = PreconditionIndex::new(preconditions);
+    let mut budget = ValidationBudget::default();
     for action in &plan.actions {
-        let path = action_path(action);
-        match action {
-            SyncAction::CopyLeftToRight { .. } => {
-                validate_precondition(left_root, left.get(path).copied(), path, "source")?;
-                validate_precondition(right_root, right.get(path).copied(), path, "target")?;
-            }
-            SyncAction::CopyRightToLeft { .. } => {
-                validate_precondition(right_root, right.get(path).copied(), path, "source")?;
-                validate_precondition(left_root, left.get(path).copied(), path, "target")?;
-            }
-            SyncAction::DeleteLeft { .. } => {
-                validate_precondition(left_root, left.get(path).copied(), path, "delete target")?;
-            }
-            SyncAction::DeleteRight { .. } => {
-                validate_precondition(right_root, right.get(path).copied(), path, "delete target")?;
-            }
-            SyncAction::CreateDirLeft { .. } => {
-                validate_precondition(left_root, None, path, "directory target")?;
-            }
-            SyncAction::CreateDirRight { .. } => {
-                validate_precondition(right_root, None, path, "directory target")?;
-            }
-            SyncAction::Conflict { .. } => {
-                validate_precondition(left_root, left.get(path).copied(), path, "conflict source")?;
-                validate_precondition(
-                    right_root,
-                    right.get(path).copied(),
-                    path,
-                    "conflict source",
-                )?;
-            }
-            SyncAction::Skip { .. } => {}
+        validate_action_precondition(action, left_root, right_root, &index, &mut budget)?;
+    }
+    Ok(())
+}
+
+struct PreconditionIndex<'a> {
+    left: HashMap<&'a str, &'a FileEntry>,
+    right: HashMap<&'a str, &'a FileEntry>,
+    left_ordered: Vec<&'a FileEntry>,
+    right_ordered: Vec<&'a FileEntry>,
+}
+
+#[derive(Default)]
+struct ValidationBudget {
+    hashed_bytes: u64,
+    hashed_files: usize,
+}
+
+impl<'a> PreconditionIndex<'a> {
+    fn new(preconditions: &'a PlanPreconditions) -> Self {
+        let mut left_ordered: Vec<_> = preconditions.left.iter().collect();
+        let mut right_ordered: Vec<_> = preconditions.right.iter().collect();
+        left_ordered.sort_unstable_by_key(|entry| entry.relative_path.as_str());
+        right_ordered.sort_unstable_by_key(|entry| entry.relative_path.as_str());
+        Self {
+            left: preconditions
+                .left
+                .iter()
+                .map(|entry| (entry.relative_path.as_str(), entry))
+                .collect(),
+            right: preconditions
+                .right
+                .iter()
+                .map(|entry| (entry.relative_path.as_str(), entry))
+                .collect(),
+            left_ordered,
+            right_ordered,
         }
+    }
+}
+
+fn validate_action_precondition(
+    action: &SyncAction,
+    left_root: &Path,
+    right_root: &Path,
+    index: &PreconditionIndex<'_>,
+    budget: &mut ValidationBudget,
+) -> Result<(), String> {
+    let path = action_path(action);
+    match action {
+        SyncAction::CopyLeftToRight { .. } => {
+            validate_precondition(
+                left_root,
+                index.left.get(path).copied(),
+                path,
+                "source",
+                budget,
+            )?;
+            validate_precondition(
+                right_root,
+                index.right.get(path).copied(),
+                path,
+                "target",
+                budget,
+            )?;
+        }
+        SyncAction::CopyRightToLeft { .. } => {
+            validate_precondition(
+                right_root,
+                index.right.get(path).copied(),
+                path,
+                "source",
+                budget,
+            )?;
+            validate_precondition(
+                left_root,
+                index.left.get(path).copied(),
+                path,
+                "target",
+                budget,
+            )?;
+        }
+        SyncAction::DeleteLeft { .. } => {
+            let expected = index.left.get(path).copied();
+            validate_precondition(left_root, expected, path, "delete target", budget)?;
+            if expected.is_some_and(|entry| entry.is_dir) {
+                validate_subtree(left_root, &index.left_ordered, path, "delete target", budget)?;
+            }
+        }
+        SyncAction::DeleteRight { .. } => {
+            let expected = index.right.get(path).copied();
+            validate_precondition(right_root, expected, path, "delete target", budget)?;
+            if expected.is_some_and(|entry| entry.is_dir) {
+                validate_subtree(right_root, &index.right_ordered, path, "delete target", budget)?;
+            }
+        }
+        SyncAction::CreateDirLeft { .. } => {
+            validate_precondition(left_root, None, path, "directory target", budget)?;
+        }
+        SyncAction::CreateDirRight { .. } => {
+            validate_precondition(right_root, None, path, "directory target", budget)?;
+        }
+        SyncAction::Conflict { .. } => {
+            validate_precondition(
+                left_root,
+                index.left.get(path).copied(),
+                path,
+                "conflict source",
+                budget,
+            )?;
+            validate_precondition(
+                right_root,
+                index.right.get(path).copied(),
+                path,
+                "conflict source",
+                budget,
+            )?;
+        }
+        SyncAction::Skip { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_subtree(
+    root: &Path,
+    entries: &[&FileEntry],
+    directory: &str,
+    label: &str,
+    budget: &mut ValidationBudget,
+) -> Result<(), String> {
+    let prefix = format!("{directory}/");
+    let expected_paths: std::collections::HashSet<&str> = entries
+        .iter()
+        .skip(entries.partition_point(|entry| entry.relative_path.as_str() < prefix.as_str()))
+        .take_while(|entry| entry.relative_path.starts_with(&prefix))
+        .map(|entry| entry.relative_path.as_str())
+        .collect();
+    let subtree_root = join_relative(root, directory);
+    for entry_result in WalkDir::new(&subtree_root).follow_links(false).into_iter() {
+        let entry = entry_result.map_err(|error| {
+            format!("Preview validation failed while scanning {directory}: {error}")
+        })?;
+        let entry_path = entry.path();
+        let Ok(relative) = entry_path.strip_prefix(root) else {
+            continue;
+        };
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
+        if relative_path != directory && !expected_paths.contains(relative_path.as_str()) {
+            return Err(format!("Preview is stale: {label} changed at {relative_path}"));
+        }
+    }
+    let start = entries.partition_point(|entry| entry.relative_path.as_str() < prefix.as_str());
+    for expected in entries.iter().skip(start) {
+        if !expected.relative_path.starts_with(&prefix) {
+            break;
+        }
+        validate_precondition(root, Some(expected), &expected.relative_path, label, budget)?;
     }
     Ok(())
 }
@@ -613,7 +786,11 @@ fn validate_precondition(
     expected: Option<&FileEntry>,
     relative_path: &str,
     label: &str,
+    budget: &mut ValidationBudget,
 ) -> Result<(), String> {
+    const PRECONDITION_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
+    const PRECONDITION_HASH_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+    const PRECONDITION_HASH_BUDGET_FILES: usize = 10_000;
     let path = join_relative(root, relative_path);
     let actual = fs::metadata(&path).ok();
     match (expected, actual) {
@@ -628,6 +805,38 @@ fn validate_precondition(
                 || expected.modified_nanos != modified_nanos
             {
                 return Err(format!("Preview is stale: {label} changed at {relative_path}"));
+            }
+            if !expected.is_dir && expected.size > PRECONDITION_HASH_MAX_BYTES {
+                return Err(format!(
+                    "Preview cannot safely validate large file at {relative_path}; preview again"
+                ));
+            }
+            if !expected.is_dir && expected.size > 0 && expected.size <= PRECONDITION_HASH_MAX_BYTES
+            {
+                budget.hashed_bytes = budget.hashed_bytes.saturating_add(expected.size);
+                budget.hashed_files += 1;
+                if budget.hashed_bytes > PRECONDITION_HASH_BUDGET_BYTES
+                    || budget.hashed_files > PRECONDITION_HASH_BUDGET_FILES
+                {
+                    return Err("Preview validation exceeds the bounded content budget".into());
+                }
+            }
+            // Scans intentionally avoid storing hashes for every entry. Rehash
+            // bounded regular files here so same-metadata edits cannot bypass a
+            // reusable preview's stale-plan guard.
+            if expected.size > 0 && expected.size <= PRECONDITION_HASH_MAX_BYTES {
+                let actual_hash = crate::hashing::hash_file(&path).map_err(|error| {
+                    format!("Preview validation failed at {relative_path}: {error}")
+                })?;
+                if expected
+                    .hash
+                    .as_deref()
+                    .is_some_and(|expected_hash| actual_hash != expected_hash)
+                {
+                    return Err(format!(
+                        "Preview is stale: {label} content changed at {relative_path}"
+                    ));
+                }
             }
             Ok(())
         }
@@ -729,9 +938,9 @@ where
 #[allow(clippy::too_many_arguments)]
 fn finish_cancelled<F>(
     db: &dyn DatabaseHandle,
-    pair: &FolderPair,
-    left_root: &Path,
-    right_root: &Path,
+    _pair: &FolderPair,
+    _left_root: &Path,
+    _right_root: &Path,
     report: &mut RunReport,
     emit: &mut F,
     current: u32,
@@ -741,9 +950,6 @@ fn finish_cancelled<F>(
 where
     F: FnMut(ProgressEvent<'_>),
 {
-    if actions_were_applied(report) {
-        save_post_run_snapshot(db, pair, left_root, right_root)?;
-    }
     report.status = RunStatus::Cancelled;
     report.finished_at = Some(now_millis());
     with_db(db, |db| db.save_run(report).map_err(|e| e.to_string()))?;
@@ -829,6 +1035,7 @@ mod tests {
             modified_nanos: 0,
             is_dir: false,
             hash: None,
+            deleted: false,
         };
         let result = validate_plan_preconditions(
             &plan,
@@ -894,6 +1101,7 @@ mod tests {
             modified_nanos: 0,
             is_dir: false,
             hash: None,
+            deleted: false,
         }];
         let right = vec![FileEntry {
             relative_path: "a.txt".into(),
@@ -902,6 +1110,7 @@ mod tests {
             modified_nanos: 0,
             is_dir: false,
             hash: None,
+            deleted: false,
         }];
         let merged = build_snapshot_entries(&left, &right);
         assert_eq!(merged.len(), 1);
@@ -1121,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_mid_run_saves_snapshot_matching_disk() {
+    fn cancel_mid_run_preserves_previous_snapshot_baseline() {
         let data_dir = TempDir::new().expect("tempdir");
         let db = Mutex::new(
             crate::persistence::Database::open(&data_dir.path().join("test.db")).expect("db"),
@@ -1162,28 +1371,10 @@ mod tests {
         .expect("cancelled run returns report");
 
         assert_eq!(report.status, RunStatus::Cancelled);
-        assert!(actions_were_applied(&report));
+        assert!(report.files_copied > 0 || report.files_deleted > 0);
 
-        let snapshot = db
-            .lock()
-            .expect("lock")
-            .latest_snapshot(&pair.id)
-            .expect("snapshot")
-            .expect("snapshot saved after partial cancel");
-
-        let snapshot_paths: std::collections::HashSet<_> =
-            snapshot.entries.iter().map(|e| e.relative_path.as_str()).collect();
-
-        for path in ["first.txt", "second.txt"] {
-            let on_left = left_dir.join(path).exists();
-            let on_right = right_dir.join(path).exists();
-            let in_snapshot = snapshot_paths.contains(path);
-            assert_eq!(
-                in_snapshot,
-                on_left || on_right,
-                "snapshot entry for {path} must match disk"
-            );
-        }
+        let snapshot = db.lock().expect("lock").latest_snapshot(&pair.id).expect("snapshot");
+        assert!(snapshot.is_none(), "partial cancellation must not advance the baseline");
     }
 
     #[test]

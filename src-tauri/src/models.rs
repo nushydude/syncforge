@@ -51,6 +51,12 @@ pub struct FileEntry {
     pub is_dir: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deleted: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +237,7 @@ mod tests {
                         modified_nanos: 0,
                         is_dir: false,
                         hash: None,
+                        deleted: false,
                     },
                     right: FileEntry {
                         relative_path: "report.doc".into(),
@@ -239,6 +246,7 @@ mod tests {
                         modified_nanos: 0,
                         is_dir: false,
                         hash: Some("abc".into()),
+                        deleted: false,
                     },
                 },
             ],
