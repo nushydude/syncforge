@@ -1,14 +1,74 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::State;
 
 use crate::diff::{build_sync_plan, DiffOptions};
-use crate::models::{FileEntry, FolderPair, SyncPlan};
+use crate::models::{
+    FileEntry, FolderPair, PreviewActionPage, PreviewSummary, SyncAction, SyncPlan,
+};
 use crate::path_normalization;
-use crate::persistence::Database;
+use crate::persistence::DatabaseHandle;
 use crate::scanner::{assert_destructive_scan_allowed, scan_directory, ScanIntegrity};
-use crate::state::AppState;
+use crate::state::{
+    canonical_job_roots, AppState, HeavyJobKind, HeavyJobPermit, WorkCoordinator, WorkRequest,
+    PREVIEW_PAGE_MAX,
+};
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+pub(crate) fn config_fingerprint(pair: &FolderPair) -> String {
+    let encoded = serde_json::to_vec(pair).unwrap_or_default();
+    blake3::hash(&encoded).to_hex().to_string()
+}
+
+fn preview_summary(
+    plan: &SyncPlan,
+    plan_id: String,
+    fingerprint: String,
+    created_at: i64,
+) -> PreviewSummary {
+    let mut action_counts = std::collections::HashMap::new();
+    let mut conflict_count = 0;
+    for action in &plan.actions {
+        let kind = crate::engine::action_kind(action).to_string();
+        *action_counts.entry(kind).or_insert(0) += 1;
+        if matches!(action, SyncAction::Conflict { .. }) {
+            conflict_count += 1;
+        }
+    }
+    let first_page = plan.actions.iter().take(PREVIEW_PAGE_MAX).cloned().collect();
+    PreviewSummary {
+        plan_id,
+        pair_id: plan.pair_id.clone(),
+        config_fingerprint: fingerprint,
+        created_at,
+        action_counts,
+        action_count: plan.actions.len() as u32,
+        conflict_count,
+        next_cursor: (plan.actions.len() > PREVIEW_PAGE_MAX).then_some(PREVIEW_PAGE_MAX),
+        first_page,
+        scanned_left: plan.scanned_left,
+        scanned_right: plan.scanned_right,
+        scan_skipped_left: plan.scan_skipped_left,
+        scan_skipped_right: plan.scan_skipped_right,
+        scan_warnings: plan.scan_warnings.clone(),
+        requires_attention: plan.requires_attention,
+    }
+}
+
+pub(crate) fn admit_preview(
+    coordinator: &Arc<WorkCoordinator>,
+    roots: Vec<PathBuf>,
+) -> Result<HeavyJobPermit, String> {
+    coordinator.acquire_manual(WorkRequest::new(roots, false, HeavyJobKind::Preview))
+}
 
 /// Core preview logic shared by the Tauri command, watcher, scheduler, and tests.
 ///
@@ -18,6 +78,13 @@ pub(crate) fn preview_pair_impl(
     pair: &FolderPair,
     snapshot_entries: Option<&[FileEntry]>,
 ) -> Result<SyncPlan, String> {
+    build_preview(pair, snapshot_entries).map(|(plan, _, _)| plan)
+}
+
+pub(crate) fn build_preview(
+    pair: &FolderPair,
+    snapshot_entries: Option<&[FileEntry]>,
+) -> Result<(SyncPlan, Vec<FileEntry>, Vec<FileEntry>), String> {
     if pair.id.is_empty() {
         return Err("pair id required for preview".into());
     }
@@ -25,16 +92,16 @@ pub(crate) fn preview_pair_impl(
     let left_path = path_normalization::to_long_path(&pair.left_path);
     let right_path = path_normalization::to_long_path(&pair.right_path);
 
-    let left_scan = scan_directory(Path::new(&left_path), &pair.filters)
+    let mut left_scan = scan_directory(Path::new(&left_path), &pair.filters)
         .map_err(|e| format!("scan left failed: {e}"))?;
-    let right_scan = scan_directory(Path::new(&right_path), &pair.filters)
+    let mut right_scan = scan_directory(Path::new(&right_path), &pair.filters)
         .map_err(|e| format!("scan right failed: {e}"))?;
 
     assert_destructive_scan_allowed(pair.mode, &left_scan, &right_scan)?;
 
     let scan = ScanIntegrity::from_sides(&left_scan, &right_scan);
 
-    Ok(build_sync_plan(
+    let plan = build_sync_plan(
         &pair.id,
         pair.mode,
         pair.conflict_policy,
@@ -47,10 +114,105 @@ pub(crate) fn preview_pair_impl(
             right_root: Some(Path::new(&right_path).to_path_buf()),
             ..DiffOptions::default()
         },
-    ))
+    );
+    if plan.requires_attention
+        && matches!(pair.mode, crate::models::SyncMode::Echo | crate::models::SyncMode::Synchronize)
+    {
+        return Err("Preview requires attention: a content hash could not be read safely. Fix access and preview again.".into());
+    }
+    let mut preview_hash_bytes = 0;
+    let mut preview_hash_files = 0;
+    populate_preview_hashes_for_actions(
+        &mut left_scan.entries,
+        Path::new(&left_path),
+        &plan.actions,
+        &mut preview_hash_bytes,
+        &mut preview_hash_files,
+    )?;
+    populate_preview_hashes_for_actions(
+        &mut right_scan.entries,
+        Path::new(&right_path),
+        &plan.actions,
+        &mut preview_hash_bytes,
+        &mut preview_hash_files,
+    )?;
+    Ok((plan, left_scan.entries, right_scan.entries))
 }
 
-fn load_preview_snapshot(db: &Database, pair_id: &str) -> Result<Option<Vec<FileEntry>>, String> {
+fn populate_preview_hashes_for_actions(
+    entries: &mut [FileEntry],
+    root: &Path,
+    actions: &[SyncAction],
+    hashed_bytes: &mut u64,
+    hashed_files: &mut usize,
+) -> Result<(), String> {
+    const PREVIEW_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
+    const PREVIEW_SUBTREE_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
+    const PREVIEW_SUBTREE_HASH_MAX_FILES: usize = 10_000;
+    let paths: HashSet<&str> = actions
+        .iter()
+        .map(|action| match action {
+            SyncAction::CopyLeftToRight { path }
+            | SyncAction::CopyRightToLeft { path }
+            | SyncAction::DeleteLeft { path }
+            | SyncAction::DeleteRight { path }
+            | SyncAction::CreateDirLeft { path }
+            | SyncAction::CreateDirRight { path }
+            | SyncAction::Conflict { path, .. }
+            | SyncAction::Skip { path, .. } => path.as_str(),
+        })
+        .collect();
+    let deleted_directories: HashSet<&str> = actions
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::DeleteLeft { path } | SyncAction::DeleteRight { path } => {
+                Some(path.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    for entry in entries.iter_mut() {
+        let under_deleted_directory = entry
+            .relative_path
+            .split('/')
+            .scan(String::new(), |prefix, part| {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+                Some(deleted_directories.contains(prefix.as_str()))
+            })
+            .any(|is_match| is_match);
+        let is_selected = paths.contains(entry.relative_path.as_str()) || under_deleted_directory;
+        if !is_selected || entry.is_dir || entry.size == 0 {
+            continue;
+        }
+        if entry.size > PREVIEW_HASH_MAX_BYTES {
+            return Err(format!(
+                "preview cannot safely validate large file at {}; reduce the workload or preview again",
+                entry.relative_path
+            ));
+        }
+        *hashed_bytes = (*hashed_bytes).saturating_add(entry.size);
+        *hashed_files += 1;
+        if *hashed_bytes > PREVIEW_SUBTREE_HASH_MAX_BYTES
+            || *hashed_files > PREVIEW_SUBTREE_HASH_MAX_FILES
+        {
+            return Err("preview content exceeds the bounded validation budget".into());
+        }
+        let path = root.join(entry.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        entry.hash =
+            Some(crate::hashing::hash_file(&path).map_err(|error| {
+                format!("content hash failed at {}: {error}", entry.relative_path)
+            })?);
+    }
+    Ok(())
+}
+
+fn load_preview_snapshot(
+    db: &dyn DatabaseHandle,
+    pair_id: &str,
+) -> Result<Option<Vec<FileEntry>>, String> {
     db.latest_snapshot(pair_id)
         .map_err(|e| e.to_string())
         .map(|snapshot| snapshot.map(|s| s.entries))
@@ -60,21 +222,76 @@ fn load_preview_snapshot(db: &Database, pair_id: &str) -> Result<Option<Vec<File
 pub async fn preview_pair(
     pair: FolderPair,
     state: State<'_, Arc<AppState>>,
-) -> Result<SyncPlan, String> {
+) -> Result<PreviewSummary, String> {
     if pair.id.is_empty() {
         return Err("pair id required for preview".into());
     }
 
-    let snapshot_entries = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        load_preview_snapshot(&db, &pair.id)?
-    };
-
+    let work_coordinator = Arc::clone(&state.work_coordinator);
+    let app_state = Arc::clone(&state);
+    let db = Arc::clone(&state.db);
+    let roots = canonical_job_roots(&[&pair.left_path, &pair.right_path]);
     tauri::async_runtime::spawn_blocking(move || {
-        preview_pair_impl(&pair, snapshot_entries.as_deref())
+        let _permit = admit_preview(&work_coordinator, roots)?;
+        let snapshot_entries = load_preview_snapshot(db.as_ref(), &pair.id)?;
+        let (plan, left_preconditions, right_preconditions) =
+            build_preview(&pair, snapshot_entries.as_deref())?;
+        let created_at = now_millis();
+        let fingerprint = config_fingerprint(&pair);
+        let mut summary = preview_summary(&plan, String::new(), fingerprint.clone(), created_at);
+        let mut previews = app_state.preview_plans.lock().map_err(|e| e.to_string())?;
+        let plan_id = previews.insert(
+            pair.id.clone(),
+            fingerprint.clone(),
+            plan,
+            left_preconditions,
+            right_preconditions,
+            created_at,
+        )?;
+        summary.plan_id = plan_id;
+        Ok(summary)
     })
     .await
     .map_err(|e| format!("preview task failed: {e}"))?
+}
+
+#[tauri::command]
+pub fn get_preview_actions(
+    plan_id: String,
+    pair: FolderPair,
+    cursor: Option<usize>,
+    limit: Option<usize>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<PreviewActionPage, String> {
+    let limit = limit.unwrap_or(PREVIEW_PAGE_MAX).min(PREVIEW_PAGE_MAX);
+    let fingerprint = config_fingerprint(&pair);
+    state.preview_plans.lock().map_err(|e| e.to_string())?.get_page(
+        &plan_id,
+        &pair.id,
+        &fingerprint,
+        cursor.unwrap_or(0),
+        limit,
+        now_millis(),
+    )
+}
+
+#[tauri::command]
+pub fn get_preview_conflicts(
+    plan_id: String,
+    pair: FolderPair,
+    cursor: Option<usize>,
+    limit: Option<usize>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<PreviewActionPage, String> {
+    let fingerprint = config_fingerprint(&pair);
+    state.preview_plans.lock().map_err(|e| e.to_string())?.get_conflicts_page(
+        &plan_id,
+        &pair.id,
+        &fingerprint,
+        cursor.unwrap_or(0),
+        limit.unwrap_or(PREVIEW_PAGE_MAX),
+        now_millis(),
+    )
 }
 
 #[cfg(test)]
@@ -254,6 +471,7 @@ mod tests {
                 modified_nanos: 0,
                 is_dir: false,
                 hash: None,
+                deleted: false,
             }],
         })
         .expect("snapshot");

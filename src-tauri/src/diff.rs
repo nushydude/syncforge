@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::hashing;
@@ -29,8 +30,26 @@ impl Default for DiffOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum EntrySide {
+    Left,
+    Right,
+    Snapshot,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct HashKey {
+    side: EntrySide,
+    relative_path: String,
+    size: u64,
+    modified_secs: i64,
+    modified_nanos: u32,
+}
+
 struct DiffContext<'a> {
     options: &'a DiffOptions,
+    hashes: RefCell<HashMap<HashKey, Result<String, String>>>,
+    hash_warnings: RefCell<Vec<String>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -44,36 +63,35 @@ pub fn build_sync_plan(
     scan: ScanIntegrity,
     diff_options: DiffOptions,
 ) -> SyncPlan {
-    let ctx = DiffContext { options: &diff_options };
-    let left_map = entries_map(left);
-    let right_map = entries_map(right);
-    let snapshot_map = snapshot.map(entries_map).unwrap_or_default();
-
-    let paths = collect_paths(&left_map, &right_map, &snapshot_map);
+    let ctx = DiffContext {
+        options: &diff_options,
+        hashes: RefCell::new(HashMap::new()),
+        hash_warnings: RefCell::new(Vec::new()),
+    };
     let mut actions = Vec::new();
+    let empty_snapshot = [];
+    let snapshot = snapshot.unwrap_or(&empty_snapshot);
 
-    for path in paths {
-        let l = left_map.get(&path);
-        let r = right_map.get(&path);
-        let s = snapshot_map.get(&path);
-
+    for (path, l, r, s) in ThreeWayMerge::new(left, right, snapshot) {
         match mode {
             SyncMode::Echo => {
                 // Echo mirrors left → right; snapshot is not used for planning.
-                plan_echo(&mut actions, &path, l, r, &ctx);
+                plan_echo(&mut actions, path, l, r, &ctx);
             }
             SyncMode::Contribute => {
-                plan_contribute(&mut actions, &path, l, r, &ctx);
+                plan_contribute(&mut actions, path, l, r, &ctx);
             }
             SyncMode::Synchronize => {
-                plan_synchronize(&mut actions, &path, l, r, s, conflict_policy, &ctx);
+                plan_synchronize(&mut actions, path, l, r, s, conflict_policy, &ctx);
             }
         }
     }
 
-    ensure_parent_dirs(&mut actions, mode, &left_map, &right_map);
+    ensure_parent_dirs(&mut actions, mode, left, right);
+    collapse_redundant_directory_deletes(&mut actions, left, right);
     sort_actions(&mut actions);
 
+    let hash_warnings = ctx.hash_warnings.borrow().clone();
     SyncPlan {
         pair_id: pair_id.to_string(),
         actions,
@@ -81,8 +99,8 @@ pub fn build_sync_plan(
         scanned_right: right.len() as u32,
         scan_skipped_left: scan.skipped_left,
         scan_skipped_right: scan.skipped_right,
-        scan_warnings: scan.warnings,
-        requires_attention: scan.requires_attention,
+        scan_warnings: scan.warnings.into_iter().chain(hash_warnings.iter().cloned()).collect(),
+        requires_attention: scan.requires_attention || !hash_warnings.is_empty(),
     }
 }
 
@@ -100,7 +118,9 @@ fn plan_echo(
         (Some(l), None) if !l.is_dir => {
             actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
-        (Some(l), Some(r)) if entries_differ(l, r, ctx) && !l.is_dir => {
+        (Some(l), Some(r))
+            if entries_differ(l, EntrySide::Left, r, EntrySide::Right, ctx) && !l.is_dir =>
+        {
             actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
         (Some(l), Some(r)) if l.is_dir && !r.is_dir => {
@@ -127,7 +147,9 @@ fn plan_contribute(
         (Some(l), None) if !l.is_dir => {
             actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
-        (Some(l), Some(r)) if entries_differ(l, r, ctx) && !l.is_dir => {
+        (Some(l), Some(r))
+            if entries_differ(l, EntrySide::Left, r, EntrySide::Right, ctx) && !l.is_dir =>
+        {
             actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
         }
         (Some(l), Some(r)) if l.is_dir && !r.is_dir => {
@@ -167,7 +189,7 @@ fn plan_synchronize(
         }
         (Some(l), Some(r)) if l.is_dir && r.is_dir => {}
         (Some(l), Some(r)) if !l.is_dir && !r.is_dir => {
-            if !entries_differ(l, r, ctx) {
+            if !entries_differ(l, EntrySide::Left, r, EntrySide::Right, ctx) {
                 return;
             }
             if snapshot_changed_both(l, r, snapshot, ctx) || snapshot.is_none() {
@@ -204,7 +226,15 @@ fn plan_one_sided_file(
                 actions.push(SyncAction::CopyRightToLeft { path: path.to_string() });
             }
         }
-        Some(snap) if entries_match(snap, present, ctx) => {
+        Some(snap)
+            if entries_match(
+                present,
+                if present_is_left { EntrySide::Left } else { EntrySide::Right },
+                snap,
+                EntrySide::Snapshot,
+                ctx,
+            ) =>
+        {
             if present_is_left {
                 actions.push(SyncAction::DeleteRight { path: path.to_string() });
             } else {
@@ -213,17 +243,27 @@ fn plan_one_sided_file(
         }
         Some(snap) => {
             let (left, right) = if present_is_left {
-                (present.clone(), snap.clone())
+                let mut deleted = snap.clone();
+                deleted.deleted = true;
+                (present.clone(), deleted)
             } else {
-                (snap.clone(), present.clone())
+                let mut deleted = snap.clone();
+                deleted.deleted = true;
+                (deleted, present.clone())
             };
             apply_conflict_policy(actions, path, &left, &right, conflict_policy);
         }
     }
 }
 
-fn entries_match(a: &FileEntry, b: &FileEntry, ctx: &DiffContext<'_>) -> bool {
-    !entries_differ(a, b, ctx)
+fn entries_match(
+    a: &FileEntry,
+    a_side: EntrySide,
+    b: &FileEntry,
+    b_side: EntrySide,
+    ctx: &DiffContext<'_>,
+) -> bool {
+    !entries_differ(a, a_side, b, b_side, ctx)
 }
 
 fn snapshot_changed_both(
@@ -235,7 +275,8 @@ fn snapshot_changed_both(
     let Some(snap) = snapshot else {
         return false;
     };
-    entries_differ(left, snap, ctx) && entries_differ(right, snap, ctx)
+    entries_differ(left, EntrySide::Left, snap, EntrySide::Snapshot, ctx)
+        && entries_differ(right, EntrySide::Right, snap, EntrySide::Snapshot, ctx)
 }
 
 fn apply_conflict_policy(
@@ -254,13 +295,22 @@ fn apply_conflict_policy(
             });
         }
         ConflictPolicy::NewerWins => {
-            push_newer_wins_copy(actions, path, left, right);
+            if left.deleted {
+                // A tombstone has no trustworthy deletion timestamp. Preserve
+                // the live file rather than allowing a historical snapshot
+                // time to delete a newer surviving copy.
+                actions.push(SyncAction::CopyRightToLeft { path: path.to_string() });
+            } else if right.deleted {
+                actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
+            } else {
+                push_newer_wins_copy(actions, path, left, right);
+            }
         }
         ConflictPolicy::Left => {
-            actions.push(SyncAction::CopyLeftToRight { path: path.to_string() });
+            actions.push(resolve_conflict_action(ConflictResolution::Left, path, left, right));
         }
         ConflictPolicy::Right => {
-            actions.push(SyncAction::CopyRightToLeft { path: path.to_string() });
+            actions.push(resolve_conflict_action(ConflictResolution::Right, path, left, right));
         }
         ConflictPolicy::KeepBoth => {
             actions.push(SyncAction::Skip {
@@ -320,25 +370,32 @@ fn compare_newer(left: &FileEntry, right: &FileEntry) -> Option<bool> {
 fn ensure_parent_dirs(
     actions: &mut Vec<SyncAction>,
     mode: SyncMode,
-    left: &HashMap<String, FileEntry>,
-    right: &HashMap<String, FileEntry>,
+    left: &[FileEntry],
+    right: &[FileEntry],
 ) {
-    let mut needed_right: BTreeSet<String> = BTreeSet::new();
-    let mut needed_left: BTreeSet<String> = BTreeSet::new();
+    let mut planned_right = HashSet::new();
+    let mut planned_left = HashSet::new();
+    let mut additions = Vec::new();
 
     for action in actions.iter() {
         match action {
             SyncAction::CopyLeftToRight { path } | SyncAction::CreateDirRight { path } => {
                 for parent in parent_paths(path) {
-                    if !right.contains_key(&parent) && left.get(&parent).is_some_and(|e| e.is_dir) {
-                        needed_right.insert(parent);
+                    if !contains_entry(right, &parent)
+                        && contains_directory(left, &parent)
+                        && planned_right.insert(parent.clone())
+                    {
+                        additions.push(SyncAction::CreateDirRight { path: parent });
                     }
                 }
             }
             SyncAction::CopyRightToLeft { path } | SyncAction::CreateDirLeft { path } => {
                 for parent in parent_paths(path) {
-                    if !left.contains_key(&parent) && right.get(&parent).is_some_and(|e| e.is_dir) {
-                        needed_left.insert(parent);
+                    if !contains_entry(left, &parent)
+                        && contains_directory(right, &parent)
+                        && planned_left.insert(parent.clone())
+                    {
+                        additions.push(SyncAction::CreateDirLeft { path: parent });
                     }
                 }
             }
@@ -346,25 +403,26 @@ fn ensure_parent_dirs(
         }
     }
 
-    for path in needed_right {
-        if !has_action_for_path(actions, &path, true) {
-            actions.push(SyncAction::CreateDirRight { path });
-        }
-    }
-
-    for path in needed_left {
-        if mode == SyncMode::Synchronize && !has_action_for_path(actions, &path, false) {
-            actions.push(SyncAction::CreateDirLeft { path });
-        }
+    if mode == SyncMode::Synchronize {
+        actions.extend(additions);
+    } else {
+        actions.extend(
+            additions
+                .into_iter()
+                .filter(|action| matches!(action, SyncAction::CreateDirRight { .. })),
+        );
     }
 }
 
-fn has_action_for_path(actions: &[SyncAction], path: &str, right: bool) -> bool {
-    actions.iter().any(|a| match a {
-        SyncAction::CreateDirRight { path: p } if right => p == path,
-        SyncAction::CreateDirLeft { path: p } if !right => p == path,
-        _ => false,
-    })
+fn contains_entry(entries: &[FileEntry], path: &str) -> bool {
+    entries.binary_search_by(|entry| entry.relative_path.as_str().cmp(path)).is_ok()
+}
+
+fn contains_directory(entries: &[FileEntry], path: &str) -> bool {
+    entries
+        .binary_search_by(|entry| entry.relative_path.as_str().cmp(path))
+        .ok()
+        .is_some_and(|index| entries[index].is_dir)
 }
 
 fn parent_paths(path: &str) -> Vec<String> {
@@ -384,6 +442,32 @@ fn sort_actions(actions: &mut [SyncAction]) {
     actions.sort_by(|a, b| action_path(a).cmp(action_path(b)));
 }
 
+fn collapse_redundant_directory_deletes(
+    actions: &mut Vec<SyncAction>,
+    left: &[FileEntry],
+    right: &[FileEntry],
+) {
+    let mut deleted_dirs = HashSet::new();
+    actions.retain(|action| {
+        let (path, side, is_dir) = match action {
+            SyncAction::DeleteLeft { path } => {
+                (path, EntrySide::Left, contains_directory(left, path))
+            }
+            SyncAction::DeleteRight { path } => {
+                (path, EntrySide::Right, contains_directory(right, path))
+            }
+            _ => return true,
+        };
+        if parent_paths(path).into_iter().any(|parent| deleted_dirs.contains(&(side, parent))) {
+            return false;
+        }
+        if is_dir {
+            deleted_dirs.insert((side, path.clone()));
+        }
+        true
+    });
+}
+
 fn action_path(action: &SyncAction) -> &str {
     match action {
         SyncAction::CopyLeftToRight { path }
@@ -397,23 +481,59 @@ fn action_path(action: &SyncAction) -> &str {
     }
 }
 
-fn entries_map(entries: &[FileEntry]) -> HashMap<String, FileEntry> {
-    entries.iter().map(|e| (e.relative_path.clone(), e.clone())).collect()
+struct ThreeWayMerge<'a> {
+    left: &'a [FileEntry],
+    right: &'a [FileEntry],
+    snapshot: &'a [FileEntry],
+    left_index: usize,
+    right_index: usize,
+    snapshot_index: usize,
 }
 
-fn collect_paths(
-    left: &HashMap<String, FileEntry>,
-    right: &HashMap<String, FileEntry>,
-    snapshot: &HashMap<String, FileEntry>,
-) -> Vec<String> {
-    let mut set = BTreeSet::new();
-    for key in left.keys().chain(right.keys()).chain(snapshot.keys()) {
-        set.insert(key.clone());
+impl<'a> ThreeWayMerge<'a> {
+    fn new(left: &'a [FileEntry], right: &'a [FileEntry], snapshot: &'a [FileEntry]) -> Self {
+        Self { left, right, snapshot, left_index: 0, right_index: 0, snapshot_index: 0 }
     }
-    set.into_iter().collect()
 }
 
-fn entries_differ(a: &FileEntry, b: &FileEntry, ctx: &DiffContext<'_>) -> bool {
+impl<'a> Iterator for ThreeWayMerge<'a> {
+    type Item = (&'a str, Option<&'a FileEntry>, Option<&'a FileEntry>, Option<&'a FileEntry>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let path = [
+            self.left.get(self.left_index),
+            self.right.get(self.right_index),
+            self.snapshot.get(self.snapshot_index),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.relative_path.as_str())
+        .min()?;
+
+        let left = self.left.get(self.left_index).filter(|entry| entry.relative_path == path);
+        let right = self.right.get(self.right_index).filter(|entry| entry.relative_path == path);
+        let snapshot =
+            self.snapshot.get(self.snapshot_index).filter(|entry| entry.relative_path == path);
+        if left.is_some() {
+            self.left_index += 1;
+        }
+        if right.is_some() {
+            self.right_index += 1;
+        }
+        if snapshot.is_some() {
+            self.snapshot_index += 1;
+        }
+        Some((path, left, right, snapshot))
+    }
+}
+
+fn entries_differ(
+    a: &FileEntry,
+    a_side: EntrySide,
+    b: &FileEntry,
+    b_side: EntrySide,
+    ctx: &DiffContext<'_>,
+) -> bool {
     if a.is_dir != b.is_dir {
         return true;
     }
@@ -432,23 +552,67 @@ fn entries_differ(a: &FileEntry, b: &FileEntry, ctx: &DiffContext<'_>) -> bool {
     if a.size == 0 {
         return false;
     }
-    content_differs_if_enabled(a, b, ctx)
+    content_differs_if_enabled(a, a_side, b, b_side, ctx)
 }
 
-fn content_differs_if_enabled(a: &FileEntry, b: &FileEntry, ctx: &DiffContext<'_>) -> bool {
+fn content_differs_if_enabled(
+    a: &FileEntry,
+    a_side: EntrySide,
+    b: &FileEntry,
+    b_side: EntrySide,
+    ctx: &DiffContext<'_>,
+) -> bool {
     let opts = ctx.options;
     if !opts.content_hash_compare || a.size >= opts.content_hash_max_bytes {
         return false;
     }
-    let (Some(left_root), Some(right_root)) = (&opts.left_root, &opts.right_root) else {
+    // Metadata-only snapshots have no physical path or content hash. Metadata is
+    // the documented comparison semantics; never infer a snapshot path.
+    if (a_side == EntrySide::Snapshot && a.hash.is_none())
+        || (b_side == EntrySide::Snapshot && b.hash.is_none())
+    {
         return false;
-    };
-    let left_path = join_relative(left_root, &a.relative_path);
-    let right_path = join_relative(right_root, &b.relative_path);
-    match (hashing::hash_file(&left_path), hashing::hash_file(&right_path)) {
-        (Ok(lh), Ok(rh)) => lh != rh,
-        _ => false,
     }
+    let left_hash = hash_entry(a, a_side, ctx);
+    let right_hash = hash_entry(b, b_side, ctx);
+    match (left_hash, right_hash) {
+        (Some(Ok(lh)), Some(Ok(rh))) => lh != rh,
+        (Some(Err(_)), _) | (_, Some(Err(_))) => true,
+        (Some(Ok(_)), None) | (None, Some(Ok(_))) | (None, None) => false,
+    }
+}
+
+fn hash_entry(
+    entry: &FileEntry,
+    side: EntrySide,
+    ctx: &DiffContext<'_>,
+) -> Option<Result<String, String>> {
+    if let Some(hash) = &entry.hash {
+        return Some(Ok(hash.clone()));
+    }
+    let root = match side {
+        EntrySide::Left => ctx.options.left_root.as_ref(),
+        EntrySide::Right => ctx.options.right_root.as_ref(),
+        EntrySide::Snapshot => return None,
+    }?;
+    let key = HashKey {
+        side,
+        relative_path: entry.relative_path.clone(),
+        size: entry.size,
+        modified_secs: entry.modified_secs,
+        modified_nanos: entry.modified_nanos,
+    };
+    if let Some(cached) = ctx.hashes.borrow().get(&key) {
+        return Some(cached.clone());
+    }
+    let path = join_relative(root, &entry.relative_path);
+    let result = hashing::hash_file(&path)
+        .map_err(|error| format!("{}: content hash failed: {error}", entry.relative_path));
+    if let Err(error) = &result {
+        ctx.hash_warnings.borrow_mut().push(error.clone());
+    }
+    ctx.hashes.borrow_mut().insert(key, result.clone());
+    Some(result)
 }
 
 fn join_relative(base: &std::path::Path, relative: &str) -> PathBuf {
@@ -459,11 +623,23 @@ fn join_relative(base: &std::path::Path, relative: &str) -> PathBuf {
 pub fn resolve_conflict_action(
     resolution: ConflictResolution,
     path: &str,
-    _left: &FileEntry,
-    _right: &FileEntry,
+    left: &FileEntry,
+    right: &FileEntry,
 ) -> SyncAction {
     match resolution {
+        ConflictResolution::Left if left.deleted => {
+            SyncAction::DeleteRight { path: path.to_string() }
+        }
+        ConflictResolution::Left if right.deleted => {
+            SyncAction::CopyLeftToRight { path: path.to_string() }
+        }
         ConflictResolution::Left => SyncAction::CopyLeftToRight { path: path.to_string() },
+        ConflictResolution::Right if right.deleted => {
+            SyncAction::DeleteLeft { path: path.to_string() }
+        }
+        ConflictResolution::Right if left.deleted => {
+            SyncAction::CopyRightToLeft { path: path.to_string() }
+        }
         ConflictResolution::Right => SyncAction::CopyRightToLeft { path: path.to_string() },
         ConflictResolution::KeepBoth => {
             SyncAction::Skip { path: path.to_string(), reason: "keep both (user choice)".into() }
@@ -504,6 +680,7 @@ mod tests {
             modified_nanos: nanos,
             is_dir: false,
             hash: None,
+            deleted: false,
         }
     }
 
@@ -515,6 +692,7 @@ mod tests {
             modified_nanos: 0,
             is_dir: true,
             hash: None,
+            deleted: false,
         }
     }
 
@@ -931,6 +1109,112 @@ mod tests {
     }
 
     #[test]
+    fn equal_metadata_hashes_each_current_side_once_per_plan() {
+        use crate::hashing::{hash_invocation_count, reset_hash_invocations};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let left_root = dir.path().join("left");
+        let right_root = dir.path().join("right");
+        fs::create_dir_all(&left_root).expect("mkdir left");
+        fs::create_dir_all(&right_root).expect("mkdir right");
+        fs::write(left_root.join("doc.txt"), "left-content").expect("write left");
+        fs::write(right_root.join("doc.txt"), "right-content").expect("write right");
+
+        let left = vec![file_with_nanos("doc.txt", 12, 100, 0)];
+        let right = vec![file_with_nanos("doc.txt", 12, 100, 0)];
+        let snapshot = vec![file_with_nanos("doc.txt", 12, 100, 0)];
+        reset_hash_invocations();
+
+        let plan = build_sync_plan(
+            "p1",
+            SyncMode::Synchronize,
+            ConflictPolicy::Ask,
+            &left,
+            &right,
+            Some(&snapshot),
+            ScanIntegrity::default(),
+            DiffOptions {
+                left_root: Some(left_root),
+                right_root: Some(right_root),
+                ..DiffOptions::default()
+            },
+        );
+
+        assert_eq!(hash_invocation_count(), 2);
+        assert!(!plan.requires_attention);
+    }
+
+    #[test]
+    fn metadata_only_snapshot_does_not_trigger_physical_hashing() {
+        use crate::hashing::{hash_invocation_count, reset_hash_invocations};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let left_root = dir.path().join("left");
+        let right_root = dir.path().join("right");
+        fs::create_dir_all(&left_root).expect("mkdir left");
+        fs::create_dir_all(&right_root).expect("mkdir right");
+        fs::write(left_root.join("doc.txt"), "left-content").expect("write left");
+
+        let left = vec![file_with_nanos("doc.txt", 12, 100, 0)];
+        let snapshot = vec![file_with_nanos("doc.txt", 12, 100, 0)];
+        reset_hash_invocations();
+
+        let plan = build_sync_plan(
+            "p1",
+            SyncMode::Synchronize,
+            ConflictPolicy::Ask,
+            &left,
+            &[],
+            Some(&snapshot),
+            ScanIntegrity::default(),
+            DiffOptions {
+                left_root: Some(left_root),
+                right_root: Some(right_root),
+                ..DiffOptions::default()
+            },
+        );
+
+        assert_eq!(hash_invocation_count(), 0);
+        assert!(plan.actions.iter().any(|action| matches!(
+            action,
+            SyncAction::DeleteRight { path } if path == "doc.txt"
+        )));
+    }
+
+    #[test]
+    fn hash_failure_marks_plan_as_needing_attention() {
+        use crate::hashing::reset_hash_invocations;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let left = vec![file_with_nanos("missing.txt", 12, 100, 0)];
+        let right = vec![file_with_nanos("missing.txt", 12, 100, 0)];
+        reset_hash_invocations();
+
+        let plan = build_sync_plan(
+            "p1",
+            SyncMode::Echo,
+            ConflictPolicy::NewerWins,
+            &left,
+            &right,
+            None,
+            ScanIntegrity::default(),
+            DiffOptions {
+                left_root: Some(dir.path().join("left")),
+                right_root: Some(dir.path().join("right")),
+                ..DiffOptions::default()
+            },
+        );
+
+        assert!(plan.requires_attention);
+        assert!(plan.scan_warnings.iter().any(|warning| warning.contains("hash failed")));
+    }
+
+    #[test]
     fn newer_wins_prefers_higher_nanos_on_tied_seconds() {
         let plan = plan(
             SyncMode::Synchronize,
@@ -940,5 +1224,17 @@ mod tests {
             None,
         );
         assert!(has_copy_ltr(&plan, "both.txt"));
+    }
+
+    #[test]
+    fn newer_wins_keeps_newer_modified_file_against_delete() {
+        let plan = plan(
+            SyncMode::Synchronize,
+            ConflictPolicy::NewerWins,
+            &[file_with_nanos("doc.txt", 20, 200, 0)],
+            &[],
+            Some(&[file_with_nanos("doc.txt", 10, 100, 0)]),
+        );
+        assert!(has_copy_ltr(&plan, "doc.txt"));
     }
 }

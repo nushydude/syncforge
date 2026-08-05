@@ -52,6 +52,7 @@ export const CONFLICT_POLICY_OPTIONS: {
 
 export function entriesEqual(a: FileEntry, b: FileEntry): boolean {
   return (
+    !!a.deleted === !!b.deleted &&
     a.isDir === b.isDir &&
     a.size === b.size &&
     a.modifiedSecs === b.modifiedSecs &&
@@ -69,6 +70,8 @@ export function classifyPathChange(
   snapshot: FileEntry | undefined,
 ): PathChangeKind {
   if (left && right) {
+    if (left.deleted && !right.deleted) return "deletedOnLeft";
+    if (right.deleted && !left.deleted) return "deletedOnRight";
     if (entriesEqual(left, right)) {
       return "inSync";
     }

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +51,12 @@ pub struct FileEntry {
     pub is_dir: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deleted: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +88,39 @@ pub struct SyncPlan {
     /// When true, destructive sync modes must not run until the user resolves scan issues.
     #[serde(default)]
     pub requires_attention: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSummary {
+    pub plan_id: String,
+    pub pair_id: String,
+    pub config_fingerprint: String,
+    pub created_at: i64,
+    pub action_counts: HashMap<String, u32>,
+    pub action_count: u32,
+    pub conflict_count: u32,
+    pub first_page: Vec<SyncAction>,
+    pub next_cursor: Option<usize>,
+    pub scanned_left: u32,
+    pub scanned_right: u32,
+    #[serde(default)]
+    pub scan_skipped_left: u32,
+    #[serde(default)]
+    pub scan_skipped_right: u32,
+    #[serde(default)]
+    pub scan_warnings: Vec<String>,
+    #[serde(default)]
+    pub requires_attention: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewActionPage {
+    pub plan_id: String,
+    pub cursor: usize,
+    pub next_cursor: Option<usize>,
+    pub actions: Vec<SyncAction>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +237,7 @@ mod tests {
                         modified_nanos: 0,
                         is_dir: false,
                         hash: None,
+                        deleted: false,
                     },
                     right: FileEntry {
                         relative_path: "report.doc".into(),
@@ -205,6 +246,7 @@ mod tests {
                         modified_nanos: 0,
                         is_dir: false,
                         hash: Some("abc".into()),
+                        deleted: false,
                     },
                 },
             ],

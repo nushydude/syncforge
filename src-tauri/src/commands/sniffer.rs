@@ -1,8 +1,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::Emitter;
+use tauri::State;
+
+use crate::run_coordinator::retry_pending_syncs;
+use crate::state::{AppState, HeavyJobKind, HeavyJobPermit, WorkCoordinator, WorkRequest};
+
+pub(crate) fn admit_sniffer(
+    coordinator: &Arc<WorkCoordinator>,
+    roots: Vec<PathBuf>,
+    writer: bool,
+) -> Result<HeavyJobPermit, String> {
+    coordinator.acquire_manual(WorkRequest::new(roots, writer, HeavyJobKind::Sniffer))
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,15 +84,44 @@ fn measure(path: &Path) -> FolderTotals {
 pub async fn scan_folder_sizes(
     path: String,
     app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<FolderSizeResult, String> {
-    tauri::async_runtime::spawn_blocking(move || scan_folder_sizes_blocking(path, app))
-        .await
-        .map_err(|error| format!("folder scan failed: {error}"))?
+    let work_coordinator = Arc::clone(&state.work_coordinator);
+    let job_root = PathBuf::from(path.trim())
+        .canonicalize()
+        .map_err(|e| format!("could not open folder: {e}"))?;
+    {
+        let mut jobs = state.active_sniffer_jobs.lock().map_err(|e| e.to_string())?;
+        if !jobs.is_empty() {
+            return Err("a sniffer scan is already queued".into());
+        }
+        jobs.insert(job_root.clone());
+    }
+    let active_jobs = Arc::clone(&*state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = admit_sniffer(&work_coordinator, Vec::new(), false)?;
+        let app_for_retry = app.clone();
+        let result = scan_folder_sizes_blocking(path, app);
+        if let Ok(mut jobs) = active_jobs.active_sniffer_jobs.lock() {
+            jobs.remove(&job_root);
+        }
+        drop(_permit);
+        retry_pending_syncs(app_for_retry, &active_jobs);
+        result
+    })
+    .await
+    .map_err(|error| format!("folder scan failed: {error}"))?
 }
 
 #[tauri::command]
-pub fn rename_sniffer_item(path: String, new_name: String) -> Result<String, String> {
+pub fn rename_sniffer_item(
+    path: String,
+    new_name: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
     let source = PathBuf::from(path.trim());
+    let root = source.canonicalize().unwrap_or_else(|_| source.clone());
+    let _permit = admit_sniffer(&state.work_coordinator, vec![root], true)?;
     let name = new_name.trim();
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
         return Err("invalid new name".to_string());
@@ -94,8 +136,10 @@ pub fn rename_sniffer_item(path: String, new_name: String) -> Result<String, Str
 }
 
 #[tauri::command]
-pub fn delete_sniffer_item(path: String) -> Result<(), String> {
+pub fn delete_sniffer_item(path: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let target = PathBuf::from(path.trim());
+    let root = target.canonicalize().unwrap_or_else(|_| target.clone());
+    let _permit = admit_sniffer(&state.work_coordinator, vec![root], true)?;
     let metadata =
         fs::metadata(&target).map_err(|error| format!("could not access item: {error}"))?;
     if metadata.is_dir() {

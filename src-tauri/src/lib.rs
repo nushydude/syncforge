@@ -7,11 +7,15 @@ mod models;
 mod notifications;
 mod path_normalization;
 mod persistence;
+mod progress;
 mod run_coordinator;
 mod scanner;
 mod scheduler;
 mod state;
 mod watcher;
+
+#[cfg(test)]
+mod perf_harness;
 
 use std::sync::Arc;
 
@@ -126,6 +130,8 @@ pub fn run() {
             commands::pairs::save_pair,
             commands::pairs::delete_pair,
             commands::preview::preview_pair,
+            commands::preview::get_preview_actions,
+            commands::preview::get_preview_conflicts,
             commands::run::run_pair,
             commands::run::cancel_run,
             commands::history::get_history,

@@ -25,6 +25,7 @@ export interface RunPairOptions {
   conflictResolutions?: Record<string, ConflictChoice>;
   /** When true (default), the first non-conflict action failure stops the run. */
   stopOnError?: boolean;
+  planId?: string;
 }
 
 /** Emitted when a debounced watch run is skipped (conflicts, errors). */

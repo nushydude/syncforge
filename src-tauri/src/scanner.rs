@@ -226,6 +226,7 @@ pub fn scan_directory(root: &Path, filters: &Filters) -> ScanResult {
             modified_nanos,
             is_dir: metadata.is_dir(),
             hash: None,
+            deleted: false,
         });
     }
 

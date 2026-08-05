@@ -28,7 +28,7 @@ fn validate_pair_paths(left: &str, right: &str) -> Result<(), String> {
 
 #[tauri::command]
 pub fn list_pairs(state: State<'_, Arc<AppState>>) -> Result<Vec<FolderPair>, String> {
-    state.db.lock().map_err(|e| e.to_string())?.list_pairs().map_err(|e| e.to_string())
+    state.db.list_pairs().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -49,8 +49,7 @@ pub fn save_pair(
 
     validate_pair_paths(&pair.left_path, &pair.right_path)?;
 
-    let saved =
-        state.db.lock().map_err(|e| e.to_string())?.save_pair(&pair).map_err(|e| e.to_string())?;
+    let saved = state.db.save_pair(&pair).map_err(|e| e.to_string())?;
 
     refresh_watch_service(&app, &state)?;
     refresh_schedule_service(&app, &state)?;
@@ -63,7 +62,7 @@ pub fn delete_pair(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    state.db.lock().map_err(|e| e.to_string())?.delete_pair(&id).map_err(|e| {
+    state.db.delete_pair(&id).map_err(|e| {
         if matches!(e, PersistenceError::PairNotFound(_)) {
             format!("pair not found: {id}")
         } else {

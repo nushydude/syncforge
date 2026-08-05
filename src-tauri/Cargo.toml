@@ -28,10 +28,10 @@ jwalk = "0.8"
 globset = "0.4"
 blake3 = "1"
 trash = "5"
-tokio = { version = "1", features = ["time", "macros"] }
+tokio = { version = "1", features = ["time", "macros", "sync"] }
 cron = "0.15"
 chrono = "0.4"
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

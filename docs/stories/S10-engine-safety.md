@@ -11,8 +11,8 @@ Harden `engine.rs` and `commands/run.rs` for cancel and failure paths.
 ## Acceptance criteria
 
 - [ ] `cancel_run` uses `State<'_, Arc<AppState>>` (matches other commands); cancel works from UI without panic
-- [ ] On **cancel**: after partial apply, capture post-run snapshot from fresh scans of both sides OR document rollback; snapshot must reflect disk (not pre-run only)
-- [ ] `finish_cancelled` saves snapshot when any actions were applied; run status remains `Cancelled`
+- [ ] On **cancel**: retain the previous baseline after partial apply so the next run reconciles unresolved paths
+- [ ] `finish_cancelled` retains the previous snapshot baseline; run status remains `Cancelled`
 - [ ] **Stop-on-error** default for manual runs: first non-conflict action failure stops the loop (configurable `RunOptions.stop_on_error`, default `true`)
 - [ ] When errors occurred and run stops early: status `Failed` or new `Partial`; snapshot policy documented in code comments
 - [ ] Do not mark run `Completed` when `report.errors` is non-empty

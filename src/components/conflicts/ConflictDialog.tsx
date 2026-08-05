@@ -1,5 +1,4 @@
 import {
-  allConflictsResolved,
   classifyPathChange,
   pathChangeKindLabel,
   type ConflictAction,
@@ -7,6 +6,9 @@ import {
 import type { ConflictChoice, FileEntry } from "../../types";
 
 function formatEntry(entry: FileEntry): string {
+  if (entry.deleted) {
+    return "deleted";
+  }
   if (entry.isDir) {
     return "folder";
   }
@@ -19,6 +21,13 @@ interface ConflictDialogProps {
   onChoose: (path: string, choice: ConflictChoice) => void;
   onConfirm: () => void;
   onCancel: () => void;
+  page: number;
+  total: number;
+  hasNextPage: boolean;
+  hasPreviousPage: boolean;
+  loading: boolean;
+  onNextPage: () => void;
+  onPreviousPage: () => void;
 }
 
 export function ConflictDialog({
@@ -27,8 +36,15 @@ export function ConflictDialog({
   onChoose,
   onConfirm,
   onCancel,
+  page,
+  total,
+  hasNextPage,
+  hasPreviousPage,
+  loading,
+  onNextPage,
+  onPreviousPage,
 }: ConflictDialogProps) {
-  const ready = allConflictsResolved(conflicts, resolutions);
+  const ready = Object.keys(resolutions).length >= total;
 
   return (
     <div
@@ -43,6 +59,9 @@ export function ConflictDialog({
           <p>
             Choose how to handle each path. Sync will continue after you confirm
             all choices.
+          </p>
+          <p>
+            Page {page} · {total} total conflicts
           </p>
         </header>
 
@@ -101,6 +120,23 @@ export function ConflictDialog({
             );
           })}
         </ul>
+
+        <nav className="conflict-dialog-pagination" aria-label="Conflict pages">
+          <button
+            type="button"
+            disabled={!hasPreviousPage || loading}
+            onClick={onPreviousPage}
+          >
+            Previous
+          </button>
+          <button
+            type="button"
+            disabled={!hasNextPage || loading}
+            onClick={onNextPage}
+          >
+            {loading ? "Loading…" : "Next"}
+          </button>
+        </nav>
 
         <footer className="conflict-dialog-actions">
           <button
