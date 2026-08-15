@@ -376,6 +376,8 @@ pub struct AppState {
     pub active_sniffer_jobs: Mutex<HashSet<PathBuf>>,
     /// Per-pair cancel flags while a sync run is active.
     pub active_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Per-pair cancel flags while a preview scan is active.
+    pub preview_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Pair ids whose debounced watch sync could not start while that pair was busy.
     pub pending_watch_syncs: Mutex<HashSet<String>>,
     /// Pair ids whose scheduled sync could not start while that pair was busy.
@@ -404,6 +406,7 @@ impl AppState {
             active_duplicate_jobs: Mutex::new(HashSet::new()),
             active_sniffer_jobs: Mutex::new(HashSet::new()),
             active_runs: Mutex::new(HashMap::new()),
+            preview_cancels: Mutex::new(HashMap::new()),
             pending_watch_syncs: Mutex::new(HashSet::new()),
             pending_schedule_syncs: Mutex::new(HashSet::new()),
             pending_automatic_syncs: Mutex::new(HashSet::new()),

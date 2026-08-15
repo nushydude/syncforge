@@ -6,6 +6,7 @@ A modern desktop folder-sync tool (SyncToy replacement) built with **Tauri 2**, 
 
 - **Folder pairs** — Left/right folders with Synchronize, Echo, and Contribute modes
 - **Preview before run** — See planned copies, updates, and deletes before executing
+- **Work queue** — Scans and syncs for several pairs queue up and run one at a time, so spinning disks are never hit by two jobs at once; each pair keeps its own scan and run results, and any job can be cancelled
 - **Sync engine** — Safe copies, Recycle Bin deletes, optional hash verification
 - **Conflict policies** — Newer-wins, left/right, keep-both, or prompt
 - **Real-time watch** — Auto-sync on file changes with debouncing

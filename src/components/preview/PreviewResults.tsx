@@ -88,7 +88,7 @@ export function PreviewResults({
 
       {rows.length === 0 ? (
         <p className="preview-empty">
-          No changes needed â€” folders are in sync.
+          No changes needed — folders are in sync.
         </p>
       ) : (
         <div className="preview-results-table-wrap">
@@ -108,7 +108,7 @@ export function PreviewResults({
                 >
                   <td>{row.label}</td>
                   <td className="preview-path">{row.path}</td>
-                  <td className="preview-detail">{row.detail || "â€”"}</td>
+                  <td className="preview-detail">{row.detail || "—"}</td>
                 </tr>
               ))}
             </tbody>

@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -35,6 +36,8 @@ pub enum ScanError {
     InvalidPattern(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type ScanResult = std::result::Result<ScanOutput, ScanError>;
@@ -158,10 +161,44 @@ mod scan_test_hooks {
 #[cfg(test)]
 pub use scan_test_hooks::with_scan_counting;
 
+/// How often the walk checks the cancel flag — cheap enough to stay responsive.
+const CANCEL_CHECK_INTERVAL: usize = 512;
+
+/// Cancel flag for callers that have nothing to cancel with.
+static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
+
 /// Scans `root` in parallel and returns filtered entries keyed by relative path.
 pub fn scan_directory(root: &Path, filters: &Filters) -> ScanResult {
+    scan_directory_cancellable(root, filters, &NEVER_CANCEL)
+}
+
+/// How often the walk reports progress — often enough to look alive.
+const PROGRESS_REPORT_INTERVAL: usize = 128;
+
+/// Same as [`scan_directory`], but aborts with [`ScanError::Cancelled`] when
+/// `cancel` is set. Long scans on spinning disks must be stoppable.
+pub fn scan_directory_cancellable(
+    root: &Path,
+    filters: &Filters,
+    cancel: &AtomicBool,
+) -> ScanResult {
+    scan_directory_observed(root, filters, cancel, &mut |_, _| {})
+}
+
+/// Cancellable scan that also reports `(entries seen so far, latest path)` as it
+/// walks, so a long scan can show that it is making progress.
+pub fn scan_directory_observed(
+    root: &Path,
+    filters: &Filters,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(u64, &str),
+) -> ScanResult {
     #[cfg(test)]
     scan_test_hooks::record_scan_invocation();
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(ScanError::Cancelled);
+    }
 
     let root = root.canonicalize().map_err(|_| ScanError::NotFound(root.display().to_string()))?;
 
@@ -176,7 +213,20 @@ pub fn scan_directory(root: &Path, filters: &Filters) -> ScanResult {
     let mut skipped_entries = 0u32;
     let mut warnings = Vec::new();
 
+    let mut visited = 0usize;
     for entry in WalkDir::new(&root).follow_links(false).into_iter() {
+        visited += 1;
+        if visited.is_multiple_of(CANCEL_CHECK_INTERVAL) && cancel.load(Ordering::Relaxed) {
+            return Err(ScanError::Cancelled);
+        }
+        if visited.is_multiple_of(PROGRESS_REPORT_INTERVAL) {
+            let latest = entry
+                .as_ref()
+                .ok()
+                .and_then(|e| e.path().strip_prefix(&root).ok().map(to_relative_string))
+                .unwrap_or_default();
+            on_progress(visited as u64, &latest);
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
@@ -231,6 +281,7 @@ pub fn scan_directory(root: &Path, filters: &Filters) -> ScanResult {
     }
 
     append_overflow_summary(&mut warnings, skipped_entries);
+    on_progress(visited as u64, "");
     entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(ScanOutput { entries, skipped_entries, warnings })
 }
@@ -312,6 +363,32 @@ mod tests {
         let filters = Filters { include: vec![], exclude: vec!["*.tmp".into()] };
         assert!(matches_filter_rules("any.bin", &filters));
         assert!(!matches_filter_rules("skip.tmp", &filters));
+    }
+
+    #[test]
+    fn cancelled_scan_stops_before_walking() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello").expect("write");
+
+        let cancel = AtomicBool::new(true);
+        let error = scan_directory_cancellable(root, &Filters::default(), &cancel)
+            .expect_err("cancelled scan");
+
+        assert!(matches!(error, ScanError::Cancelled));
+        assert_eq!(error.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn uncancelled_scan_still_returns_entries() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "hello").expect("write");
+
+        let cancel = AtomicBool::new(false);
+        let output = scan_directory_cancellable(root, &Filters::default(), &cancel).expect("scan");
+
+        assert_eq!(output.entries.len(), 1);
     }
 
     #[test]

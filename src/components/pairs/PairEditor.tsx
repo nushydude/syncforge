@@ -2,14 +2,14 @@ import { ConflictDialog } from "../conflicts/ConflictDialog";
 import { PreviewResults } from "../preview/PreviewResults";
 import { PreviewScanProgress } from "../preview/PreviewScanProgress";
 import { RunProgress } from "../run/RunProgress";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { usePairsStore } from "../../hooks/usePairsStore";
 import { useRunStore } from "../../hooks/useRunStore";
 import {
   cancelEdit,
   deleteSelected,
+  emptyPairPreview,
   pickFolderForSide,
-  previewSelectedPair,
   saveEditing,
   updateEditing,
 } from "../../store/pairsStore";
@@ -17,8 +17,12 @@ import type { PairsStoreState } from "../../store/pairsStore";
 import {
   cancelConflictResolution,
   confirmConflictResolutionAndRun,
+  enqueuePairRun,
+  cancelPairPreview,
+  enqueuePairPreview,
+  isPairBusy,
+  queuePosition,
   loadConflictPage,
-  runSelectedPair,
   setConflictResolution,
 } from "../../store/runStore";
 import type { RunStoreState } from "../../store/runStore";
@@ -32,18 +36,9 @@ const selectPairEditor = (s: PairsStoreState) => ({
   validationErrors: s.validationErrors,
   error: s.error,
   selectedId: s.selectedId,
-  previewPlan: s.previewPlan,
-  previewLoading: s.previewLoading,
-  previewError: s.previewError,
   watchWarning: s.watchWarning,
   scheduleError: s.scheduleError,
   scheduleDescription: s.scheduleDescription,
-});
-
-const selectPairEditorRun = (s: RunStoreState) => ({
-  running: s.running,
-  pendingConflicts: s.pendingConflicts,
-  conflictResolutions: s.conflictResolutions,
 });
 
 export function PairEditor() {
@@ -53,18 +48,42 @@ export function PairEditor() {
     validationErrors,
     error,
     selectedId,
-    previewPlan,
-    previewLoading,
-    previewError,
     watchWarning,
     scheduleError,
     scheduleDescription,
   } = usePairsStore(selectPairEditor);
+  const editingId = editing?.id ?? "";
   const {
-    running: runInProgress,
+    plan: previewPlan,
+    queued: previewQueued,
+    loading: previewLoading,
+    error: previewError,
+    startedAt: scanStartedAt,
+    scannedEntries,
+    scanSide,
+    scanPath,
+  } = usePairsStore(
+    useCallback(
+      (s: PairsStoreState) => s.previews[editingId] ?? emptyPairPreview,
+      [editingId],
+    ),
+  );
+  const {
+    busy: runInProgress,
+    scanPosition,
     pendingConflicts,
     conflictResolutions,
-  } = useRunStore(selectPairEditorRun);
+  } = useRunStore(
+    useCallback(
+      (s: RunStoreState) => ({
+        busy: isPairBusy(s, editingId),
+        scanPosition: queuePosition(s, editingId, "preview"),
+        pendingConflicts: s.pendingConflicts,
+        conflictResolutions: s.conflictResolutions,
+      }),
+      [editingId],
+    ),
+  );
   const [showResults, setShowResults] = useState(false);
   const resultsTitleRef = useRef<HTMLHeadingElement>(null);
   const resultsTriggerRef = useRef<HTMLButtonElement>(null);
@@ -84,6 +103,11 @@ export function PairEditor() {
   }
 
   const isNew = !editing.id;
+  // Warnings still deserve a look, so only a warning-free empty plan is "clean".
+  const previewIsClean =
+    previewPlan !== null &&
+    (previewPlan.actionCount ?? previewPlan.actions.length) === 0 &&
+    (previewPlan.scanWarnings?.length ?? 0) === 0;
 
   return (
     <form
@@ -97,6 +121,22 @@ export function PairEditor() {
       <header className="pair-editor-header">
         <h2>{isNew ? "New folder pair" : "Edit folder pair"}</h2>
       </header>
+
+      {/* Live scan and sync status stay directly under the header. */}
+      {!isNew && (
+        <PreviewScanProgress
+          pairName={editing.name}
+          loading={previewLoading}
+          queued={previewQueued}
+          position={scanPosition}
+          startedAt={scanStartedAt}
+          scannedEntries={scannedEntries}
+          scanSide={scanSide}
+          scanPath={scanPath}
+          onCancel={() => void cancelPairPreview(editingId)}
+        />
+      )}
+      {!isNew && <RunProgress pairId={editing.id} />}
 
       {error && (
         <p className="form-error" role="alert">
@@ -253,26 +293,36 @@ export function PairEditor() {
         )}
       </fieldset>
 
-      {!isNew && <PreviewScanProgress loading={previewLoading} />}
-
       {!isNew && previewPlan && !previewLoading && !showResults && (
-        <section className="preview-ready-card" aria-live="polite">
+        <section
+          className={
+            previewIsClean
+              ? "preview-ready-card preview-ready-clean"
+              : "preview-ready-card"
+          }
+          aria-live="polite"
+        >
           <div>
-            <strong>Preview ready</strong>
+            <strong>
+              {previewIsClean ? "Nothing to sync" : "Preview ready"}
+            </strong>
             <p>
-              {previewPlan.actions.length === 0
-                ? "Folders are already in sync."
+              {previewIsClean
+                ? "Both folders are already identical."
                 : "Review the planned changes before syncing."}
             </p>
           </div>
-          <button
-            ref={resultsTriggerRef}
-            type="button"
-            onClick={() => setShowResults(true)}
-            disabled={runInProgress}
-          >
-            View results
-          </button>
+          {/* Nothing to page through when the plan is empty. */}
+          {!previewIsClean && (
+            <button
+              ref={resultsTriggerRef}
+              type="button"
+              onClick={() => setShowResults(true)}
+              disabled={runInProgress}
+            >
+              View results
+            </button>
+          )}
         </section>
       )}
 
@@ -305,31 +355,28 @@ export function PairEditor() {
         </p>
       )}
 
-      {!isNew && <RunProgress />}
-
       <div className="form-actions">
         {!isNew && (
           <>
             <button
               type="button"
               className="btn-primary"
-              disabled={saving || previewLoading || runInProgress}
-              onClick={() => void previewSelectedPair()}
+              disabled={saving || previewLoading || previewQueued}
+              onClick={() => editing && enqueuePairPreview(editing)}
             >
-              {previewLoading ? "Previewing…" : "Preview sync"}
+              {previewQueued
+                ? "Queued to scan…"
+                : previewLoading
+                  ? "Scanning…"
+                  : "Preview sync"}
             </button>
             <button
               type="button"
               className="btn-primary"
-              disabled={
-                saving ||
-                previewLoading ||
-                runInProgress ||
-                !!(pendingConflicts && pendingConflicts.pair.id === editing.id)
-              }
-              onClick={() => editing && void runSelectedPair(editing)}
+              disabled={saving || runInProgress}
+              onClick={() => editing && enqueuePairRun(editing)}
             >
-              {runInProgress ? "Running…" : "Run sync"}
+              {runInProgress ? "Queued…" : "Run sync"}
             </button>
           </>
         )}

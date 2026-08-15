@@ -1,14 +1,20 @@
-import { memo } from "react";
+import { memo, useCallback } from "react";
 import { useRunStore } from "../../hooks/useRunStore";
-import { cancelActiveRun } from "../../store/runStore";
-import type { RunStoreState } from "../../store/runStore";
+import {
+  cancelPairRun,
+  dismissPairRun,
+  getPairRun,
+  queuePosition,
+  type PairRunState,
+  type RunStoreState,
+} from "../../store/runStore";
 
-function phaseLabel(phase: string | undefined): string {
-  switch (phase) {
-    case "scanning":
-      return "Scanning…";
-    case "running":
-      return "Syncing…";
+function phaseLabel(run: PairRunState): string {
+  switch (run.status) {
+    case "queued":
+      return "Queued";
+    case "awaitingInput":
+      return "Waiting for conflict choices";
     case "completed":
       return "Completed";
     case "failed":
@@ -16,59 +22,94 @@ function phaseLabel(phase: string | undefined): string {
     case "cancelled":
       return "Cancelled";
     default:
+      break;
+  }
+  switch (run.progress?.phase) {
+    case "scanning":
+      return "Scanning…";
+    case "running":
+      return "Syncing…";
+    default:
       return "Running…";
   }
 }
 
-const selectRunProgress = (s: RunStoreState) => ({
-  running: s.running,
-  progress: s.progress,
-  lastReport: s.lastReport,
-  error: s.error,
-});
+export const RunProgress = memo(function RunProgress({
+  pairId,
+}: {
+  pairId: string;
+}) {
+  const selectRun = useCallback(
+    (s: RunStoreState) => getPairRun(s, pairId),
+    [pairId],
+  );
+  const run = useRunStore(selectRun);
+  const waitingAt = useRunStore(
+    useCallback(
+      (s: RunStoreState) => queuePosition(s, pairId, "sync"),
+      [pairId],
+    ),
+  );
 
-export const RunProgress = memo(function RunProgress() {
-  const { running, progress, lastReport, error } =
-    useRunStore(selectRunProgress);
-
-  if (!running && !progress && !lastReport && !error) {
+  if (!run) {
     return null;
   }
 
-  const phase = progress?.phase ?? lastReport?.status;
-  const total = progress?.total ?? 0;
-  const current = progress?.current ?? 0;
+  const active =
+    run.status === "queued" ||
+    run.status === "running" ||
+    run.status === "awaitingInput";
+  const report = run.report;
+  const total = run.progress?.total ?? 0;
+  const current = run.progress?.current ?? 0;
   const percent =
     total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
 
   return (
-    <section className="run-progress" aria-live="polite">
+    <section
+      className={`run-progress run-progress-${run.status}`}
+      aria-live="polite"
+    >
       <header className="run-progress-header">
-        <h3>{phaseLabel(phase)}</h3>
-        {running && (
+        <h3>{phaseLabel(run)}</h3>
+        {active ? (
           <button
             type="button"
             className="btn-danger"
-            onClick={() => void cancelActiveRun()}
+            onClick={() => void cancelPairRun(pairId)}
           >
             Cancel
+          </button>
+        ) : (
+          <button type="button" onClick={() => dismissPairRun(pairId)}>
+            Dismiss
           </button>
         )}
       </header>
 
-      {error && (
-        <p className="form-error" role="alert">
-          {error}
+      {run.status === "queued" && (
+        <p className="run-progress-message">
+          {waitingAt >= 0
+            ? `Waiting for ${waitingAt + 1} job${
+                waitingAt === 0 ? "" : "s"
+              } ahead of it.`
+            : "Waiting to start."}
         </p>
       )}
 
-      {progress?.message && (
-        <p className="run-progress-message">{progress.message}</p>
+      {run.error && (
+        <p className="form-error" role="alert">
+          {run.error}
+        </p>
       )}
 
-      {progress?.path && (
-        <p className="run-progress-path" title={progress.path}>
-          {progress.path}
+      {run.progress?.message && (
+        <p className="run-progress-message">{run.progress.message}</p>
+      )}
+
+      {run.progress?.path && (
+        <p className="run-progress-path" title={run.progress.path}>
+          {run.progress.path}
         </p>
       )}
 
@@ -81,12 +122,11 @@ export const RunProgress = memo(function RunProgress() {
         </div>
       )}
 
-      {lastReport && !running && (
+      {report && !active && (
         <p className="run-progress-summary">
-          Copied {lastReport.filesCopied} · Deleted {lastReport.filesDeleted} ·{" "}
-          {(lastReport.bytesTransferred / 1024).toFixed(1)} KiB
-          {lastReport.errors.length > 0 &&
-            ` · ${lastReport.errors.length} error(s)`}
+          Copied {report.filesCopied} · Deleted {report.filesDeleted} ·{" "}
+          {(report.bytesTransferred / 1024).toFixed(1)} KiB
+          {report.errors.length > 0 && ` · ${report.errors.length} error(s)`}
         </p>
       )}
     </section>

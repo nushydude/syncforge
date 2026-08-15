@@ -1,17 +1,21 @@
 import { ConflictDialog } from "../conflicts/ConflictDialog";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { PreviewResults } from "../preview/PreviewResults";
 import { PreviewScanProgress } from "../preview/PreviewScanProgress";
 import { RunProgress } from "../run/RunProgress";
 import { usePairsStore } from "../../hooks/usePairsStore";
 import { useRunStore } from "../../hooks/useRunStore";
 import type { PairsStoreState } from "../../store/pairsStore";
-import { beginEdit, previewSelectedPair } from "../../store/pairsStore";
+import { beginEdit, emptyPairPreview } from "../../store/pairsStore";
 import {
   cancelConflictResolution,
+  cancelPairPreview,
   confirmConflictResolutionAndRun,
+  enqueuePairPreview,
+  enqueuePairRun,
+  isPairBusy,
   loadConflictPage,
-  runSelectedPair,
+  queuePosition,
   setConflictResolution,
 } from "../../store/runStore";
 import type { RunStoreState } from "../../store/runStore";
@@ -20,18 +24,6 @@ import type { ConflictPolicy, FolderPair, SyncMode } from "../../types";
 interface PairDetailsProps {
   pair: FolderPair;
 }
-
-const selectPairDetails = (s: PairsStoreState) => ({
-  previewPlan: s.previewPlan,
-  previewLoading: s.previewLoading,
-  previewError: s.previewError,
-});
-
-const selectPairDetailsRun = (s: RunStoreState) => ({
-  running: s.running,
-  pendingConflicts: s.pendingConflicts,
-  conflictResolutions: s.conflictResolutions,
-});
 
 function modeLabel(mode: SyncMode): string {
   switch (mode) {
@@ -67,11 +59,40 @@ export function PairDetails({ pair }: PairDetailsProps) {
   const [showResults, setShowResults] = useState(false);
   const resultsTitleRef = useRef<HTMLHeadingElement>(null);
   const resultsTriggerRef = useRef<HTMLButtonElement>(null);
-  const { previewPlan, previewLoading, previewError } =
-    usePairsStore(selectPairDetails);
-  const { running, pendingConflicts, conflictResolutions } =
-    useRunStore(selectPairDetailsRun);
+  const {
+    plan: previewPlan,
+    queued: previewQueued,
+    loading: previewLoading,
+    error: previewError,
+    startedAt: scanStartedAt,
+    scannedEntries,
+    scanSide,
+    scanPath,
+  } = usePairsStore(
+    useCallback(
+      (s: PairsStoreState) => s.previews[pair.id] ?? emptyPairPreview,
+      [pair.id],
+    ),
+  );
+  const { busy, scanPosition, pendingConflicts, conflictResolutions } =
+    useRunStore(
+      useCallback(
+        (s: RunStoreState) => ({
+          busy: isPairBusy(s, pair.id),
+          scanPosition: queuePosition(s, pair.id, "preview"),
+          pendingConflicts: s.pendingConflicts,
+          conflictResolutions: s.conflictResolutions,
+        }),
+        [pair.id],
+      ),
+    );
   const hasPendingConflicts = pendingConflicts?.pair.id === pair.id;
+  const scanBusy = previewLoading || previewQueued;
+  // Warnings still deserve a look, so only a warning-free empty plan is "clean".
+  const previewIsClean =
+    previewPlan !== null &&
+    (previewPlan.actionCount ?? previewPlan.actions.length) === 0 &&
+    (previewPlan.scanWarnings?.length ?? 0) === 0;
 
   useEffect(() => {
     setShowResults(false);
@@ -90,30 +111,46 @@ export function PairDetails({ pair }: PairDetailsProps) {
           <h2 id="pair-details-title">{pair.name}</h2>
           <p className="pair-details-subtitle">Folder pair details</p>
         </div>
-        <div className="pair-details-actions">
-          <button type="button" onClick={beginEdit} disabled={running}>
-            Edit pair
-          </button>
-          <button
-            type="button"
-            className="btn-primary"
-            disabled={previewLoading || running}
-            onClick={() => void previewSelectedPair()}
-          >
-            {previewLoading ? "Previewing..." : "Preview sync"}
-          </button>
-          <button
-            type="button"
-            className="btn-primary"
-            disabled={previewLoading || running || hasPendingConflicts}
-            onClick={() => void runSelectedPair(pair)}
-          >
-            {running ? "Running..." : "Run sync"}
-          </button>
-        </div>
+        {/* While a scan is queued or running, cancelling is the only action —
+            showing disabled Edit/Run buttons just invites dead clicks. The
+            status card below already says what is happening. */}
+        {!scanBusy && (
+          <div className="pair-details-actions">
+            <button type="button" onClick={beginEdit} disabled={busy}>
+              Edit pair
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={() => enqueuePairPreview(pair)}
+            >
+              Preview sync
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={busy}
+              onClick={() => enqueuePairRun(pair)}
+            >
+              {busy ? "Queued…" : "Run sync"}
+            </button>
+          </div>
+        )}
       </header>
 
-      <PreviewScanProgress loading={previewLoading} />
+      {/* Live scan and sync status stay directly under the header. */}
+      <PreviewScanProgress
+        pairName={pair.name}
+        loading={previewLoading}
+        queued={previewQueued}
+        position={scanPosition}
+        startedAt={scanStartedAt}
+        scannedEntries={scannedEntries}
+        scanSide={scanSide}
+        scanPath={scanPath}
+        onCancel={() => void cancelPairPreview(pair.id)}
+      />
+      <RunProgress pairId={pair.id} />
 
       {showResults && previewPlan ? (
         <>
@@ -126,7 +163,6 @@ export function PairDetails({ pair }: PairDetailsProps) {
                 resultsTriggerRef.current?.focus(),
               );
             }}
-            disabled={running}
           >
             ← Back to pair details
           </button>
@@ -139,23 +175,35 @@ export function PairDetails({ pair }: PairDetailsProps) {
       ) : (
         <>
           {previewPlan && !previewLoading && (
-            <section className="preview-ready-card" aria-live="polite">
+            <section
+              className={
+                previewIsClean
+                  ? "preview-ready-card preview-ready-clean"
+                  : "preview-ready-card"
+              }
+              aria-live="polite"
+            >
               <div>
-                <strong>Preview ready</strong>
+                <strong>
+                  {previewIsClean ? "Nothing to sync" : "Preview ready"}
+                </strong>
                 <p>
-                  {previewPlan.actions.length === 0
-                    ? "Folders are already in sync."
+                  {previewIsClean
+                    ? "Both folders are already identical."
                     : "Review the planned changes before syncing."}
                 </p>
               </div>
-              <button
-                ref={resultsTriggerRef}
-                type="button"
-                onClick={() => setShowResults(true)}
-                disabled={running}
-              >
-                View results
-              </button>
+              {/* A clean result has nothing to page through — do not make the
+                  user click into an empty table to learn that. */}
+              {!previewIsClean && (
+                <button
+                  ref={resultsTriggerRef}
+                  type="button"
+                  onClick={() => setShowResults(true)}
+                >
+                  View results
+                </button>
+              )}
             </section>
           )}
 
@@ -206,7 +254,6 @@ export function PairDetails({ pair }: PairDetailsProps) {
           )}
         </>
       )}
-      <RunProgress />
 
       {hasPendingConflicts && pendingConflicts && (
         <ConflictDialog

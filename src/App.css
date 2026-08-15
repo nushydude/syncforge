@@ -170,6 +170,7 @@ html[data-theme="dark"] .pair-details-grid > div,
 html[data-theme="dark"] .pair-details-filters,
 html[data-theme="dark"] .preview-table,
 html[data-theme="dark"] .run-progress,
+html[data-theme="dark"] .run-queue,
 html[data-theme="dark"] .conflict-dialog,
 html[data-theme="dark"] .conflict-panel,
 html[data-theme="dark"] .duplicates-controls,
@@ -211,6 +212,8 @@ html[data-theme="dark"] .run-progress-path,
 html[data-theme="dark"] .run-progress-summary,
 html[data-theme="dark"] .run-progress-message,
 html[data-theme="dark"] .run-progress-count,
+html[data-theme="dark"] .run-queue-count,
+html[data-theme="dark"] .run-queue-status,
 html[data-theme="dark"] .conflict-path,
 html[data-theme="dark"] .conflict-sides,
 html[data-theme="dark"] .conflict-sides strong,
@@ -255,6 +258,7 @@ html[data-theme="dark"] .duplicate-progress-path {
   html[data-theme="system"] .pair-details-filters,
   html[data-theme="system"] .preview-table,
   html[data-theme="system"] .run-progress,
+  html[data-theme="system"] .run-queue,
   html[data-theme="system"] .conflict-dialog,
   html[data-theme="system"] .conflict-panel,
   html[data-theme="system"] .duplicates-controls,
@@ -289,6 +293,8 @@ html[data-theme="dark"] .duplicate-progress-path {
   html[data-theme="system"] .run-progress-summary,
   html[data-theme="system"] .run-progress-message,
   html[data-theme="system"] .run-progress-count,
+  html[data-theme="system"] .run-queue-count,
+  html[data-theme="system"] .run-queue-status,
   html[data-theme="system"] .conflict-path,
   html[data-theme="system"] .conflict-sides,
   html[data-theme="system"] .conflict-sides strong,
@@ -603,9 +609,24 @@ html[data-theme="dark"] .pairs-workspace-tabs button.active {
   font-size: 0.8rem;
 }
 .preview-scan-progress > span {
-  margin-left: auto;
   color: #64748b;
   font-size: 0.8rem;
+}
+/* The text grows so the elapsed time and the cancel button always sit right,
+   whether or not the elapsed counter is showing. */
+.preview-scan-text {
+  flex: 1;
+  min-width: 0;
+}
+.preview-scan-path {
+  margin: 0.15rem 0 0;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.75rem;
+  color: #64748b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 32rem;
 }
 .preview-scan-spinner {
   width: 1rem;
@@ -636,6 +657,10 @@ html[data-theme="dark"] .pairs-workspace-tabs button.active {
   color: #166534;
   font-size: 0.85rem;
 }
+/* No action button, so the text should not sit against a wide empty gap. */
+.preview-ready-clean {
+  justify-content: flex-start;
+}
 .preview-back-button {
   margin-bottom: 0.75rem;
 }
@@ -650,17 +675,21 @@ html[data-theme="dark"] .pairs-workspace-tabs button.active {
   display: flex;
   flex-direction: column;
 }
+/* Live status sits directly under the editor header, not below the form. */
+.pair-editor .pair-editor-header {
+  order: -2;
+}
+.pair-editor .preview-scan-progress,
+.pair-editor .run-progress {
+  order: -1;
+}
 .pair-editor .form-actions {
   order: 9;
-}
-.pair-editor .preview-scan-progress {
-  order: 10;
 }
 .pair-editor .preview-ready-card,
 .pair-editor .preview-back-button,
 .pair-editor .preview-results,
-.pair-editor .preview-error,
-.pair-editor .run-progress {
+.pair-editor .preview-error {
   order: 11;
 }
 .preview-results-header {
@@ -1426,6 +1455,140 @@ button:disabled {
   margin: 0.5rem 0 0;
   font-size: 0.875rem;
   color: #334155;
+}
+
+.run-progress-failed {
+  border-color: #fecaca;
+  background: #fef2f2;
+}
+
+.run-progress-completed {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+}
+
+.run-queue {
+  margin: 0 1.5rem 0.75rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid #bfdbfe;
+  border-radius: 0.5rem;
+  background: #eff6ff;
+}
+
+.run-queue-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.run-queue-header h2 {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.run-queue-count {
+  color: #475569;
+  font-size: 0.8rem;
+  font-weight: 400;
+}
+
+.run-queue-items {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  max-height: 9rem;
+  overflow-y: auto;
+}
+
+.run-queue-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.3rem 0;
+  font-size: 0.85rem;
+}
+
+.run-queue-item-active {
+  font-weight: 600;
+}
+
+.run-queue-name {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: #1d4ed8;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: underline;
+}
+
+.run-queue-status {
+  margin-left: auto;
+  color: #475569;
+  font-weight: 400;
+}
+
+.run-queue-kind {
+  flex: 0 0 auto;
+  min-width: 3rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 0.25rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.run-queue-kind.kind-preview {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+
+.run-queue-kind.kind-sync {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.pair-list-sync-all {
+  width: 100%;
+  margin-bottom: 0.625rem;
+}
+
+.pair-item-badge {
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  background: #e2e8f0;
+  color: #334155;
+}
+
+.pair-item-badge.badge-running,
+.pair-item-badge.badge-queued {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.pair-item-badge.badge-awaitingInput {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.pair-item-badge.badge-completed {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.pair-item-badge.badge-failed {
+  background: #fee2e2;
+  color: #b91c1c;
 }
 
 .sniffer-view {
