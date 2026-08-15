@@ -5,9 +5,11 @@ import type { FolderPair, SyncPlan } from "../types";
 import {
   beginEdit,
   cancelEdit,
+  clearPairPreview,
+  getPairPreview,
   getPairsState,
   loadPairs,
-  previewSelectedPair,
+  previewPairById,
   resetPairsStoreForTests,
   saveEditing,
   selectPair,
@@ -180,17 +182,17 @@ describe("pairsStore", () => {
     await loadPairs();
     selectPair("pair-1");
     updateEditing({ mode: "synchronize" });
-    await previewSelectedPair();
+    await previewPairById(getPairsState().editing ?? samplePair);
     expect(previewApi.previewPair).toHaveBeenCalledWith({
       ...samplePair,
       mode: "synchronize",
     });
-    expect(getPairsState().previewPlan).toEqual(plan);
-    expect(getPairsState().previewLoading).toBe(false);
-    expect(getPairsState().previewError).toBeNull();
+    expect(getPairPreview("pair-1").plan).toEqual(plan);
+    expect(getPairPreview("pair-1").loading).toBe(false);
+    expect(getPairPreview("pair-1").error).toBeNull();
   });
 
-  it("ignores stale preview responses after selectPair", async () => {
+  it("keeps preview results attached to their own pair", async () => {
     const pair2: FolderPair = { ...samplePair, id: "pair-2", name: "Other" };
     vi.mocked(pairsApi.listPairs).mockResolvedValue([samplePair, pair2]);
     let resolvePreview!: (plan: SyncPlan) => void;
@@ -203,34 +205,86 @@ describe("pairsStore", () => {
 
     await loadPairs();
     selectPair("pair-1");
-    const previewPromise = previewSelectedPair();
+    const previewPromise = previewPairById(samplePair);
+    await vi.waitFor(() => expect(previewApi.previewPair).toHaveBeenCalled());
     selectPair("pair-2");
 
-    resolvePreview({
+    const plan: SyncPlan = {
       pairId: "pair-1",
       scannedLeft: 1,
       scannedRight: 1,
       actions: [],
-    });
+    };
+    resolvePreview(plan);
     await previewPromise;
 
-    expect(getPairsState().previewPlan).toBeNull();
-    expect(getPairsState().previewLoading).toBe(false);
+    // The late result belongs to pair-1 and must not leak into pair-2's view.
+    expect(getPairPreview("pair-1").plan).toEqual(plan);
+    expect(getPairPreview("pair-1").loading).toBe(false);
+    expect(getPairPreview("pair-2").plan).toBeNull();
   });
 
-  it("resets previewLoading on cancelEdit", async () => {
+  it("drops a superseded preview for the same pair", async () => {
+    vi.mocked(pairsApi.listPairs).mockResolvedValue([samplePair]);
+    const resolvers: ((plan: SyncPlan) => void)[] = [];
+    vi.mocked(previewApi.previewPair).mockImplementation(
+      () => new Promise((resolve) => resolvers.push(resolve)),
+    );
+
+    await loadPairs();
+    selectPair("pair-1");
+    const first = previewPairById(samplePair);
+    const second = previewPairById(samplePair);
+    await vi.waitFor(() => expect(resolvers).toHaveLength(2));
+
+    resolvers[1]({
+      pairId: "pair-1",
+      scannedLeft: 2,
+      scannedRight: 2,
+      actions: [],
+    });
+    resolvers[0]({
+      pairId: "pair-1",
+      scannedLeft: 1,
+      scannedRight: 1,
+      actions: [{ kind: "copyLeftToRight", path: "stale.txt" }],
+    });
+    await Promise.all([first, second]);
+
+    expect(getPairPreview("pair-1").plan?.scannedLeft).toBe(2);
+  });
+
+  it("keeps a running preview attached to the pair after cancelEdit", async () => {
     vi.mocked(pairsApi.listPairs).mockResolvedValue([samplePair]);
     vi.mocked(previewApi.previewPair).mockImplementation(
       () => new Promise(() => {}),
     );
     await loadPairs();
     selectPair("pair-1");
-    void previewSelectedPair();
-    expect(getPairsState().previewLoading).toBe(true);
+    void previewPairById(samplePair);
+    expect(getPairPreview("pair-1").loading).toBe(true);
 
     cancelEdit();
-    expect(getPairsState().previewLoading).toBe(false);
+    expect(getPairPreview("pair-1").loading).toBe(true);
     expect(getPairsState().editing).toBeNull();
+  });
+
+  it("clears a pair's cached preview once a run consumes it", async () => {
+    const plan: SyncPlan = {
+      pairId: "pair-1",
+      scannedLeft: 1,
+      scannedRight: 1,
+      actions: [],
+    };
+    vi.mocked(pairsApi.listPairs).mockResolvedValue([samplePair]);
+    vi.mocked(previewApi.previewPair).mockResolvedValue(plan);
+    await loadPairs();
+    selectPair("pair-1");
+    await previewPairById(getPairsState().editing ?? samplePair);
+    expect(getPairPreview("pair-1").plan).toEqual(plan);
+
+    clearPairPreview("pair-1");
+    expect(getPairPreview("pair-1").plan).toBeNull();
   });
 
   it("debounces path-exists checks for watch warning", async () => {
@@ -262,9 +316,9 @@ describe("pairsStore", () => {
     );
     await loadPairs();
     selectPair("pair-1");
-    await previewSelectedPair();
-    expect(getPairsState().previewError).toBe("scan left failed");
-    expect(getPairsState().previewPlan).toBeNull();
+    await previewPairById(getPairsState().editing ?? samplePair);
+    expect(getPairPreview("pair-1").error).toBe("scan left failed");
+    expect(getPairPreview("pair-1").plan).toBeNull();
   });
 
   it("rejects identical paths", async () => {

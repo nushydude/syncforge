@@ -75,7 +75,7 @@ impl Default for RunOptions {
             use_recycle_bin: true,
             conflict_resolutions: HashMap::new(),
             stop_on_error: true,
-            content_hash_compare: true,
+            content_hash_compare: false,
             content_hash_max_bytes: 50 * 1024 * 1024,
             plan: None,
             plan_preconditions: None,
@@ -426,6 +426,8 @@ where
                 right_root: Some(right_root.to_path_buf()),
                 content_hash_compare,
                 content_hash_max_bytes,
+                cancel: None,
+                hash_progress: None,
             },
         )
     };
@@ -1150,10 +1152,10 @@ mod tests {
         };
         db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
 
         let (plan, preview_scans) =
-            with_scan_counting(|| preview_pair_impl(&pair, None).expect("preview"));
+            with_scan_counting(|| preview_pair_impl(&pair, None, &cancel).expect("preview"));
         assert_eq!(preview_scans, 2, "preview should scan left and right once each");
 
         let (_, run_scans) = with_scan_counting(|| {
@@ -1215,7 +1217,7 @@ mod tests {
         };
         db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let mut events = Vec::new();
         let report = run_pair_impl(
             &db,
@@ -1263,7 +1265,7 @@ mod tests {
         };
         db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let mut failed_report: Option<RunReport> = None;
         let err = run_pair_impl(
             &db,
@@ -1360,7 +1362,7 @@ mod tests {
         };
         db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let report = run_pair_impl(&db, &pair, RunOptions::default(), &cancel, |p| {
             if let ProgressEvent::Update(p) = p {
                 if p.phase == "running" && p.current >= 1 {
@@ -1409,7 +1411,7 @@ mod tests {
         };
         db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let report = run_pair_impl(
             &db,
             &pair,
@@ -1542,7 +1544,7 @@ mod tests {
         };
         db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let err = run_pair_impl(
             &db,
             &pair,

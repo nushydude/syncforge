@@ -66,22 +66,33 @@ pub async fn run_pair(
         return Err("pair id required".into());
     }
 
-    let (plan, plan_preconditions) = if let Some(plan_id) = options.plan_id.as_deref() {
+    // Reserve the pair's run slot first: taking the plan consumes it, so doing
+    // that before a failed acquisition would destroy a plan for a run that
+    // never starts.
+    let cancel = try_acquire_pair_run(&state, &pair_id)?;
+
+    let take_plan = || -> Result<(Option<_>, Option<PlanPreconditions>), String> {
+        let Some(plan_id) = options.plan_id.as_deref() else {
+            return Ok((None, None));
+        };
         let fingerprint = config_fingerprint(&pair);
         let (plan, left_preconditions, right_preconditions) = state
             .preview_plans
             .lock()
             .map_err(|e| e.to_string())?
             .take(plan_id, &pair.id, &fingerprint, current_millis())?;
-        (
+        Ok((
             Some(plan),
             Some(PlanPreconditions { left: left_preconditions, right: right_preconditions }),
-        )
-    } else {
-        (None, None)
+        ))
     };
-
-    let cancel = try_acquire_pair_run(&state, &pair_id)?;
+    let (plan, plan_preconditions) = match take_plan() {
+        Ok(taken) => taken,
+        Err(e) => {
+            release_sync_slot(app.clone(), &state, &pair_id, &cancel);
+            return Err(e);
+        }
+    };
 
     let run_options = RunOptions {
         verify_hashes: options.verify_hashes,

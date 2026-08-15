@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use tauri::State;
@@ -10,7 +11,7 @@ use crate::models::{
 };
 use crate::path_normalization;
 use crate::persistence::DatabaseHandle;
-use crate::scanner::{assert_destructive_scan_allowed, scan_directory, ScanIntegrity};
+use crate::scanner::{assert_destructive_scan_allowed, scan_directory_observed, ScanIntegrity};
 use crate::state::{
     canonical_job_roots, AppState, HeavyJobKind, HeavyJobPermit, WorkCoordinator, WorkRequest,
     PREVIEW_PAGE_MAX,
@@ -77,13 +78,33 @@ pub(crate) fn admit_preview(
 pub(crate) fn preview_pair_impl(
     pair: &FolderPair,
     snapshot_entries: Option<&[FileEntry]>,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<SyncPlan, String> {
-    build_preview(pair, snapshot_entries).map(|(plan, _, _)| plan)
+    build_preview(pair, snapshot_entries, cancel).map(|(plan, _, _)| plan)
+}
+
+/// Reports `(phase, count, latest path)` throughout a preview.
+pub(crate) type ScanReporter = Arc<dyn Fn(&str, u64, &str) + Send + Sync>;
+
+fn silent_reporter() -> ScanReporter {
+    Arc::new(|_, _, _| {})
 }
 
 pub(crate) fn build_preview(
     pair: &FolderPair,
     snapshot_entries: Option<&[FileEntry]>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(SyncPlan, Vec<FileEntry>, Vec<FileEntry>), String> {
+    build_preview_observed(pair, snapshot_entries, cancel, &silent_reporter())
+}
+
+/// `on_scan` receives `(phase, count, latest path)` through every phase of the
+/// preview — walking, comparing, and hashing — so a long pass never looks frozen.
+pub(crate) fn build_preview_observed(
+    pair: &FolderPair,
+    snapshot_entries: Option<&[FileEntry]>,
+    cancel: &Arc<AtomicBool>,
+    on_scan: &ScanReporter,
 ) -> Result<(SyncPlan, Vec<FileEntry>, Vec<FileEntry>), String> {
     if pair.id.is_empty() {
         return Err("pair id required for preview".into());
@@ -92,10 +113,20 @@ pub(crate) fn build_preview(
     let left_path = path_normalization::to_long_path(&pair.left_path);
     let right_path = path_normalization::to_long_path(&pair.right_path);
 
-    let mut left_scan = scan_directory(Path::new(&left_path), &pair.filters)
-        .map_err(|e| format!("scan left failed: {e}"))?;
-    let mut right_scan = scan_directory(Path::new(&right_path), &pair.filters)
-        .map_err(|e| format!("scan right failed: {e}"))?;
+    let mut left_scan = scan_directory_observed(
+        Path::new(&left_path),
+        &pair.filters,
+        cancel,
+        &mut |entries, path| on_scan("left", entries, path),
+    )
+    .map_err(|e| format!("scan left failed: {e}"))?;
+    let mut right_scan = scan_directory_observed(
+        Path::new(&right_path),
+        &pair.filters,
+        cancel,
+        &mut |entries, path| on_scan("right", entries, path),
+    )
+    .map_err(|e| format!("scan right failed: {e}"))?;
 
     assert_destructive_scan_allowed(pair.mode, &left_scan, &right_scan)?;
 
@@ -112,9 +143,18 @@ pub(crate) fn build_preview(
         DiffOptions {
             left_root: Some(Path::new(&left_path).to_path_buf()),
             right_root: Some(Path::new(&right_path).to_path_buf()),
+            cancel: Some(Arc::clone(cancel)),
+            hash_progress: Some({
+                let reporter = Arc::clone(on_scan);
+                Arc::new(move |files, path: &str| reporter("comparing", files, path))
+            }),
             ..DiffOptions::default()
         },
     );
+    // Planning reads file contents; bail out before reporting a degraded plan.
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("scan cancelled".into());
+    }
     if plan.requires_attention
         && matches!(pair.mode, crate::models::SyncMode::Echo | crate::models::SyncMode::Synchronize)
     {
@@ -128,23 +168,31 @@ pub(crate) fn build_preview(
         &plan.actions,
         &mut preview_hash_bytes,
         &mut preview_hash_files,
+        cancel,
+        &mut |files, path| on_scan("hashing left", files, path),
     )?;
+
     populate_preview_hashes_for_actions(
         &mut right_scan.entries,
         Path::new(&right_path),
         &plan.actions,
         &mut preview_hash_bytes,
         &mut preview_hash_files,
+        cancel,
+        &mut |files, path| on_scan("hashing right", files, path),
     )?;
     Ok((plan, left_scan.entries, right_scan.entries))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn populate_preview_hashes_for_actions(
     entries: &mut [FileEntry],
     root: &Path,
     actions: &[SyncAction],
     hashed_bytes: &mut u64,
     hashed_files: &mut usize,
+    cancel: &Arc<AtomicBool>,
+    on_hash: &mut dyn FnMut(u64, &str),
 ) -> Result<(), String> {
     const PREVIEW_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
     const PREVIEW_SUBTREE_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -200,6 +248,12 @@ fn populate_preview_hashes_for_actions(
         {
             return Err("preview content exceeds the bounded validation budget".into());
         }
+        // Hashing is the slowest phase of a preview; without this check a cancel
+        // during it would be ignored until every selected file had been read.
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("scan cancelled".into());
+        }
+        on_hash(*hashed_files as u64, &entry.relative_path);
         let path = root.join(entry.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
         entry.hash =
             Some(crate::hashing::hash_file(&path).map_err(|error| {
@@ -218,9 +272,23 @@ fn load_preview_snapshot(
         .map(|snapshot| snapshot.map(|s| s.entries))
 }
 
+/// Scan heartbeat so the UI can show a long walk is alive.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewScanProgressPayload {
+    pub pair_id: String,
+    pub side: String,
+    pub entries: u64,
+    pub path: String,
+}
+
+/// Throttles scan heartbeats crossing the Tauri bridge.
+const SCAN_EVENT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+
 #[tauri::command]
 pub async fn preview_pair(
     pair: FolderPair,
+    app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<PreviewSummary, String> {
     if pair.id.is_empty() {
@@ -231,11 +299,41 @@ pub async fn preview_pair(
     let app_state = Arc::clone(&state);
     let db = Arc::clone(&state.db);
     let roots = canonical_job_roots(&[&pair.left_path, &pair.right_path]);
-    tauri::async_runtime::spawn_blocking(move || {
+    let cancel = register_preview_cancel(&state, &pair.id)?;
+    let cancel_pair_id = pair.id.clone();
+    let cancel_state = Arc::clone(&state);
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let _permit = admit_preview(&work_coordinator, roots)?;
         let snapshot_entries = load_preview_snapshot(db.as_ref(), &pair.id)?;
+        let progress_pair_id = pair.id.clone();
+        let last_event = std::sync::Mutex::new(None::<std::time::Instant>);
+        let reporter: ScanReporter = Arc::new(move |side: &str, entries, path: &str| {
+            {
+                let Ok(mut last) = last_event.lock() else { return };
+                let now = std::time::Instant::now();
+                // Always let a phase change through, otherwise the UI can sit on
+                // a stale phase for as long as the throttle window.
+                let phase_changed = last.is_none();
+                if !phase_changed
+                    && last.is_some_and(|at| now.duration_since(at) < SCAN_EVENT_INTERVAL)
+                {
+                    return;
+                }
+                *last = Some(now);
+            }
+            let _ = crate::run_coordinator::emit_event(
+                &app,
+                "preview://scan-progress",
+                &PreviewScanProgressPayload {
+                    pair_id: progress_pair_id.clone(),
+                    side: side.to_string(),
+                    entries,
+                    path: path.to_string(),
+                },
+            );
+        });
         let (plan, left_preconditions, right_preconditions) =
-            build_preview(&pair, snapshot_entries.as_deref())?;
+            build_preview_observed(&pair, snapshot_entries.as_deref(), &cancel, &reporter)?;
         let created_at = now_millis();
         let fingerprint = config_fingerprint(&pair);
         let mut summary = preview_summary(&plan, String::new(), fingerprint.clone(), created_at);
@@ -252,7 +350,41 @@ pub async fn preview_pair(
         Ok(summary)
     })
     .await
-    .map_err(|e| format!("preview task failed: {e}"))?
+    .map_err(|e| format!("preview task failed: {e}"));
+
+    clear_preview_cancel(&cancel_state, &cancel_pair_id);
+    result?
+}
+
+/// Reserves the cancel slot for a pair's preview; one preview per pair at a time.
+fn register_preview_cancel(
+    state: &Arc<AppState>,
+    pair_id: &str,
+) -> Result<Arc<AtomicBool>, String> {
+    let mut cancels = state.preview_cancels.lock().map_err(|e| e.to_string())?;
+    if cancels.contains_key(pair_id) {
+        return Err(format!("preview already in progress for pair {pair_id}"));
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    cancels.insert(pair_id.to_string(), Arc::clone(&cancel));
+    Ok(cancel)
+}
+
+fn clear_preview_cancel(state: &Arc<AppState>, pair_id: &str) {
+    if let Ok(mut cancels) = state.preview_cancels.lock() {
+        cancels.remove(pair_id);
+    }
+}
+
+/// Stops an in-progress preview scan for `pair_id`.
+#[tauri::command]
+pub fn cancel_preview(pair_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let cancels = state.preview_cancels.lock().map_err(|e| e.to_string())?;
+    let Some(flag) = cancels.get(&pair_id) else {
+        return Err(format!("no preview in progress for pair {pair_id}"));
+    };
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 #[tauri::command]
@@ -330,7 +462,11 @@ mod tests {
         pair: &FolderPair,
     ) -> Result<crate::models::SyncPlan, String> {
         let snapshot_entries = super::load_preview_snapshot(db, &pair.id)?;
-        super::preview_pair_impl(pair, snapshot_entries.as_deref())
+        super::preview_pair_impl(
+            pair,
+            snapshot_entries.as_deref(),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
     }
 
     #[test]
@@ -366,6 +502,30 @@ mod tests {
                     if path == "remove.txt"
             )
         }));
+    }
+
+    /// A cancel raised after the walk (during planning/hashing) must still stop
+    /// the preview — that phase reads file contents and used to run to completion.
+    #[test]
+    fn preview_stops_when_cancelled_before_planning() {
+        let data_dir = TempDir::new().expect("tempdir");
+        let db = Database::open(&data_dir.path().join("test.db")).expect("db");
+
+        let left_dir = data_dir.path().join("left");
+        let right_dir = data_dir.path().join("right");
+        fs::create_dir_all(&left_dir).expect("mkdir left");
+        fs::create_dir_all(&right_dir).expect("mkdir right");
+        fs::write(left_dir.join("a.txt"), "a").expect("write");
+        fs::write(right_dir.join("b.txt"), "b").expect("write");
+
+        let id = new_pair_id();
+        save_echo_pair(&db, &id, &left_dir, &right_dir);
+        let pair = db.get_pair(&id).expect("get").expect("pair");
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let error = super::preview_pair_impl(&pair, None, &cancel).expect_err("cancelled");
+
+        assert!(error.contains("cancelled"), "unexpected error: {error}");
     }
 
     #[test]

@@ -4,7 +4,7 @@ import { DuplicatesView } from "./components/duplicates/DuplicatesView";
 import { PairsPanel } from "./components/pairs/PairsPanel";
 import { SettingsView } from "./components/settings/SettingsView";
 import { useRunStore } from "./hooks/useRunStore";
-import type { RunStoreState } from "./store/runStore";
+import { isRunExecuting } from "./store/runStore";
 import { FolderSnifferView } from "./components/sniffer/FolderSnifferView";
 
 type AppView = "pairs" | "sniffer" | "duplicates" | "settings";
@@ -19,7 +19,8 @@ function NavIcon({ children }: { children: string }) {
 
 function App() {
   const [view, setView] = useState<AppView>("pairs");
-  const running = useRunStore((s: RunStoreState) => s.running);
+  // Other heavy-scan views stay locked only while a pair is actively syncing.
+  const running = useRunStore(isRunExecuting);
 
   return (
     <div className="app">
