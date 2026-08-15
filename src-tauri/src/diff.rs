@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::hashing;
 use crate::models::{
@@ -8,15 +10,42 @@ use crate::models::{
 };
 use crate::scanner::ScanIntegrity;
 
+/// Reports `(files hashed, latest path)` while planning reads file contents.
+pub type HashProgress = Arc<dyn Fn(u64, &str) + Send + Sync>;
+
 /// Options for comparing file entries during sync planning.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DiffOptions {
     pub left_root: Option<PathBuf>,
     pub right_root: Option<PathBuf>,
-    /// When metadata matches, hash file contents to detect same-second edits.
+    /// Hash file contents when size and modification time already match.
+    ///
+    /// Off by default. Once the scanner records nanosecond timestamps, an exact
+    /// size + mtime match is taken as identical: hashing would only catch a file
+    /// changed without altering either, and it costs a full read of both copies
+    /// of every matching file — minutes of disk I/O on a large in-sync pair.
     pub content_hash_compare: bool,
     /// Maximum file size (bytes) eligible for content hashing (exclusive upper bound).
     pub content_hash_max_bytes: u64,
+    /// Stops content hashing when set. Planning a large pair reads a lot of file
+    /// data, so a cancel must be honoured here and not only during the walk.
+    pub cancel: Option<Arc<AtomicBool>>,
+    /// Called as files are hashed. Without it a long planning pass looks frozen,
+    /// because the walk counters have already stopped moving by then.
+    pub hash_progress: Option<HashProgress>,
+}
+
+impl std::fmt::Debug for DiffOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiffOptions")
+            .field("left_root", &self.left_root)
+            .field("right_root", &self.right_root)
+            .field("content_hash_compare", &self.content_hash_compare)
+            .field("content_hash_max_bytes", &self.content_hash_max_bytes)
+            .field("cancel", &self.cancel)
+            .field("hash_progress", &self.hash_progress.is_some())
+            .finish()
+    }
 }
 
 impl Default for DiffOptions {
@@ -24,9 +53,19 @@ impl Default for DiffOptions {
         Self {
             left_root: None,
             right_root: None,
-            content_hash_compare: true,
+            content_hash_compare: false,
             content_hash_max_bytes: 50 * 1024 * 1024,
+            cancel: None,
+            hash_progress: None,
         }
+    }
+}
+
+impl DiffOptions {
+    /// True when a caller asked to stop; planning reads file data, so callers
+    /// must be able to interrupt it.
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
     }
 }
 
@@ -50,6 +89,7 @@ struct DiffContext<'a> {
     options: &'a DiffOptions,
     hashes: RefCell<HashMap<HashKey, Result<String, String>>>,
     hash_warnings: RefCell<Vec<String>>,
+    hashed_files: std::cell::Cell<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -67,6 +107,7 @@ pub fn build_sync_plan(
         options: &diff_options,
         hashes: RefCell::new(HashMap::new()),
         hash_warnings: RefCell::new(Vec::new()),
+        hashed_files: std::cell::Cell::new(0),
     };
     let mut actions = Vec::new();
     let empty_snapshot = [];
@@ -605,6 +646,16 @@ fn hash_entry(
     if let Some(cached) = ctx.hashes.borrow().get(&key) {
         return Some(cached.clone());
     }
+    // Stop reading file data as soon as the caller cancels; the partial plan is
+    // discarded by the caller's own cancel check.
+    if ctx.options.cancelled() {
+        return None;
+    }
+    let hashed = ctx.hashed_files.get() + 1;
+    ctx.hashed_files.set(hashed);
+    if let Some(report) = ctx.options.hash_progress.as_ref() {
+        report(hashed, &entry.relative_path);
+    }
     let path = join_relative(root, &entry.relative_path);
     let result = hashing::hash_file(&path)
         .map_err(|error| format!("{}: content hash failed: {error}", entry.relative_path));
@@ -1083,6 +1134,8 @@ mod tests {
             ScanIntegrity::default(),
             DiffOptions {
                 left_root: Some(left_root.clone()),
+                cancel: None,
+                hash_progress: None,
                 right_root: Some(right_root.clone()),
                 content_hash_compare: false,
                 content_hash_max_bytes: 50 * 1024 * 1024,
@@ -1100,12 +1153,53 @@ mod tests {
             ScanIntegrity::default(),
             DiffOptions {
                 left_root: Some(left_root),
+                cancel: None,
+                hash_progress: None,
                 right_root: Some(right_root),
                 content_hash_compare: true,
                 content_hash_max_bytes: 50 * 1024 * 1024,
             },
         );
         assert!(has_copy_ltr(&with_hash, "doc.txt"));
+    }
+
+    /// Previewing an in-sync pair must not read file contents. Hashing every
+    /// matching file cost minutes of disk I/O on large libraries.
+    #[test]
+    fn identical_metadata_does_not_read_file_contents_by_default() {
+        use crate::hashing::{hash_invocation_count, reset_hash_invocations};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let left_root = dir.path().join("left");
+        let right_root = dir.path().join("right");
+        fs::create_dir_all(&left_root).expect("mkdir left");
+        fs::create_dir_all(&right_root).expect("mkdir right");
+        fs::write(left_root.join("doc.txt"), "same").expect("write left");
+        fs::write(right_root.join("doc.txt"), "diff").expect("write right");
+
+        let left = vec![file_with_nanos("doc.txt", 4, 100, 7)];
+        let right = vec![file_with_nanos("doc.txt", 4, 100, 7)];
+        reset_hash_invocations();
+
+        let plan = build_sync_plan(
+            "p1",
+            SyncMode::Echo,
+            ConflictPolicy::NewerWins,
+            &left,
+            &right,
+            None,
+            ScanIntegrity::default(),
+            DiffOptions {
+                left_root: Some(left_root),
+                right_root: Some(right_root),
+                ..DiffOptions::default()
+            },
+        );
+
+        assert_eq!(hash_invocation_count(), 0, "default preview must not hash");
+        assert!(plan.actions.is_empty());
     }
 
     #[test]
@@ -1137,7 +1231,10 @@ mod tests {
             ScanIntegrity::default(),
             DiffOptions {
                 left_root: Some(left_root),
+                cancel: None,
+                hash_progress: None,
                 right_root: Some(right_root),
+                content_hash_compare: true,
                 ..DiffOptions::default()
             },
         );
@@ -1173,6 +1270,8 @@ mod tests {
             ScanIntegrity::default(),
             DiffOptions {
                 left_root: Some(left_root),
+                cancel: None,
+                hash_progress: None,
                 right_root: Some(right_root),
                 ..DiffOptions::default()
             },
@@ -1206,6 +1305,7 @@ mod tests {
             DiffOptions {
                 left_root: Some(dir.path().join("left")),
                 right_root: Some(dir.path().join("right")),
+                content_hash_compare: true,
                 ..DiffOptions::default()
             },
         );

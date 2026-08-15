@@ -42,3 +42,8 @@ export function getPreviewConflicts(
     limit,
   });
 }
+
+/** Stops an in-progress preview scan for a pair. */
+export function cancelPreview(pairId: string): Promise<void> {
+  return invoke<void>("cancel_preview", { pairId });
+}

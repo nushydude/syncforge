@@ -9,6 +9,7 @@ import {
   ensureWatchSkippedListener,
 } from "../../store/runStore";
 import type { RunStoreState } from "../../store/runStore";
+import { RunQueuePanel } from "../run/RunQueuePanel";
 import { PairDetails } from "./PairDetails";
 import { PairEditor } from "./PairEditor";
 import { PairList } from "./PairList";
@@ -67,6 +68,8 @@ export function PairsPanel() {
           Sync history
         </button>
       </div>
+      {/* Visible on both tabs so a parked queue is never a mystery. */}
+      <RunQueuePanel />
       {section === "history" ? (
         <HistoryView active />
       ) : (

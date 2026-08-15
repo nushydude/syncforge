@@ -1,3 +1,4 @@
+import { listen } from "@tauri-apps/api/event";
 import * as pairsApi from "../api/pairs";
 import * as previewApi from "../api/preview";
 import { validatePairForm } from "../lib/pairValidation";
@@ -14,6 +15,22 @@ import type {
 import { defaultFilters } from "../types";
 import { getAppSettings } from "./settingsStore";
 
+/** Scan/preview result for a single pair — kept per pair so views stay independent. */
+export interface PairPreviewState {
+  plan: PreviewSummary | null;
+  /** Waiting in the shared work queue, not scanning yet. */
+  queued: boolean;
+  loading: boolean;
+  error: string | null;
+  /** Epoch ms the scan started — kept in the store so the timer survives
+   * navigating away and back, which would reset component-local state. */
+  startedAt: number | null;
+  /** Live heartbeat from the backend walk. */
+  scannedEntries: number;
+  scanSide: string | null;
+  scanPath: string | null;
+}
+
 export interface PairsStoreState {
   pairs: FolderPair[];
   selectedId: string | null;
@@ -23,13 +40,24 @@ export interface PairsStoreState {
   saving: boolean;
   error: string | null;
   validationErrors: string[];
-  previewPlan: PreviewSummary | null;
-  previewLoading: boolean;
-  previewError: string | null;
+  /** Keyed by pair id; a pair's preview survives switching to another pair. */
+  previews: Record<string, PairPreviewState>;
   watchWarning: string | null;
   scheduleError: string | null;
   scheduleDescription: string | null;
 }
+
+/** Stable identity so selectors comparing snapshots stay referentially equal. */
+export const emptyPairPreview: PairPreviewState = {
+  plan: null,
+  queued: false,
+  loading: false,
+  error: null,
+  startedAt: null,
+  scannedEntries: 0,
+  scanSide: null,
+  scanPath: null,
+};
 
 type Listener = () => void;
 
@@ -55,30 +83,46 @@ function emptyPair(): FolderPair {
   };
 }
 
-let state: PairsStoreState = {
-  pairs: [],
-  selectedId: null,
-  editing: null,
-  editorOpen: false,
-  loading: false,
-  saving: false,
-  error: null,
-  validationErrors: [],
-  previewPlan: null,
-  previewLoading: false,
-  previewError: null,
-  watchWarning: null,
-  scheduleError: null,
-  scheduleDescription: null,
-};
+function emptyState(): PairsStoreState {
+  return {
+    pairs: [],
+    selectedId: null,
+    editing: null,
+    editorOpen: false,
+    loading: false,
+    saving: false,
+    error: null,
+    validationErrors: [],
+    previews: {},
+    watchWarning: null,
+    scheduleError: null,
+    scheduleDescription: null,
+  };
+}
+
+let state: PairsStoreState = emptyState();
 
 const WATCH_INACTIVE_MSG =
   "Auto-sync watch is saved but inactive until both folder paths exist on disk.";
 
 const listeners = new Set<Listener>();
 
-/** Monotonic token — stale preview responses are ignored when this changes. */
-let previewRequestId = 0;
+/** Monotonic token per pair — stale preview responses are ignored when it changes. */
+const previewRequestIds = new Map<string, number>();
+
+function bumpPreviewRequest(pairId: string): number {
+  const next = (previewRequestIds.get(pairId) ?? 0) + 1;
+  previewRequestIds.set(pairId, next);
+  return next;
+}
+
+function setPreview(pairId: string, patch: Partial<PairPreviewState>): void {
+  const current = state.previews[pairId] ?? emptyPairPreview;
+  state = {
+    ...state,
+    previews: { ...state.previews, [pairId]: { ...current, ...patch } },
+  };
+}
 
 const PATH_EXISTS_DEBOUNCE_MS = 300;
 let watchWarningTimer: ReturnType<typeof setTimeout> | null = null;
@@ -88,8 +132,35 @@ function emit() {
   listeners.forEach((l) => l());
 }
 
-export function isPreviewLoading(): boolean {
-  return state.previewLoading;
+export function getPairPreview(
+  pairId: string | null | undefined,
+): PairPreviewState {
+  if (!pairId) return emptyPairPreview;
+  return state.previews[pairId] ?? emptyPairPreview;
+}
+
+export function isPreviewLoadingForPair(
+  pairId: string | null | undefined,
+): boolean {
+  return getPairPreview(pairId).loading;
+}
+
+/** Surfaces a preview-related failure against the pair it belongs to. */
+export function setPreviewError(pairId: string, message: string): void {
+  setPreview(pairId, { error: message });
+  emit();
+}
+
+/** Drops a pair's cached plan — used once a run consumes the backend plan. */
+export function clearPairPreview(pairId: string): void {
+  if (!state.previews[pairId]) {
+    return;
+  }
+  bumpPreviewRequest(pairId);
+  const previews = { ...state.previews };
+  delete previews[pairId];
+  state = { ...state, previews };
+  emit();
 }
 
 export function getPairsState(): PairsStoreState {
@@ -197,7 +268,6 @@ export function selectPair(id: string): void {
   if (!pair) {
     return;
   }
-  previewRequestId++;
   state = {
     ...state,
     selectedId: id,
@@ -205,9 +275,6 @@ export function selectPair(id: string): void {
     editorOpen: false,
     validationErrors: [],
     error: null,
-    previewPlan: null,
-    previewLoading: false,
-    previewError: null,
     watchWarning: null,
     scheduleError: null,
     scheduleDescription: null,
@@ -250,16 +317,12 @@ export function beginEdit(): void {
 }
 
 export function cancelEdit(): void {
-  previewRequestId++;
   state = {
     ...state,
     editing: null,
     editorOpen: false,
     validationErrors: [],
     error: null,
-    previewPlan: null,
-    previewLoading: false,
-    previewError: null,
     watchWarning: null,
     scheduleError: null,
     scheduleDescription: null,
@@ -267,38 +330,83 @@ export function cancelEdit(): void {
   emit();
 }
 
-export async function previewSelectedPair(): Promise<void> {
-  const editing = state.editing;
-  if (!editing?.id) {
+/** Marks a pair as waiting in the shared work queue for its turn to scan. */
+export function markPreviewQueued(pairId: string): void {
+  bumpPreviewRequest(pairId);
+  setPreview(pairId, {
+    ...emptyPairPreview,
+    queued: true,
+  });
+  emit();
+}
+
+let unlistenScanProgress: (() => void) | null = null;
+
+/** Subscribes to backend scan heartbeats so a long walk shows real progress. */
+export async function ensureScanProgressListener(): Promise<void> {
+  if (unlistenScanProgress) {
     return;
   }
+  unlistenScanProgress = await listen<{
+    pairId: string;
+    side: string;
+    entries: number;
+    path: string;
+  }>("preview://scan-progress", (event) => {
+    const { pairId, side, entries, path } = event.payload;
+    if (!state.previews[pairId]?.loading) {
+      return;
+    }
+    setPreview(pairId, {
+      scannedEntries: entries,
+      scanSide: side,
+      scanPath: path || null,
+    });
+    emit();
+  });
+}
 
-  const requestId = ++previewRequestId;
-  state = {
-    ...state,
-    previewLoading: true,
-    previewError: null,
-    previewPlan: null,
-  };
+/**
+ * Scans one pair; the result is stored against that pair id only. Callers go
+ * through the shared work queue rather than invoking this directly, so that only
+ * one scan walks the disk at a time.
+ */
+export async function previewPairById(pair: FolderPair): Promise<void> {
+  if (!pair.id) {
+    return;
+  }
+  const pairId = pair.id;
+  const requestId = bumpPreviewRequest(pairId);
+  setPreview(pairId, {
+    ...emptyPairPreview,
+    loading: true,
+    startedAt: Date.now(),
+  });
   emit();
 
   try {
-    const previewPlan = await previewApi.previewPair(editing);
-    if (requestId !== previewRequestId) {
+    await ensureScanProgressListener();
+    const plan = await previewApi.previewPair(pair);
+    if (requestId !== previewRequestIds.get(pairId)) {
       return;
     }
-    state = { ...state, previewPlan, previewLoading: false };
+    setPreview(pairId, { plan, loading: false, scanPath: null });
   } catch (e) {
-    if (requestId !== previewRequestId) {
+    if (requestId !== previewRequestIds.get(pairId)) {
       return;
     }
-    state = {
-      ...state,
-      previewLoading: false,
-      previewError: e instanceof Error ? e.message : String(e),
-    };
+    const message = e instanceof Error ? e.message : String(e);
+    // A cancelled scan is a user action, not a failure to report.
+    setPreview(pairId, {
+      loading: false,
+      error: isCancelledScan(message) ? null : message,
+    });
   }
   emit();
+}
+
+function isCancelledScan(message: string): boolean {
+  return message.includes("cancelled");
 }
 
 export function updateEditing(patch: Partial<FolderPair>): void {
@@ -412,6 +520,8 @@ export async function saveEditing(): Promise<boolean> {
       saving: false,
       validationErrors: [],
     };
+    // Config changes invalidate the stored plan's fingerprint on the backend.
+    clearPairPreview(scheduled.id);
     emit();
     refreshWatchWarning(state.editing);
     await refreshScheduleDescription(state.editing);
@@ -437,9 +547,13 @@ export async function deleteSelected(): Promise<boolean> {
   try {
     await pairsApi.deletePair(id);
     const pairs = state.pairs.filter((p) => p.id !== id);
+    const previews = { ...state.previews };
+    delete previews[id];
+    previewRequestIds.delete(id);
     state = {
       ...state,
       pairs,
+      previews,
       selectedId: null,
       editing: null,
       editorOpen: false,
@@ -461,27 +575,12 @@ export async function deleteSelected(): Promise<boolean> {
 
 /** Test helper — reset module state between Vitest cases. */
 export function resetPairsStoreForTests(): void {
-  previewRequestId = 0;
+  previewRequestIds.clear();
   watchWarningRequestId = 0;
   if (watchWarningTimer) {
     clearTimeout(watchWarningTimer);
     watchWarningTimer = null;
   }
-  state = {
-    pairs: [],
-    selectedId: null,
-    editing: null,
-    editorOpen: false,
-    loading: false,
-    saving: false,
-    error: null,
-    validationErrors: [],
-    previewPlan: null,
-    previewLoading: false,
-    previewError: null,
-    watchWarning: null,
-    scheduleError: null,
-    scheduleDescription: null,
-  };
+  state = emptyState();
   emit();
 }
