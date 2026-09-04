@@ -53,29 +53,51 @@ struct FolderTotals {
     skipped: u64,
 }
 
-fn measure(path: &Path) -> FolderTotals {
-    let Ok(metadata) = fs::metadata(path) else {
-        return FolderTotals { size: 0, files: 0, folders: 0, skipped: 1 };
-    };
-    if metadata.is_file() {
-        return FolderTotals { size: metadata.len(), files: 1, folders: 0, skipped: 0 };
+fn is_scan_link(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Junctions and other reparse points must not escape or cycle through the scan root.
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
 
-    let mut totals = FolderTotals { size: 0, files: 0, folders: 1, skipped: 0 };
-    let Ok(children) = fs::read_dir(path) else {
-        totals.skipped += 1;
-        return totals;
-    };
-    for child in children {
-        let Ok(child) = child else {
+fn measure(path: &Path) -> FolderTotals {
+    let mut totals = FolderTotals { size: 0, files: 0, folders: 0, skipped: 0 };
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
             totals.skipped += 1;
             continue;
         };
-        let child_totals = measure(&child.path());
-        totals.size = totals.size.saturating_add(child_totals.size);
-        totals.files = totals.files.saturating_add(child_totals.files);
-        totals.folders = totals.folders.saturating_add(child_totals.folders);
-        totals.skipped = totals.skipped.saturating_add(child_totals.skipped);
+        if is_scan_link(&metadata) {
+            totals.skipped += 1;
+        } else if metadata.is_file() {
+            totals.size = totals.size.saturating_add(metadata.len());
+            totals.files += 1;
+        } else if metadata.is_dir() {
+            totals.folders += 1;
+            match fs::read_dir(&path) {
+                Ok(children) => {
+                    for child in children {
+                        match child {
+                            Ok(child) => pending.push(child.path()),
+                            Err(_) => totals.skipped += 1,
+                        }
+                    }
+                }
+                Err(_) => totals.skipped += 1,
+            }
+        } else {
+            totals.skipped += 1;
+        }
     }
     totals
 }
@@ -232,7 +254,7 @@ fn scan_folder_sizes_blocking(
             }
         };
         let child_path = child.path();
-        let metadata = match fs::metadata(&child_path) {
+        let metadata = match fs::symlink_metadata(&child_path) {
             Ok(metadata) => metadata,
             Err(_) => {
                 total.skipped += 1;
@@ -252,17 +274,19 @@ fn scan_folder_sizes_blocking(
         total.files = total.files.saturating_add(child_totals.files);
         total.folders = total.folders.saturating_add(child_totals.folders);
         total.skipped = total.skipped.saturating_add(child_totals.skipped);
-        entries.push(FolderSizeEntry {
-            name: child.file_name().to_string_lossy().into_owned(),
-            path: child_path.display().to_string(),
-            size: child_totals.size,
-            is_folder: metadata.is_dir(),
-            child_count: if metadata.is_dir() {
-                child_totals.files + child_totals.folders.saturating_sub(1)
-            } else {
-                0
-            },
-        });
+        if !is_scan_link(&metadata) {
+            entries.push(FolderSizeEntry {
+                name: child.file_name().to_string_lossy().into_owned(),
+                path: child_path.display().to_string(),
+                size: child_totals.size,
+                is_folder: metadata.is_dir(),
+                child_count: if metadata.is_dir() {
+                    child_totals.files + child_totals.folders.saturating_sub(1)
+                } else {
+                    0
+                },
+            });
+        }
         let _ = app.emit(
             "sniffer://progress",
             SnifferProgress {
@@ -282,4 +306,42 @@ fn scan_folder_sizes_blocking(
         skipped: total.skipped,
         entries,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn measures_nested_files_and_reports_missing_paths() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("nested")).unwrap();
+        fs::write(root.path().join("first"), b"abc").unwrap();
+        fs::write(root.path().join("nested/second"), b"12345").unwrap();
+        let totals = measure(root.path());
+        assert_eq!((totals.size, totals.files, totals.folders, totals.skipped), (8, 2, 2, 0));
+        assert_eq!(measure(&root.path().join("missing")).skipped, 1);
+    }
+
+    #[test]
+    fn skips_directory_links_that_cycle_back_to_root() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"abc").unwrap();
+        let link = root.path().join("cycle");
+        #[cfg(windows)]
+        {
+            // Junction creation does not require the symlink privilege on Windows.
+            let output = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(root.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        let totals = measure(root.path());
+        assert_eq!((totals.size, totals.files, totals.folders, totals.skipped), (3, 1, 1, 1));
+    }
 }

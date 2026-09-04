@@ -137,11 +137,28 @@ function FileSizeView({
   contextEntryPath?: string;
 }) {
   const [expandedFiles, setExpandedFiles] = useState(false);
-  const files = result.entries.filter((entry) => !entry.isFolder);
-  const visibleFiles = expandedFiles ? files : files.slice(0, 12);
-  const otherFiles = files.slice(12);
-  const otherSize = otherFiles.reduce((sum, entry) => sum + entry.size, 0);
-  const maxSize = Math.max(...visibleFiles.map((entry) => entry.size), 1);
+  const [page, setPage] = useState(0);
+  const files = useMemo(
+    () => result.entries.filter((entry) => !entry.isFolder),
+    [result],
+  );
+  const pageSize = 100;
+  const visibleFiles = expandedFiles
+    ? files.slice(page * pageSize, (page + 1) * pageSize)
+    : files.slice(0, 12);
+  const otherSize = useMemo(
+    () => files.slice(12).reduce((sum, entry) => sum + entry.size, 0),
+    [files],
+  );
+  const maxSize = visibleFiles.reduce(
+    (largest, entry) => Math.max(largest, entry.size),
+    1,
+  );
+
+  useEffect(() => {
+    setPage(0);
+    setExpandedFiles(false);
+  }, [result]);
 
   return (
     <section className="sniffer-file-view" aria-label="Largest files">
@@ -153,7 +170,7 @@ function FileSizeView({
         <div className="sniffer-file-view-actions">
           <span className="sniffer-file-count">
             {expandedFiles
-              ? `Showing all ${files.length.toLocaleString()}`
+              ? `Showing ${page * pageSize + 1}–${Math.min((page + 1) * pageSize, files.length)} of ${files.length.toLocaleString()}`
               : `Top ${visibleFiles.length} of ${files.length.toLocaleString()}`}
           </span>
           {onShowInMap && (
@@ -185,7 +202,7 @@ function FileSizeView({
             </div>
           </div>
         ))}
-        {otherSize > 0 && !expandedFiles && (
+        {files.length > 12 && !expandedFiles && (
           <button
             type="button"
             className="sniffer-file-row other-file-row"
@@ -210,6 +227,36 @@ function FileSizeView({
           </button>
         )}
       </div>
+      {expandedFiles && (
+        <nav className="preview-pagination" aria-label="Largest files pages">
+          <button
+            type="button"
+            onClick={() => setPage(page - 1)}
+            disabled={page === 0}
+          >
+            Previous
+          </button>
+          <span>
+            Page {page + 1} of {Math.ceil(files.length / pageSize)}
+          </span>
+          <button
+            type="button"
+            onClick={() => setPage(page + 1)}
+            disabled={(page + 1) * pageSize >= files.length}
+          >
+            Next
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setExpandedFiles(false);
+              setPage(0);
+            }}
+          >
+            Show top 12
+          </button>
+        </nav>
+      )}
     </section>
   );
 }
@@ -346,6 +393,8 @@ export function FolderSnifferView() {
 
       const cached = scanCache.current.get(path);
       if (cached && !forceRefresh) {
+        scanCache.current.delete(path);
+        scanCache.current.set(path, cached);
         setResult(cached);
         setCurrentPath(cached.path);
         setPathTrail([...nextTrail.slice(0, -1), cached.path]);
@@ -356,7 +405,14 @@ export function FolderSnifferView() {
 
       try {
         const next = await scanFolderSizes(path);
-        scanCache.current.set(next.path, next);
+        scanCache.current.delete(next.path);
+        // Bound retained scans as well as the size of each cached result.
+        if (next.entries.length <= 10_000) {
+          scanCache.current.set(next.path, next);
+          if (scanCache.current.size > 8) {
+            scanCache.current.delete(scanCache.current.keys().next().value!);
+          }
+        }
         setCurrentPath(next.path);
         setPathTrail([...nextTrail.slice(0, -1), next.path]);
         setResult(next);
@@ -374,8 +430,12 @@ export function FolderSnifferView() {
   );
 
   async function chooseFolder() {
-    const selected = await pickFolder();
-    if (selected) await openFolder(selected, [selected]);
+    try {
+      const selected = await pickFolder();
+      if (selected) await openFolder(selected, [selected]);
+    } catch (pickError) {
+      setError(String(pickError));
+    }
   }
 
   function toggleOtherItems() {
@@ -618,6 +678,12 @@ export function FolderSnifferView() {
               <span>Files</span>
             </div>
           </div>
+          {result.skipped > 0 && (
+            <p className="form-warning" role="status">
+              {result.skipped.toLocaleString()} items were skipped because they
+              could not be read or are links. Totals may be incomplete.
+            </p>
+          )}
           {result.folders === 0 && result.files > 0 && !showFilesInMap ? (
             <FileSizeView
               result={result}
