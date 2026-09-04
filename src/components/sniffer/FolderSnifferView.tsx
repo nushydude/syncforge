@@ -839,11 +839,6 @@ export function FolderSnifferView() {
               )}
             </>
           )}
-          {result.skipped > 0 && (
-            <p className="sniffer-warning">
-              {result.skipped} item(s) could not be read and are not included.
-            </p>
-          )}
         </section>
       )}
       {contextMenu && (

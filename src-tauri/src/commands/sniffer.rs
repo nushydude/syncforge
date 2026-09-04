@@ -53,18 +53,45 @@ struct FolderTotals {
     skipped: u64,
 }
 
-fn is_scan_link(metadata: &fs::Metadata) -> bool {
+#[cfg(windows)]
+fn is_name_surrogate_reparse_tag(tag: u32) -> bool {
+    tag & 0x2000_0000 != 0
+}
+
+#[cfg(windows)]
+fn windows_reparse_tag(path: &Path) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let handle = unsafe { FindFirstFileW(wide_path.as_ptr(), &mut data) };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    unsafe { FindClose(handle) };
+    Some(data.dwReserved0)
+}
+
+fn is_scan_link(path: &Path, metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        // Junctions and other reparse points must not escape or cycle through the scan root.
-        metadata.file_attributes() & 0x400 != 0
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            return false;
+        }
+        // Name-surrogate tags redirect traversal. Ordinary reparse files such as cloud
+        // placeholders remain visible. Unknown directories are skipped conservatively.
+        windows_reparse_tag(path).map(is_name_surrogate_reparse_tag).unwrap_or(metadata.is_dir())
     }
     #[cfg(not(windows))]
     {
+        let _ = path;
         false
     }
 }
@@ -77,7 +104,7 @@ fn measure(path: &Path) -> FolderTotals {
             totals.skipped += 1;
             continue;
         };
-        if is_scan_link(&metadata) {
+        if is_scan_link(&path, &metadata) {
             totals.skipped += 1;
         } else if metadata.is_file() {
             totals.size = totals.size.saturating_add(metadata.len());
@@ -274,7 +301,7 @@ fn scan_folder_sizes_blocking(
         total.files = total.files.saturating_add(child_totals.files);
         total.folders = total.folders.saturating_add(child_totals.folders);
         total.skipped = total.skipped.saturating_add(child_totals.skipped);
-        if !is_scan_link(&metadata) {
+        if !is_scan_link(&child_path, &metadata) {
             entries.push(FolderSizeEntry {
                 name: child.file_name().to_string_lossy().into_owned(),
                 path: child_path.display().to_string(),
@@ -343,5 +370,13 @@ mod tests {
         std::os::unix::fs::symlink(root.path(), &link).unwrap();
         let totals = measure(root.path());
         assert_eq!((totals.size, totals.files, totals.folders, totals.skipped), (3, 1, 1, 1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn distinguishes_name_surrogate_tags_from_cloud_reparse_tags() {
+        assert!(is_name_surrogate_reparse_tag(0xA000_0003)); // mount point
+        assert!(is_name_surrogate_reparse_tag(0xA000_000C)); // symbolic link
+        assert!(!is_name_surrogate_reparse_tag(0x9000_001A)); // cloud placeholder
     }
 }

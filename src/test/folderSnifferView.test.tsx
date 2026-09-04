@@ -31,6 +31,9 @@ describe("FolderSnifferView", () => {
     const { container } = render(<FolderSnifferView />);
     fireEvent.click(screen.getByRole("button", { name: "Choose a folder" }));
     expect(await screen.findByText(/2 items were skipped/)).toBeInTheDocument();
+    expect(
+      container.querySelectorAll(".form-warning, .sniffer-warning"),
+    ).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: /Other files/ }));
     expect(container.querySelectorAll(".sniffer-file-row")).toHaveLength(100);
     fireEvent.click(screen.getByRole("button", { name: "Next" }));
