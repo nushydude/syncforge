@@ -3684,7 +3684,7 @@ dependencies = [
 
 [[package]]
 name = "syncforge"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "blake3",
  "chrono",
