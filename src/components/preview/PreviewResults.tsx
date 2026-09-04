@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { getPreviewActions } from "../../api/preview";
 import { formatAction, formatPlanSummary } from "../../lib/planFormatting";
 import type { FolderPair, PreviewSummary, SyncAction } from "../../types";
@@ -18,6 +18,8 @@ export function PreviewResults({
   const [page, setPage] = useState(1);
   const [actions, setActions] = useState<SyncAction[]>(plan.actions);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const requestId = useRef(0);
   const visibleActions = plan.planId
     ? actions.slice(0, BACKEND_PAGE_SIZE)
     : actions.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
@@ -34,13 +36,24 @@ export function PreviewResults({
   useEffect(() => {
     setPage(1);
     setActions(plan.actions);
+    setLoading(false);
+    setError(null);
+    return () => {
+      requestId.current += 1;
+    };
   }, [plan]);
 
   async function changePage(nextPage: number): Promise<void> {
-    if (nextPage < 1 || nextPage > pageCount || nextPage === page) return;
-    setPage(nextPage);
-    if (!plan.planId || !pair) return;
+    if (loading || nextPage < 1 || nextPage > pageCount || nextPage === page)
+      return;
+    if (!plan.planId) {
+      setPage(nextPage);
+      return;
+    }
+    if (!pair) return;
+    const currentRequest = ++requestId.current;
     setLoading(true);
+    setError(null);
     try {
       const result = await getPreviewActions(
         pair,
@@ -48,9 +61,17 @@ export function PreviewResults({
         (nextPage - 1) * BACKEND_PAGE_SIZE,
         BACKEND_PAGE_SIZE,
       );
+      if (currentRequest !== requestId.current) return;
       setActions(result.actions);
+      setPage(nextPage);
+    } catch (loadError) {
+      if (currentRequest === requestId.current) {
+        setError(
+          `Could not load preview page: ${loadError instanceof Error ? loadError.message : String(loadError)}. Try again.`,
+        );
+      }
     } finally {
-      setLoading(false);
+      if (currentRequest === requestId.current) setLoading(false);
     }
   }
 
@@ -58,6 +79,7 @@ export function PreviewResults({
     <section
       className="preview-results"
       aria-labelledby="preview-results-title"
+      aria-busy={loading}
     >
       <header className="preview-results-header">
         <div>
@@ -84,6 +106,12 @@ export function PreviewResults({
             <li key={warning}>{warning}</li>
           ))}
         </ul>
+      )}
+
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
       )}
 
       {rows.length === 0 ? (
