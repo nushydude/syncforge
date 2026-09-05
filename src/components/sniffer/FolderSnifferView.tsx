@@ -86,6 +86,7 @@ export function FolderSnifferView() {
   const pendingRefreshId = useRef<string | null>(null);
   const refreshTrail = useRef<SnifferEntry[]>([]);
   const acceptedRevisions = useRef(new Map<string, number>());
+  const pendingEvents = useRef(new Map<string, SnifferScan>());
   const [scan, setScan] = useState<SnifferScan | null>(null);
   const [page, setPage] = useState<SnifferEntryPage | null>(null);
   const [summary, setSummary] = useState<SnifferSummary | null>(null);
@@ -146,15 +147,29 @@ export function FolderSnifferView() {
           cursor,
           limit: PAGE_SIZE,
         };
-        const [nextPage, nextSummary] = await Promise.all([
-          querySnifferEntries(request),
-          getSnifferSummary(
-            activeScan.id,
-            activeScan.generationId,
-            activeDirectory,
-            request,
-          ),
-        ]);
+        let nextPage: SnifferEntryPage | undefined;
+        let nextSummary: SnifferSummary | undefined;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          [nextPage, nextSummary] = await Promise.all([
+            querySnifferEntries(request),
+            getSnifferSummary(
+              activeScan.id,
+              activeScan.generationId,
+              activeDirectory,
+              request,
+            ),
+          ]);
+          if (nextPage.revision === nextSummary.revision) break;
+          nextPage = undefined;
+          nextSummary = undefined;
+        }
+        if (!nextPage || !nextSummary)
+          throw {
+            code: "staleCursor",
+            operation: "query",
+            retryable: true,
+            message: "The index changed while loading. Refresh the results.",
+          } satisfies SnifferError;
         if (token !== requestToken.current) return;
         setPage(nextPage);
         setSummary(nextSummary);
@@ -223,83 +238,100 @@ export function FolderSnifferView() {
     },
     [],
   );
+  const loadResultsRef = useRef(loadResults);
+  const resolveTrailRef = useRef(resolveTrail);
+  loadResultsRef.current = loadResults;
+  resolveTrailRef.current = resolveTrail;
 
-  const acceptScan = useCallback(
-    (next: SnifferScan, allowNew = false) => {
-      if (
-        !next ||
-        typeof next.id !== "string" ||
-        typeof next.revision !== "number" ||
-        typeof next.logicalBytes !== "string"
-      )
-        return;
-      const currentRevision = acceptedRevisions.current.get(next.id);
-      if (currentRevision !== undefined && currentRevision > next.revision)
-        return;
-      const knownJob =
-        next.id === scanRef.current?.id ||
-        next.id === pendingRefreshId.current ||
-        (!scanRef.current && !pendingRefreshId.current);
-      if (!allowNew && !knownJob) return;
-      acceptedRevisions.current.set(next.id, next.revision);
-      if (pendingRefreshId.current === next.id) {
-        if (next.status === "completed" && next.rootNodeId) {
-          pendingRefreshId.current = null;
-          setRefreshJob(null);
-          scanRef.current = next;
-          setScan(next);
-          setHistory([]);
-          setForward([]);
-          setCursors([undefined]);
-          setPageIndex(0);
-          const previousTrail = refreshTrail.current;
-          void resolveTrail(next, previousTrail)
-            .then((resolved) => {
-              if (scanRef.current?.id !== next.id) return;
-              const target =
-                resolved[resolved.length - 1]?.nodeId ?? next.rootNodeId!;
-              setTrail(resolved);
-              setDirectoryId(target);
-              return loadResults(next, target, undefined);
-            })
-            .catch((nextError) => {
-              if (scanRef.current?.id !== next.id) return;
-              setTrail([]);
-              setDirectoryId(next.rootNodeId);
-              setError(errorDetail(nextError));
-            });
-        } else if (next.status === "failed" || next.status === "cancelled") {
-          pendingRefreshId.current = null;
-          setRefreshJob(null);
-          if (next.status === "failed")
-            setError(
-              next.error ?? {
-                code: "failed",
-                operation: "refresh",
-                retryable: true,
-                message:
-                  "Refresh failed. The previous scan is still available.",
-              },
-            );
-        } else {
-          setRefreshJob(next);
-        }
-        return;
-      }
-      setScan((current) => {
-        if (
-          current &&
-          current.id === next.id &&
-          current.revision > next.revision
-        )
-          return current;
+  const acceptScan = useCallback((next: SnifferScan, allowNew = false) => {
+    if (
+      !next ||
+      typeof next.id !== "string" ||
+      typeof next.revision !== "number" ||
+      typeof next.logicalBytes !== "string"
+    )
+      return;
+    const currentRevision = acceptedRevisions.current.get(next.id);
+    if (currentRevision !== undefined && currentRevision > next.revision)
+      return;
+    const knownJob =
+      next.id === scanRef.current?.id ||
+      next.id === pendingRefreshId.current ||
+      (!scanRef.current && !pendingRefreshId.current);
+    if (!allowNew && !knownJob) {
+      const buffered = pendingEvents.current.get(next.id);
+      if (!buffered || buffered.revision < next.revision)
+        pendingEvents.current.set(next.id, next);
+      return;
+    }
+    acceptedRevisions.current.set(next.id, next.revision);
+    if (pendingRefreshId.current === next.id) {
+      if (next.status === "completed" && next.rootNodeId) {
+        pendingRefreshId.current = null;
+        setRefreshJob(null);
         scanRef.current = next;
-        return next;
-      });
-      if (next.rootNodeId)
-        setDirectoryId((current) => current ?? next.rootNodeId);
+        setScan(next);
+        setHistory([]);
+        setForward([]);
+        setCursors([undefined]);
+        setPageIndex(0);
+        const previousTrail = refreshTrail.current;
+        void resolveTrailRef
+          .current(next, previousTrail)
+          .then((resolved) => {
+            if (scanRef.current?.id !== next.id) return;
+            const target =
+              resolved[resolved.length - 1]?.nodeId ?? next.rootNodeId!;
+            setTrail(resolved);
+            setDirectoryId(target);
+            return loadResultsRef.current(next, target, undefined);
+          })
+          .catch((nextError) => {
+            if (scanRef.current?.id !== next.id) return;
+            setTrail([]);
+            setDirectoryId(next.rootNodeId);
+            setError(errorDetail(nextError));
+          });
+      } else if (next.status === "failed" || next.status === "cancelled") {
+        pendingRefreshId.current = null;
+        setRefreshJob(null);
+        if (next.status === "failed")
+          setError(
+            next.error ?? {
+              code: "failed",
+              operation: "refresh",
+              retryable: true,
+              message: "Refresh failed. The previous scan is still available.",
+            },
+          );
+      } else {
+        setRefreshJob(next);
+      }
+      return;
+    }
+    setScan((current) => {
+      if (current && current.id === next.id && current.revision > next.revision)
+        return current;
+      scanRef.current = next;
+      return next;
+    });
+    if (next.rootNodeId)
+      setDirectoryId((current) => current ?? next.rootNodeId);
+  }, []);
+
+  const adoptCommandScan = useCallback(
+    (next: SnifferScan) => {
+      acceptScan(next, true);
+      const buffered = pendingEvents.current.get(next.id);
+      if (buffered) {
+        pendingEvents.current.delete(next.id);
+        acceptScan(buffered);
+      }
+      void getSnifferScan(next.id)
+        .then((latest) => latest && acceptScan(latest))
+        .catch((nextError) => setError(errorDetail(nextError)));
     },
-    [loadResults, resolveTrail],
+    [acceptScan],
   );
 
   useEffect(() => {
@@ -428,11 +460,22 @@ export function FolderSnifferView() {
       setForward([]);
       setError(null);
       setMutationWarning(null);
-      acceptedRevisions.current.clear();
-      acceptScan(next, true);
+      adoptCommandScan(next);
     } catch (nextError) {
       setError(errorDetail(nextError));
     }
+  }
+
+  async function startRefresh(directory: string) {
+    if (!scan) return;
+    refreshTrail.current = trail;
+    const next = await refreshSnifferSubtree(
+      scan.id,
+      scan.generationId,
+      directory,
+    );
+    pendingRefreshId.current = next.id;
+    adoptCommandScan(next);
   }
 
   async function runAction(action: "rename" | "recycle") {
@@ -468,7 +511,17 @@ export function FolderSnifferView() {
       setSummary((current) =>
         current ? { ...current, stale: true } : current,
       );
-      if (directoryId) void loadResults(scan, directoryId, undefined);
+      const refreshDirectory = selected.parentId ?? directoryId;
+      if (refreshDirectory) {
+        void startRefresh(refreshDirectory).catch((refreshError) => {
+          const detail = errorDetail(refreshError);
+          setMutationWarning(
+            [result.warning, `Refresh failed: ${detail.message}`]
+              .filter(Boolean)
+              .join(" "),
+          );
+        });
+      }
     } catch (nextError) {
       setError({ ...errorDetail(nextError), operation: action });
     } finally {
@@ -705,21 +758,11 @@ export function FolderSnifferView() {
               <button
                 type="button"
                 disabled={!terminal.has(scan.status) || Boolean(refreshJob)}
-                onClick={() => {
-                  refreshTrail.current = trail;
-                  void refreshSnifferSubtree(
-                    scan.id,
-                    scan.generationId,
-                    directoryId,
+                onClick={() =>
+                  void startRefresh(directoryId).catch((e) =>
+                    setError(errorDetail(e)),
                   )
-                    .then((next) => {
-                      pendingRefreshId.current = next.id;
-                      acceptScan(next);
-                    })
-                    .catch((e) => {
-                      setError(errorDetail(e));
-                    });
-                }}
+                }
               >
                 {refreshJob ? "Refreshing…" : "Refresh"}
               </button>
@@ -829,7 +872,7 @@ export function FolderSnifferView() {
                   treated as empty.
                 </p>
               )}
-              {summary.stale && (
+              {(summary.stale || scan.stale) && (
                 <p className="form-warning" role="status">
                   Stale — files changed after this observation. Refresh to
                   measure again.

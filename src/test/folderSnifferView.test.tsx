@@ -1,7 +1,22 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FolderSnifferView } from "../components/sniffer/FolderSnifferView";
-import { querySnifferEntries, startSnifferScan } from "../api/sniffer";
+import {
+  getSnifferSummary,
+  querySnifferEntries,
+  startSnifferScan,
+} from "../api/sniffer";
+import type { SnifferScan } from "../types";
+
+const eventHarness = vi.hoisted(() => ({
+  handler: null as null | ((event: { payload: SnifferScan }) => void),
+}));
 
 const scan = {
   id: "scan-1",
@@ -76,7 +91,12 @@ vi.mock("../api/sniffer", () => ({
   querySnifferIssues: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn().mockResolvedValue(() => undefined),
+  listen: vi.fn(
+    (_name: string, handler: (event: { payload: SnifferScan }) => void) => {
+      eventHarness.handler = handler;
+      return Promise.resolve(() => undefined);
+    },
+  ),
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openPath: vi.fn(),
@@ -86,6 +106,120 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 describe("FolderSnifferView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    eventHarness.handler = null;
+    vi.mocked(getSnifferSummary).mockResolvedValue({
+      directory: {
+        nodeId: "1",
+        parentId: null,
+        name: "files",
+        fullPath: "C:/files",
+        relativePath: "",
+        kind: "directory",
+        logicalSize: "0",
+        files: "250",
+        folders: "0",
+        modifiedAt: null,
+        status: "unreadable",
+      },
+      logicalBytes: "0",
+      files: "250",
+      folders: "0",
+      zeroSizeCount: "250",
+      tiles: [],
+      revision: 3,
+      coverageComplete: false,
+      stale: false,
+    });
+  });
+
+  it("buffers terminal progress that arrives before the start response", async () => {
+    let resolveStart: (value: SnifferScan) => void = () => undefined;
+    vi.mocked(startSnifferScan).mockReturnValue(
+      new Promise((resolve) => {
+        resolveStart = resolve;
+      }),
+    );
+    vi.mocked(querySnifferEntries).mockResolvedValue({
+      rows: [],
+      nextCursor: null,
+      matchCount: "0",
+      matchedBytes: "0",
+      directoryBytes: "0",
+      revision: 3,
+      coverageComplete: true,
+      stale: false,
+    });
+    render(<FolderSnifferView />);
+    await waitFor(() => expect(eventHarness.handler).not.toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Choose a folder" }));
+    await waitFor(() => expect(startSnifferScan).toHaveBeenCalled());
+    await act(async () => {
+      eventHarness.handler?.({ payload: scan });
+      resolveStart({ ...scan, status: "queued", revision: 1 });
+    });
+    expect(await screen.findByText("completed")).toBeInTheDocument();
+  });
+
+  it("retries until table and summary revisions match", async () => {
+    vi.mocked(startSnifferScan).mockResolvedValue(scan);
+    vi.mocked(querySnifferEntries)
+      .mockResolvedValueOnce({
+        rows: [],
+        nextCursor: null,
+        matchCount: "0",
+        matchedBytes: "0",
+        directoryBytes: "0",
+        revision: 2,
+        coverageComplete: true,
+        stale: false,
+      })
+      .mockResolvedValue({
+        rows: [],
+        nextCursor: null,
+        matchCount: "0",
+        matchedBytes: "0",
+        directoryBytes: "0",
+        revision: 3,
+        coverageComplete: true,
+        stale: false,
+      });
+    vi.mocked(getSnifferSummary)
+      .mockResolvedValueOnce({
+        directory: {
+          ...rows[0],
+          nodeId: "1",
+          parentId: null,
+          kind: "directory",
+        },
+        logicalBytes: "0",
+        files: "0",
+        folders: "0",
+        zeroSizeCount: "0",
+        tiles: [],
+        revision: 3,
+        coverageComplete: true,
+        stale: false,
+      })
+      .mockResolvedValue({
+        directory: {
+          ...rows[0],
+          nodeId: "1",
+          parentId: null,
+          kind: "directory",
+        },
+        logicalBytes: "0",
+        files: "0",
+        folders: "0",
+        zeroSizeCount: "0",
+        tiles: [],
+        revision: 3,
+        coverageComplete: true,
+        stale: false,
+      });
+    render(<FolderSnifferView />);
+    fireEvent.click(screen.getByRole("button", { name: "Choose a folder" }));
+    await screen.findByText(/0 matches/);
+    expect(querySnifferEntries).toHaveBeenCalledTimes(2);
   });
 
   it("queries bounded indexed pages and labels incomplete zero-size results", async () => {
