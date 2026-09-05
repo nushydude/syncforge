@@ -12,6 +12,7 @@ import {
   markPreviewQueued,
   previewPairById,
   setPreviewError,
+  setLastSyncedAt,
 } from "./pairsStore";
 import type {
   ConflictChoice,
@@ -348,6 +349,9 @@ async function executeRun(
       report,
       progress: progress ? { ...progress, report, phase: report.status } : null,
     });
+    if (report.status === "completed" && report.finishedAt != null) {
+      setLastSyncedAt(pair.id, report.finishedAt);
+    }
     // The backend consumes a reused plan, so the cached preview is now stale.
     clearPairPreview(pair.id);
     emit();

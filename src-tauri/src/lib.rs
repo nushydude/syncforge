@@ -127,6 +127,7 @@ pub fn run() {
             commands::duplicates::find_duplicates,
             commands::duplicates::remove_duplicates,
             commands::pairs::list_pairs,
+            commands::pairs::get_last_synced_at_by_pair,
             commands::pairs::save_pair,
             commands::pairs::delete_pair,
             commands::preview::preview_pair,

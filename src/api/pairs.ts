@@ -5,6 +5,10 @@ export function listPairs(): Promise<FolderPair[]> {
   return invoke<FolderPair[]>("list_pairs");
 }
 
+export function getLastSyncedAtByPair(): Promise<Record<string, number>> {
+  return invoke<Record<string, number>>("get_last_synced_at_by_pair");
+}
+
 export function savePair(pair: FolderPair): Promise<FolderPair> {
   return invoke<FolderPair>("save_pair", { pair });
 }

@@ -8,9 +8,11 @@ import type { PairsStoreState } from "../../store/pairsStore";
 import { useRunStore } from "../../hooks/useRunStore";
 import { enqueuePairRuns, type RunStoreState } from "../../store/runStore";
 import type { PairRunState } from "../../store/runStore";
+import { LastSyncedText } from "./LastSyncedText";
 
 const selectPairList = (s: PairsStoreState) => ({
   pairs: s.pairs,
+  lastSyncedAtByPair: s.lastSyncedAtByPair,
   selectedId: s.selectedId,
   loading: s.loading,
 });
@@ -36,7 +38,8 @@ function statusBadge(run: PairRunState | undefined): string | null {
 }
 
 export function PairList() {
-  const { pairs, selectedId, loading } = usePairsStore(selectPairList);
+  const { pairs, lastSyncedAtByPair, selectedId, loading } =
+    usePairsStore(selectPairList);
   const runsByPair = useRunStore(selectRuns);
 
   const queueable = pairs.filter((pair) => {
@@ -107,6 +110,10 @@ export function PairList() {
                 <span className="pair-item-meta">
                   {pair.mode}
                   {!pair.enabled && " · disabled"}
+                </span>
+                <span className="pair-item-meta">
+                  Last synced ·{" "}
+                  <LastSyncedText timestamp={lastSyncedAtByPair[pair.id]} />
                 </span>
               </button>
             </li>
