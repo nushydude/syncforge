@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 use crate::models::{PreviewActionPage, SyncPlan};
 use crate::persistence::{DatabaseManager, PersistenceError};
 use crate::scheduler::ScheduleService;
+use crate::sniffer::SnifferService;
 use crate::watcher::WatchService;
 
 /// Ignore watch events for this long after a pair's sync completes (self-write feedback).
@@ -200,6 +201,7 @@ pub struct WorkCoordinator {
     heavy_jobs: Mutex<WorkState>,
     wake: Condvar,
     released: Arc<Notify>,
+    sniffer: Mutex<Option<std::sync::Weak<SnifferService>>>,
 }
 
 #[derive(Default)]
@@ -263,6 +265,7 @@ impl WorkCoordinator {
             }),
             wake: Condvar::new(),
             released: Arc::new(Notify::new()),
+            sniffer: Mutex::new(None),
         }
     }
 
@@ -362,6 +365,13 @@ impl Drop for HeavyJobPermit {
             self.coordinator.wake.notify_one();
             self.coordinator.released.notify_waiters();
         }
+        if self.writer {
+            if let Ok(observer) = self.coordinator.sniffer.lock() {
+                if let Some(sniffer) = observer.as_ref().and_then(std::sync::Weak::upgrade) {
+                    sniffer.mark_writes_stale(&self.roots);
+                }
+            }
+        }
     }
 }
 
@@ -372,8 +382,7 @@ pub struct AppState {
     pub duplicate_scan_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Roots with an active legacy duplicate operation; rejecting repeats bounds queued work.
     pub active_duplicate_jobs: Mutex<HashSet<PathBuf>>,
-    /// Roots with an active sniffer operation; rejecting repeats bounds queued work.
-    pub active_sniffer_jobs: Mutex<HashSet<PathBuf>>,
+    pub sniffer: Arc<SnifferService>,
     /// Per-pair cancel flags while a sync run is active.
     pub active_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Per-pair cancel flags while a preview scan is active.
@@ -397,14 +406,19 @@ impl AppState {
     pub fn new(data_dir: PathBuf) -> Result<Self, PersistenceError> {
         let db_path = data_dir.join("syncforge.db");
         let db = DatabaseManager::open(&db_path)?;
+        let sniffer = SnifferService::open(&data_dir.join("sniffer-cache"))
+            .map_err(PersistenceError::Database)?;
         db.mark_duplicate_scans_interrupted()?;
         db.mark_sync_runs_interrupted()?;
+        let sniffer = Arc::new(sniffer);
+        let coordinator = Arc::new(WorkCoordinator::new());
+        *coordinator.sniffer.lock().expect("new coordinator") = Some(Arc::downgrade(&sniffer));
         Ok(Self {
-            work_coordinator: Arc::new(WorkCoordinator::new()),
+            work_coordinator: coordinator,
             db: Arc::new(db),
             duplicate_scan_cancels: Mutex::new(HashMap::new()),
             active_duplicate_jobs: Mutex::new(HashSet::new()),
-            active_sniffer_jobs: Mutex::new(HashSet::new()),
+            sniffer,
             active_runs: Mutex::new(HashMap::new()),
             preview_cancels: Mutex::new(HashMap::new()),
             pending_watch_syncs: Mutex::new(HashSet::new()),

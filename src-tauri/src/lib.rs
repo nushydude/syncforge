@@ -11,6 +11,7 @@ mod progress;
 mod run_coordinator;
 mod scanner;
 mod scheduler;
+mod sniffer;
 mod state;
 mod watcher;
 
@@ -139,9 +140,17 @@ pub fn run() {
             commands::history::get_history,
             commands::history::get_run_detail,
             commands::schedule::set_schedule,
-            commands::sniffer::scan_folder_sizes,
-            commands::sniffer::rename_sniffer_item,
-            commands::sniffer::delete_sniffer_item,
+            commands::sniffer::start_sniffer_scan,
+            commands::sniffer::get_sniffer_scan,
+            commands::sniffer::pin_sniffer_scan,
+            commands::sniffer::cancel_sniffer_scan,
+            commands::sniffer::query_sniffer_entries,
+            commands::sniffer::get_sniffer_summary,
+            commands::sniffer::get_sniffer_node,
+            commands::sniffer::query_sniffer_issues,
+            commands::sniffer::refresh_sniffer_subtree,
+            commands::sniffer::prepare_sniffer_action,
+            commands::sniffer::execute_sniffer_action,
             commands::sniffer::show_sniffer_item_properties,
         ])
         .run(tauri::generate_context!())
