@@ -10,6 +10,7 @@ import { FolderSnifferView } from "../components/sniffer/FolderSnifferView";
 import {
   getSnifferSummary,
   querySnifferEntries,
+  refreshSnifferSubtree,
   startSnifferScan,
 } from "../api/sniffer";
 import type { SnifferScan } from "../types";
@@ -220,6 +221,61 @@ describe("FolderSnifferView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Choose a folder" }));
     await screen.findByText(/0 matches/);
     expect(querySnifferEntries).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the prior visible generation when refreshed results fail", async () => {
+    vi.mocked(startSnifferScan).mockResolvedValue(scan);
+    vi.mocked(refreshSnifferSubtree).mockResolvedValue({
+      ...scan,
+      id: "replacement",
+      generationId: "replacement-generation",
+      rootNodeId: "10",
+      revision: 8,
+    });
+    vi.mocked(querySnifferEntries)
+      .mockResolvedValueOnce({
+        rows: [rows[0]],
+        nextCursor: null,
+        matchCount: "1",
+        matchedBytes: "0",
+        directoryBytes: "0",
+        revision: 3,
+        coverageComplete: true,
+        stale: false,
+      })
+      .mockRejectedValueOnce({
+        code: "failed",
+        operation: "query",
+        retryable: true,
+        message: "replacement unavailable",
+      })
+      .mockResolvedValue({
+        rows: [rows[0]],
+        nextCursor: null,
+        matchCount: "1",
+        matchedBytes: "0",
+        directoryBytes: "0",
+        revision: 3,
+        coverageComplete: true,
+        stale: false,
+      });
+
+    render(<FolderSnifferView />);
+    fireEvent.click(screen.getByRole("button", { name: "Choose a folder" }));
+    await screen.findByText("file-0.txt");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(
+      await screen.findByText("replacement unavailable"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(querySnifferEntries).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          scanId: "scan-1",
+          generationId: "generation-1",
+        }),
+      ),
+    );
   });
 
   it("queries bounded indexed pages and labels incomplete zero-size results", async () => {

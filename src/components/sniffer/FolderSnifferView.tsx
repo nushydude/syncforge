@@ -126,6 +126,7 @@ export function FolderSnifferView() {
       activeScan: SnifferScan,
       activeDirectory: string,
       cursor?: string,
+      commit = true,
     ) => {
       const token = ++requestToken.current;
       setLoading(true);
@@ -171,16 +172,18 @@ export function FolderSnifferView() {
             message: "The index changed while loading. Refresh the results.",
           } satisfies SnifferError;
         if (token !== requestToken.current) return;
-        setPage(nextPage);
-        setSummary(nextSummary);
-        setSelected((current) =>
-          current
-            ? (nextPage.rows.find((row) => row.nodeId === current.nodeId) ??
-              null)
-            : null,
-        );
-        setError(null);
-        return true;
+        if (commit) {
+          setPage(nextPage);
+          setSummary(nextSummary);
+          setSelected((current) =>
+            current
+              ? (nextPage.rows.find((row) => row.nodeId === current.nodeId) ??
+                null)
+              : null,
+          );
+          setError(null);
+        }
+        return { page: nextPage, summary: nextSummary };
       } catch (nextError) {
         if (token === requestToken.current) setError(errorDetail(nextError));
         return false;
@@ -269,27 +272,36 @@ export function FolderSnifferView() {
       if (next.status === "completed" && next.rootNodeId) {
         pendingRefreshId.current = null;
         setRefreshJob(null);
-        scanRef.current = next;
-        setScan(next);
-        setHistory([]);
-        setForward([]);
-        setCursors([undefined]);
-        setPageIndex(0);
+        const previousScanId = scanRef.current?.id;
         const previousTrail = refreshTrail.current;
         void resolveTrailRef
           .current(next, previousTrail)
-          .then((resolved) => {
-            if (scanRef.current?.id !== next.id) return;
+          .then(async (resolved) => {
+            if (scanRef.current?.id !== previousScanId) return;
             const target =
               resolved[resolved.length - 1]?.nodeId ?? next.rootNodeId!;
+            const results = await loadResultsRef.current(
+              next,
+              target,
+              undefined,
+              false,
+            );
+            if (!results || scanRef.current?.id !== previousScanId) return;
+            scanRef.current = next;
+            setScan(next);
             setTrail(resolved);
             setDirectoryId(target);
-            return loadResultsRef.current(next, target, undefined);
+            setHistory([]);
+            setForward([]);
+            setCursors([undefined]);
+            setPageIndex(0);
+            setPage(results.page);
+            setSummary(results.summary);
+            setSelected(null);
+            setError(null);
           })
           .catch((nextError) => {
-            if (scanRef.current?.id !== next.id) return;
-            setTrail([]);
-            setDirectoryId(next.rootNodeId);
+            if (scanRef.current?.id !== previousScanId) return;
             setError(errorDetail(nextError));
           });
       } else if (next.status === "failed" || next.status === "cancelled") {
