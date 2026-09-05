@@ -30,6 +30,7 @@ export interface SnifferScan {
   startedAt: number;
   finishedAt: number | null;
   error: SnifferError | null;
+  refreshedDirectoryId?: string | null;
 }
 
 export interface SnifferEntry {

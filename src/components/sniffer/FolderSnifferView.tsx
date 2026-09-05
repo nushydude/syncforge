@@ -6,7 +6,9 @@ import {
   cancelSnifferScan,
   executeSnifferAction,
   getSnifferScan,
+  getSnifferNode,
   getSnifferSummary,
+  pinSnifferScan,
   prepareSnifferAction,
   querySnifferEntries,
   querySnifferIssues,
@@ -82,7 +84,8 @@ export function FolderSnifferView() {
   const scanRef = useRef<SnifferScan | null>(null);
   const requestToken = useRef(0);
   const pendingRefreshId = useRef<string | null>(null);
-  const refreshStarting = useRef(false);
+  const refreshTrail = useRef<SnifferEntry[]>([]);
+  const acceptedRevisions = useRef(new Map<string, number>());
   const [scan, setScan] = useState<SnifferScan | null>(null);
   const [page, setPage] = useState<SnifferEntryPage | null>(null);
   const [summary, setSummary] = useState<SnifferSummary | null>(null);
@@ -108,7 +111,13 @@ export function FolderSnifferView() {
   const [error, setError] = useState<SnifferError | null>(null);
   const [issuesOpen, setIssuesOpen] = useState(false);
   const [issues, setIssues] = useState<SnifferIssuePage | null>(null);
+  const [issueCursors, setIssueCursors] = useState<(string | undefined)[]>([
+    undefined,
+  ]);
+  const [issuePageIndex, setIssuePageIndex] = useState(0);
+  const [otherOpen, setOtherOpen] = useState(false);
   const [actionPending, setActionPending] = useState(false);
+  const [mutationWarning, setMutationWarning] = useState<string | null>(null);
   const [refreshJob, setRefreshJob] = useState<SnifferScan | null>(null);
 
   const loadResults = useCallback(
@@ -143,6 +152,7 @@ export function FolderSnifferView() {
             activeScan.id,
             activeScan.generationId,
             activeDirectory,
+            request,
           ),
         ]);
         if (token !== requestToken.current) return;
@@ -177,56 +187,120 @@ export function FolderSnifferView() {
     ],
   );
 
-  const acceptScan = useCallback((next: SnifferScan) => {
-    if (
-      !next ||
-      typeof next.id !== "string" ||
-      typeof next.revision !== "number" ||
-      typeof next.logicalBytes !== "string"
-    )
-      return;
-    if (refreshStarting.current && next.id !== scanRef.current?.id) {
-      pendingRefreshId.current = next.id;
-      refreshStarting.current = false;
-    }
-    if (pendingRefreshId.current === next.id) {
-      if (next.status === "completed" && next.rootNodeId) {
-        pendingRefreshId.current = null;
-        setRefreshJob(null);
-        scanRef.current = next;
-        setScan(next);
-        setDirectoryId(next.rootNodeId);
-        setTrail([]);
-        setHistory([]);
-        setForward([]);
-        setCursors([undefined]);
-        setPageIndex(0);
-      } else if (next.status === "failed" || next.status === "cancelled") {
-        pendingRefreshId.current = null;
-        setRefreshJob(null);
-        if (next.status === "failed")
-          setError(
-            next.error ?? {
-              code: "failed",
-              operation: "refresh",
-              retryable: true,
-              message: "Refresh failed. The previous scan is still available.",
-            },
+  const resolveTrail = useCallback(
+    async (activeScan: SnifferScan, previousTrail: SnifferEntry[]) => {
+      if (!activeScan.rootNodeId) return [];
+      const resolved: SnifferEntry[] = [];
+      let parentId = activeScan.rootNodeId;
+      for (const previous of previousTrail) {
+        let cursor: string | undefined;
+        let match: SnifferEntry | undefined;
+        do {
+          const result = await querySnifferEntries({
+            scanId: activeScan.id,
+            generationId: activeScan.generationId,
+            directoryId: parentId,
+            scope: "children",
+            sortBy: "name",
+            sortDirection: "asc",
+            search: previous.name,
+            itemKind: "directory",
+            cursor,
+            limit: PAGE_SIZE,
+          });
+          match = result.rows.find(
+            (entry) =>
+              entry.name === previous.name &&
+              entry.fullPath === previous.fullPath,
           );
-      } else {
-        setRefreshJob(next);
+          cursor = result.nextCursor ?? undefined;
+        } while (!match && cursor);
+        if (!match) break;
+        resolved.push(match);
+        parentId = match.nodeId;
       }
-      return;
-    }
-    setScan((current) => {
-      if (current && current.id === next.id && current.revision > next.revision)
-        return current;
-      scanRef.current = next;
-      return next;
-    });
-    if (next.rootNodeId)
-      setDirectoryId((current) => current ?? next.rootNodeId);
-  }, []);
+      return resolved;
+    },
+    [],
+  );
+
+  const acceptScan = useCallback(
+    (next: SnifferScan, allowNew = false) => {
+      if (
+        !next ||
+        typeof next.id !== "string" ||
+        typeof next.revision !== "number" ||
+        typeof next.logicalBytes !== "string"
+      )
+        return;
+      const currentRevision = acceptedRevisions.current.get(next.id);
+      if (currentRevision !== undefined && currentRevision > next.revision)
+        return;
+      const knownJob =
+        next.id === scanRef.current?.id ||
+        next.id === pendingRefreshId.current ||
+        (!scanRef.current && !pendingRefreshId.current);
+      if (!allowNew && !knownJob) return;
+      acceptedRevisions.current.set(next.id, next.revision);
+      if (pendingRefreshId.current === next.id) {
+        if (next.status === "completed" && next.rootNodeId) {
+          pendingRefreshId.current = null;
+          setRefreshJob(null);
+          scanRef.current = next;
+          setScan(next);
+          setHistory([]);
+          setForward([]);
+          setCursors([undefined]);
+          setPageIndex(0);
+          const previousTrail = refreshTrail.current;
+          void resolveTrail(next, previousTrail)
+            .then((resolved) => {
+              if (scanRef.current?.id !== next.id) return;
+              const target =
+                resolved[resolved.length - 1]?.nodeId ?? next.rootNodeId!;
+              setTrail(resolved);
+              setDirectoryId(target);
+              return loadResults(next, target, undefined);
+            })
+            .catch((nextError) => {
+              if (scanRef.current?.id !== next.id) return;
+              setTrail([]);
+              setDirectoryId(next.rootNodeId);
+              setError(errorDetail(nextError));
+            });
+        } else if (next.status === "failed" || next.status === "cancelled") {
+          pendingRefreshId.current = null;
+          setRefreshJob(null);
+          if (next.status === "failed")
+            setError(
+              next.error ?? {
+                code: "failed",
+                operation: "refresh",
+                retryable: true,
+                message:
+                  "Refresh failed. The previous scan is still available.",
+              },
+            );
+        } else {
+          setRefreshJob(next);
+        }
+        return;
+      }
+      setScan((current) => {
+        if (
+          current &&
+          current.id === next.id &&
+          current.revision > next.revision
+        )
+          return current;
+        scanRef.current = next;
+        return next;
+      });
+      if (next.rootNodeId)
+        setDirectoryId((current) => current ?? next.rootNodeId);
+    },
+    [loadResults, resolveTrail],
+  );
 
   useEffect(() => {
     let active = true;
@@ -239,7 +313,7 @@ export function FolderSnifferView() {
         return getSnifferScan();
       })
       .then((snapshot) => {
-        if (active && snapshot) acceptScan(snapshot);
+        if (active && snapshot) acceptScan(snapshot, true);
       })
       .catch((nextError) => {
         if (active) setError(errorDetail(nextError));
@@ -280,47 +354,65 @@ export function FolderSnifferView() {
     modifiedTo,
   ]);
 
-  const navigate = useCallback(
-    async (entry: SnifferEntry, fromHistory = false) => {
-      if (!scan || entry.kind !== "directory") return;
-      const oldTrail = trail;
-      const nextTrail = fromHistory ? trail : [...trail, entry];
-      setLoading(true);
-      try {
-        const loaded = await loadResults(scan, entry.nodeId);
-        if (!loaded) return;
-        if (!fromHistory) {
-          setHistory((items) => [...items, oldTrail]);
-          setForward([]);
-        }
-        setTrail(nextTrail);
-        setDirectoryId(entry.nodeId);
-        setCursors([undefined]);
-        setPageIndex(0);
-      } catch {
-        // loadResults keeps the prior location and reports the query error.
+  const navigateToTrail = useCallback(
+    async (
+      nextTrail: SnifferEntry[],
+      mode: "push" | "back" | "forward" = "push",
+    ) => {
+      if (!scan?.rootNodeId) return;
+      const targetId =
+        nextTrail[nextTrail.length - 1]?.nodeId ?? scan.rootNodeId;
+      const loaded = await loadResults(scan, targetId, undefined);
+      if (!loaded) return;
+      if (mode === "back") {
+        setForward((items) => [trail, ...items]);
+        setHistory((items) => items.slice(0, -1));
+      } else if (mode === "forward") {
+        setHistory((items) => [...items, trail]);
+        setForward((items) => items.slice(1));
+      } else {
+        setHistory((items) => [...items, trail]);
+        setForward([]);
       }
+      setTrail(nextTrail);
+      setDirectoryId(targetId);
+      setCursors([undefined]);
+      setPageIndex(0);
     },
     [loadResults, scan, trail],
+  );
+
+  const navigate = useCallback(
+    async (entry: SnifferEntry) => {
+      if (entry.kind === "directory") await navigateToTrail([...trail, entry]);
+    },
+    [navigateToTrail, trail],
   );
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (viewRef.current?.closest("[hidden]")) return;
+      const target = event.target;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLSelectElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLButtonElement ||
+        (target instanceof HTMLElement && target.isContentEditable)
+      )
+        return;
       if (event.key === "Enter" && selected?.kind === "directory") {
         event.preventDefault();
         void navigate(selected);
       }
-      if (event.altKey && event.key === "ArrowLeft" && trail.length > 1) {
+      if (event.altKey && event.key === "ArrowLeft" && trail.length > 0) {
         event.preventDefault();
-        const parent = trail[trail.length - 2];
-        setTrail((items) => items.slice(0, -1));
-        setDirectoryId(parent.nodeId);
+        void navigateToTrail(trail.slice(0, -1));
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [navigate, selected, trail]);
+  }, [navigate, navigateToTrail, selected, trail]);
 
   async function chooseFolder() {
     try {
@@ -335,7 +427,9 @@ export function FolderSnifferView() {
       setHistory([]);
       setForward([]);
       setError(null);
-      acceptScan(next);
+      setMutationWarning(null);
+      acceptedRevisions.current.clear();
+      acceptScan(next, true);
     } catch (nextError) {
       setError(errorDetail(nextError));
     }
@@ -362,20 +456,50 @@ export function FolderSnifferView() {
           : `Rename this ${review.kind}?\n\n${review.fullPath}\n→ ${review.newPath}`;
       if (!window.confirm(message)) return;
       setActionPending(true);
-      await executeSnifferAction(review.token);
+      const result = await executeSnifferAction(review.token);
       setSelected(null);
       setError(null);
+      setMutationWarning(result.warning);
       setScan((current) =>
         current
           ? { ...current, stale: true, revision: current.revision + 1 }
           : current,
       );
+      setSummary((current) =>
+        current ? { ...current, stale: true } : current,
+      );
+      if (directoryId) void loadResults(scan, directoryId, undefined);
     } catch (nextError) {
       setError({ ...errorDetail(nextError), operation: action });
     } finally {
       setActionPending(false);
     }
   }
+
+  async function loadIssuePage(cursor?: string) {
+    if (!scan) return;
+    try {
+      setIssues(await querySnifferIssues(scan.id, undefined, cursor));
+    } catch (nextError) {
+      setError(errorDetail(nextError));
+    }
+  }
+
+  useEffect(() => {
+    setIssues(null);
+    setIssuesOpen(false);
+    setIssueCursors([undefined]);
+    setIssuePageIndex(0);
+  }, [scan?.id]);
+
+  useEffect(() => {
+    void pinSnifferScan(scan?.id ?? null).catch((nextError) =>
+      setError(errorDetail(nextError)),
+    );
+    return () => {
+      void pinSnifferScan(null);
+    };
+  }, [scan?.id]);
 
   const elapsed = scan
     ? Math.max(0, (scan.finishedAt ?? Date.now()) - scan.startedAt)
@@ -511,6 +635,12 @@ export function FolderSnifferView() {
         </section>
       )}
 
+      {mutationWarning && (
+        <p className="form-warning" role="status">
+          The file action succeeded. {mutationWarning}
+        </p>
+      )}
+
       {scan?.rootNodeId && directoryId && (
         <section
           className="sniffer-results"
@@ -521,10 +651,7 @@ export function FolderSnifferView() {
               <button
                 type="button"
                 className="sniffer-trail-link"
-                onClick={() => {
-                  setDirectoryId(scan.rootNodeId);
-                  setTrail([]);
-                }}
+                onClick={() => void navigateToTrail([])}
               >
                 Root
               </button>
@@ -537,10 +664,9 @@ export function FolderSnifferView() {
                     aria-current={
                       index === trail.length - 1 ? "location" : undefined
                     }
-                    onClick={() => {
-                      setDirectoryId(item.nodeId);
-                      setTrail(trail.slice(0, index + 1));
-                    }}
+                    onClick={() =>
+                      void navigateToTrail(trail.slice(0, index + 1))
+                    }
                   >
                     {item.name}
                   </button>
@@ -554,12 +680,7 @@ export function FolderSnifferView() {
                 onClick={() => {
                   const previous = history[history.length - 1];
                   if (!previous) return;
-                  setForward((items) => [trail, ...items]);
-                  setHistory((items) => items.slice(0, -1));
-                  setTrail(previous);
-                  setDirectoryId(
-                    previous[previous.length - 1]?.nodeId ?? scan.rootNodeId,
-                  );
+                  void navigateToTrail(previous, "back");
                 }}
               >
                 Back
@@ -569,12 +690,7 @@ export function FolderSnifferView() {
                 disabled={forward.length === 0}
                 onClick={() => {
                   const next = forward[0];
-                  setHistory((items) => [...items, trail]);
-                  setForward((items) => items.slice(1));
-                  setTrail(next);
-                  setDirectoryId(
-                    next[next.length - 1]?.nodeId ?? scan.rootNodeId,
-                  );
+                  if (next) void navigateToTrail(next, "forward");
                 }}
               >
                 Forward
@@ -582,13 +698,7 @@ export function FolderSnifferView() {
               <button
                 type="button"
                 disabled={directoryId === scan.rootNodeId}
-                onClick={() => {
-                  const next = trail.slice(0, -1);
-                  setTrail(next);
-                  setDirectoryId(
-                    next[next.length - 1]?.nodeId ?? scan.rootNodeId,
-                  );
-                }}
+                onClick={() => void navigateToTrail(trail.slice(0, -1))}
               >
                 Up
               </button>
@@ -596,29 +706,17 @@ export function FolderSnifferView() {
                 type="button"
                 disabled={!terminal.has(scan.status) || Boolean(refreshJob)}
                 onClick={() => {
-                  refreshStarting.current = true;
+                  refreshTrail.current = trail;
                   void refreshSnifferSubtree(
                     scan.id,
                     scan.generationId,
                     directoryId,
                   )
                     .then((next) => {
-                      refreshStarting.current = false;
-                      if (
-                        scanRef.current?.id === next.id &&
-                        terminal.has(scanRef.current.status)
-                      )
-                        return;
                       pendingRefreshId.current = next.id;
-                      setRefreshJob((current) =>
-                        current?.id === next.id &&
-                        current.revision > next.revision
-                          ? current
-                          : next,
-                      );
+                      acceptScan(next);
                     })
                     .catch((e) => {
-                      refreshStarting.current = false;
                       setError(errorDetail(e));
                     });
                 }}
@@ -744,9 +842,9 @@ export function FolderSnifferView() {
                     const opening = !issuesOpen;
                     setIssuesOpen(opening);
                     if (opening && !issues) {
-                      void querySnifferIssues(scan.id)
-                        .then(setIssues)
-                        .catch((nextError) => setError(errorDetail(nextError)));
+                      setIssueCursors([undefined]);
+                      setIssuePageIndex(0);
+                      void loadIssuePage();
                     }
                   }}
                 >
@@ -772,6 +870,36 @@ export function FolderSnifferView() {
                       the retention cap.
                     </p>
                   )}
+                  <nav className="preview-pagination" aria-label="Issue pages">
+                    <button
+                      type="button"
+                      disabled={issuePageIndex === 0}
+                      onClick={() => {
+                        const nextIndex = issuePageIndex - 1;
+                        setIssuePageIndex(nextIndex);
+                        void loadIssuePage(issueCursors[nextIndex]);
+                      }}
+                    >
+                      Previous issues
+                    </button>
+                    <span>Page {issuePageIndex + 1}</span>
+                    <button
+                      type="button"
+                      disabled={!issues.nextCursor}
+                      onClick={() => {
+                        if (!issues.nextCursor) return;
+                        const nextIndex = issuePageIndex + 1;
+                        setIssueCursors((items) => [
+                          ...items.slice(0, nextIndex),
+                          issues.nextCursor ?? undefined,
+                        ]);
+                        setIssuePageIndex(nextIndex);
+                        void loadIssuePage(issues.nextCursor);
+                      }}
+                    >
+                      Next issues
+                    </button>
+                  </nav>
                 </section>
               )}
               <header className="sniffer-map-header">
@@ -796,13 +924,23 @@ export function FolderSnifferView() {
                       ),
                     }}
                     onClick={() => {
-                      if (tile.nodeId) {
-                        const entry = page?.rows.find(
-                          (row) => row.nodeId === tile.nodeId,
-                        );
-                        if (entry?.kind === "directory") void navigate(entry);
-                        else if (entry) setSelected(entry);
+                      if (!tile.nodeId) {
+                        setOtherOpen(true);
+                        document
+                          .querySelector<HTMLTableElement>(".sniffer-table")
+                          ?.focus();
+                        return;
                       }
+                      void getSnifferNode(
+                        scan.id,
+                        scan.generationId,
+                        tile.nodeId,
+                      )
+                        .then((entry) => {
+                          if (entry.kind === "directory") void navigate(entry);
+                          else setSelected(entry);
+                        })
+                        .catch((nextError) => setError(errorDetail(nextError)));
                     }}
                   >
                     <strong>{tile.name}</strong>
@@ -813,6 +951,24 @@ export function FolderSnifferView() {
                   </button>
                 ))}
               </div>
+              {otherOpen &&
+                summary.tiles.some((tile) => tile.kind === "other") && (
+                  <section
+                    className="sniffer-other"
+                    aria-label="Other indexed items"
+                  >
+                    <div>
+                      <strong>Other items</strong>
+                      <span>
+                        Browse the paged table below for items outside the top
+                        40.
+                      </span>
+                    </div>
+                    <button type="button" onClick={() => setOtherOpen(false)}>
+                      Close
+                    </button>
+                  </section>
+                )}
             </>
           )}
 
@@ -834,7 +990,7 @@ export function FolderSnifferView() {
             )}
           </div>
           <div className="sniffer-table-wrap">
-            <table className="sniffer-table">
+            <table className="sniffer-table" tabIndex={-1}>
               <thead>
                 <tr>
                   {[
@@ -876,6 +1032,14 @@ export function FolderSnifferView() {
                       tabIndex={0}
                       aria-selected={selected?.nodeId === entry.nodeId}
                       onClick={() => setSelected(entry)}
+                      onFocus={() => setSelected(entry)}
+                      onKeyDown={(event) => {
+                        if (event.key !== "Enter" && event.key !== " ") return;
+                        event.preventDefault();
+                        setSelected(entry);
+                        if (event.key === "Enter" && entry.kind === "directory")
+                          void navigate(entry);
+                      }}
                       onDoubleClick={() =>
                         entry.kind === "directory" && void navigate(entry)
                       }

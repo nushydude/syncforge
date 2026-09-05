@@ -201,6 +201,7 @@ pub struct WorkCoordinator {
     heavy_jobs: Mutex<WorkState>,
     wake: Condvar,
     released: Arc<Notify>,
+    sniffer: Mutex<Option<std::sync::Weak<SnifferService>>>,
 }
 
 #[derive(Default)]
@@ -264,6 +265,7 @@ impl WorkCoordinator {
             }),
             wake: Condvar::new(),
             released: Arc::new(Notify::new()),
+            sniffer: Mutex::new(None),
         }
     }
 
@@ -363,6 +365,13 @@ impl Drop for HeavyJobPermit {
             self.coordinator.wake.notify_one();
             self.coordinator.released.notify_waiters();
         }
+        if self.writer {
+            if let Ok(observer) = self.coordinator.sniffer.lock() {
+                if let Some(sniffer) = observer.as_ref().and_then(std::sync::Weak::upgrade) {
+                    sniffer.mark_writes_stale(&self.roots);
+                }
+            }
+        }
     }
 }
 
@@ -401,12 +410,15 @@ impl AppState {
             .map_err(PersistenceError::Database)?;
         db.mark_duplicate_scans_interrupted()?;
         db.mark_sync_runs_interrupted()?;
+        let sniffer = Arc::new(sniffer);
+        let coordinator = Arc::new(WorkCoordinator::new());
+        *coordinator.sniffer.lock().expect("new coordinator") = Some(Arc::downgrade(&sniffer));
         Ok(Self {
-            work_coordinator: Arc::new(WorkCoordinator::new()),
+            work_coordinator: coordinator,
             db: Arc::new(db),
             duplicate_scan_cancels: Mutex::new(HashMap::new()),
             active_duplicate_jobs: Mutex::new(HashSet::new()),
-            sniffer: Arc::new(sniffer),
+            sniffer,
             active_runs: Mutex::new(HashMap::new()),
             preview_cancels: Mutex::new(HashMap::new()),
             pending_watch_syncs: Mutex::new(HashSet::new()),

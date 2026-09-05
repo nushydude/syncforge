@@ -21,84 +21,117 @@ pub(crate) fn admit_sniffer(
 }
 
 #[tauri::command]
-pub fn start_sniffer_scan(
+pub async fn start_sniffer_scan(
     root: String,
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ScanSnapshot, SnifferError> {
-    state.sniffer.start(&root, app, state.inner().clone())
+    let state = state.inner().clone();
+    blocking("scan", move || state.sniffer.start(&root, app, state.clone())).await
+}
+async fn blocking<T: Send + 'static>(
+    operation: &'static str,
+    task: impl FnOnce() -> Result<T, SnifferError> + Send + 'static,
+) -> Result<T, SnifferError> {
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| SnifferError::new("failed", operation, true, error.to_string()))?
 }
 #[tauri::command]
-pub fn get_sniffer_scan(
+pub async fn pin_sniffer_scan(
     scan_id: Option<String>,
     state: State<'_, Arc<AppState>>,
-) -> Result<Option<ScanSnapshot>, SnifferError> {
-    state.sniffer.get(scan_id.as_deref())
+) -> Result<(), SnifferError> {
+    let service = state.sniffer.clone();
+    blocking("pin", move || service.pin(scan_id)).await
 }
 #[tauri::command]
-pub fn cancel_sniffer_scan(
+pub async fn get_sniffer_scan(
+    scan_id: Option<String>,
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<ScanSnapshot>, SnifferError> {
+    let service = state.sniffer.clone();
+    blocking("getScan", move || {
+        service.set_app(app);
+        service.get_published(scan_id.as_deref())
+    })
+    .await
+}
+#[tauri::command]
+pub async fn cancel_sniffer_scan(
     scan_id: String,
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ScanSnapshot, SnifferError> {
-    state.sniffer.cancel(&scan_id, &app)
+    let service = state.sniffer.clone();
+    blocking("cancel", move || service.cancel(&scan_id, &app)).await
 }
 #[tauri::command]
-pub fn query_sniffer_entries(
+pub async fn query_sniffer_entries(
     request: QueryRequest,
     state: State<'_, Arc<AppState>>,
 ) -> Result<EntryPage, SnifferError> {
-    state.sniffer.query(request)
+    let service = state.sniffer.clone();
+    blocking("query", move || service.query(request)).await
 }
 #[tauri::command]
-pub fn get_sniffer_summary(
+pub async fn get_sniffer_summary(
     scan_id: String,
     generation_id: String,
     directory_id: String,
+    request: Option<QueryRequest>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Summary, SnifferError> {
-    state.sniffer.summary(&scan_id, &generation_id, &directory_id)
+    let service = state.sniffer.clone();
+    blocking("summary", move || service.summary(&scan_id, &generation_id, &directory_id, request))
+        .await
 }
 #[tauri::command]
-pub fn get_sniffer_node(
+pub async fn get_sniffer_node(
     scan_id: String,
     generation_id: String,
     node_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<EntryRow, SnifferError> {
-    state.sniffer.node(&scan_id, &generation_id, &node_id)
+    let service = state.sniffer.clone();
+    blocking("node", move || service.node(&scan_id, &generation_id, &node_id)).await
 }
 #[tauri::command]
-pub fn query_sniffer_issues(
+pub async fn query_sniffer_issues(
     scan_id: String,
     category: Option<String>,
     cursor: Option<String>,
     limit: u32,
     state: State<'_, Arc<AppState>>,
 ) -> Result<IssuePage, SnifferError> {
-    state.sniffer.issues(&scan_id, category.as_deref(), cursor.as_deref(), limit)
+    let service = state.sniffer.clone();
+    blocking("issues", move || {
+        service.issues(&scan_id, category.as_deref(), cursor.as_deref(), limit)
+    })
+    .await
 }
 #[tauri::command]
-pub fn refresh_sniffer_subtree(
+pub async fn refresh_sniffer_subtree(
     scan_id: String,
     generation_id: String,
     directory_id: String,
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ScanSnapshot, SnifferError> {
-    state.sniffer.node(&scan_id, &generation_id, &directory_id)?;
-    let previous = state
-        .sniffer
-        .get(Some(&scan_id))?
-        .ok_or_else(|| SnifferError::new("expired", "refresh", false, "Scan expired."))?;
-    state.sniffer.start(&previous.root, app, state.inner().clone())
+    let state = state.inner().clone();
+    blocking("refresh", move || {
+        state.sniffer.refresh(&scan_id, &generation_id, &directory_id, app, state.clone())
+    })
+    .await
 }
 #[tauri::command]
-pub fn prepare_sniffer_action(
+pub async fn prepare_sniffer_action(
     request: PrepareActionRequest,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ActionReview, SnifferError> {
-    state.sniffer.prepare_action(request)
+    let service = state.sniffer.clone();
+    blocking("action", move || service.prepare_action(request)).await
 }
 #[tauri::command]
 pub async fn execute_sniffer_action(

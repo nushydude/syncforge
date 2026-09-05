@@ -22,6 +22,18 @@ const ISSUE_DETAIL_LIMIT: i64 = 10_000;
 const ACTION_TTL_MS: i64 = 2 * 60 * 1000;
 const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 const INDEX_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+type ProgressSink<'a> = &'a dyn Fn(&ScanSnapshot);
+
+struct IndexRollback<'a>(&'a Mutex<Connection>);
+impl Drop for IndexRollback<'_> {
+    fn drop(&mut self) {
+        let db = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if !db.is_autocommit() {
+            let _ = db.execute_batch("ROLLBACK");
+        }
+        self.0.clear_poison();
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +65,9 @@ pub struct ScanSnapshot {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub error: Option<SnifferError>,
+    /// The replacement subtree's root, for preserving the refresh location.
+    #[serde(default)]
+    pub refreshed_directory_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -213,12 +228,15 @@ pub struct ActionResult {
     pub path: String,
     pub new_path: Option<String>,
     pub stale_directory_id: String,
+    pub warning: Option<String>,
 }
 
 #[derive(Clone)]
 struct JobControl {
     snapshot: ScanSnapshot,
     cancel: Arc<AtomicBool>,
+    last_emitted: Instant,
+    refresh: Option<(String, i64)>,
 }
 struct PreparedAction {
     review: ActionReview,
@@ -227,6 +245,8 @@ struct PreparedAction {
     parent_id: i64,
     native_path: Vec<u8>,
     fingerprint: String,
+    destination: Option<PathBuf>,
+    root: PathBuf,
 }
 
 pub struct SnifferService {
@@ -235,6 +255,11 @@ pub struct SnifferService {
     jobs: Mutex<HashMap<String, JobControl>>,
     active: Mutex<Option<String>>,
     actions: Mutex<HashMap<String, PreparedAction>>,
+    // Serializes publication and reads across the small SQLite transactions.
+    publication: Mutex<()>,
+    displayed: Mutex<Option<String>>,
+    #[cfg(not(test))]
+    event_app: Mutex<Option<AppHandle>>,
 }
 
 fn now_ms() -> i64 {
@@ -278,13 +303,85 @@ fn display(path: &Path) -> String {
 fn modified_ms(metadata: &fs::Metadata) -> Option<i64> {
     metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis() as i64)
 }
-fn fingerprint(metadata: &fs::Metadata) -> String {
+fn fingerprint(path: &Path, metadata: &fs::Metadata) -> String {
+    let identity = file_identity(path).unwrap_or_default();
     format!(
-        "{}:{}:{}",
-        metadata.len(),
-        modified_ms(metadata).unwrap_or(-1),
+        "{}:{}:{}:{}",
+        identity,
+        if metadata.is_dir() { 0 } else { metadata.len() },
+        if metadata.is_dir() { 0 } else { modified_ms(metadata).unwrap_or(-1) },
         if metadata.is_dir() { "d" } else { "f" }
     )
+}
+
+#[cfg(windows)]
+fn open_identity(
+    path: &Path,
+    exclusive_delete: bool,
+    for_rename: bool,
+) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .access_mode(0x80 | if for_rename { 0x10000 } else { 0 })
+        .share_mode(if exclusive_delete { 3 } else { 7 })
+        .custom_flags(0x0020_0000 | 0x0200_0000)
+        .open(path)
+}
+#[cfg(windows)]
+fn handle_identity(file: &fs::File) -> std::io::Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(format!("{}:{}:{}", info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow))
+}
+#[cfg(windows)]
+fn file_identity(path: &Path) -> std::io::Result<String> {
+    handle_identity(&open_identity(path, false, false)?)
+}
+#[cfg(unix)]
+fn file_identity(path: &Path) -> std::io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path)?;
+    Ok(format!("{}:{}", meta.dev(), meta.ino()))
+}
+
+fn validate_target(root: &Path, path: &Path, expected: &str) -> Result<(), SnifferError> {
+    if path == root || !path.starts_with(root) || expected.starts_with(':') {
+        return Err(SnifferError::new(
+            "staleTarget",
+            "action",
+            false,
+            "The indexed target identity or root membership cannot be verified.",
+        ));
+    }
+    for ancestor in path.ancestors() {
+        let meta = fs::symlink_metadata(ancestor)
+            .map_err(|e| SnifferError::new("staleTarget", "action", true, e.to_string()))?;
+        if is_link(ancestor, &meta) {
+            return Err(SnifferError::new(
+                "staleTarget",
+                "action",
+                false,
+                "A target or ancestor is now a link or reparse point. Scan again.",
+            ));
+        }
+    }
+    let meta = fs::symlink_metadata(path)
+        .map_err(|e| SnifferError::new("staleTarget", "action", true, e.to_string()))?;
+    if fingerprint(path, &meta) != expected {
+        return Err(SnifferError::new(
+            "staleTarget",
+            "action",
+            true,
+            "The item changed since it was indexed. Scan again before reviewing it.",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -324,6 +421,7 @@ impl SnifferService {
             .map_err(|_| rusqlite::Error::InvalidPath(cache_dir.into()))?;
         let db_path = cache_dir.join("index.sqlite3");
         let conn = Connection::open(&db_path)?;
+        conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
           CREATE TABLE IF NOT EXISTS scans(id TEXT PRIMARY KEY,generation_id TEXT NOT NULL,root_display TEXT NOT NULL,root_native BLOB NOT NULL,root_node_id INTEGER,status TEXT NOT NULL,revision INTEGER NOT NULL,files INTEGER NOT NULL DEFAULT 0,folders INTEGER NOT NULL DEFAULT 0,bytes INTEGER NOT NULL DEFAULT 0,issues INTEGER NOT NULL DEFAULT 0,coverage INTEGER NOT NULL DEFAULT 1,stale INTEGER NOT NULL DEFAULT 0,current_directory TEXT,started_at INTEGER NOT NULL,finished_at INTEGER,error TEXT,last_accessed INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY,scan_id TEXT NOT NULL,parent_id INTEGER,name_display TEXT NOT NULL,path_display TEXT NOT NULL,path_native BLOB NOT NULL,path_key TEXT NOT NULL,depth INTEGER NOT NULL,kind TEXT NOT NULL,size INTEGER NOT NULL DEFAULT 0,files INTEGER NOT NULL DEFAULT 0,folders INTEGER NOT NULL DEFAULT 0,modified_at INTEGER,state TEXT NOT NULL DEFAULT 'complete',fingerprint TEXT,extension TEXT,FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE);
@@ -331,6 +429,14 @@ impl SnifferService {
           CREATE TABLE IF NOT EXISTS issues(id INTEGER PRIMARY KEY,scan_id TEXT NOT NULL,node_id INTEGER,category TEXT NOT NULL,path_display TEXT NOT NULL,code TEXT,message TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS issues_scan ON issues(scan_id,category,id);
           CREATE TABLE IF NOT EXISTS pending_directories(scan_id TEXT NOT NULL,node_id INTEGER NOT NULL,path_native BLOB NOT NULL,depth INTEGER NOT NULL,PRIMARY KEY(scan_id,node_id));")?;
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS pending_order ON pending_directories(scan_id,depth DESC,node_id DESC);")?;
+        let columns = conn
+            .prepare("PRAGMA table_info(nodes)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "own_incomplete") {
+            conn.execute_batch("ALTER TABLE nodes ADD COLUMN own_incomplete INTEGER NOT NULL DEFAULT 0; UPDATE nodes SET own_incomplete=1 WHERE EXISTS(SELECT 1 FROM issues WHERE issues.node_id=nodes.id AND issues.category<>'skippedLink');")?;
+        }
         conn.execute("UPDATE scans SET status='failed',finished_at=?1,error='Scan interrupted when SyncForge stopped' WHERE status IN ('queued','scanning','cancelling')", [now_ms()])?;
         conn.execute("DELETE FROM scans WHERE status NOT IN ('queued','scanning','cancelling') AND last_accessed<?1", [now_ms() - RETENTION_MS])?;
         conn.execute("DELETE FROM scans WHERE id IN (SELECT id FROM scans WHERE status NOT IN ('queued','scanning','cancelling') ORDER BY last_accessed DESC LIMIT -1 OFFSET 8)", [])?;
@@ -345,6 +451,10 @@ impl SnifferService {
             jobs: Mutex::new(HashMap::new()),
             active: Mutex::new(None),
             actions: Mutex::new(HashMap::new()),
+            publication: Mutex::new(()),
+            displayed: Mutex::new(None),
+            #[cfg(not(test))]
+            event_app: Mutex::new(None),
         })
     }
 
@@ -354,7 +464,68 @@ impl SnifferService {
         app: AppHandle,
         state: Arc<AppState>,
     ) -> Result<ScanSnapshot, SnifferError> {
-        let root = Path::new(root).canonicalize().map_err(|e| {
+        self.start_native(Path::new(root), app, state, None)
+    }
+
+    pub fn refresh(
+        self: &Arc<Self>,
+        scan: &str,
+        generation: &str,
+        directory: &str,
+        app: AppHandle,
+        state: Arc<AppState>,
+    ) -> Result<ScanSnapshot, SnifferError> {
+        let old = self.validate_generation(scan, generation)?;
+        if !matches!(old.status, ScanStatus::Completed | ScanStatus::Cancelled | ScanStatus::Failed)
+        {
+            return Err(SnifferError::new(
+                "busy",
+                "refresh",
+                true,
+                "Wait for the current scan to finish.",
+            ));
+        }
+        let node = self.node(scan, generation, directory)?;
+        if node.kind != "directory" {
+            return Err(SnifferError::new(
+                "unsupported",
+                "refresh",
+                false,
+                "Refresh requires a directory.",
+            ));
+        }
+        if old.issue_count.parse::<i64>().unwrap_or(0) > ISSUE_DETAIL_LIMIT
+            && old.root_node_id.as_deref() != Some(directory)
+        {
+            return Err(SnifferError::new(
+                "unsupported",
+                "refresh",
+                false,
+                "Refresh the scan root to rebuild a scan whose issue details were capped.",
+            ));
+        }
+        let path = self.native_node_path(scan, directory)?;
+        self.start_native(
+            &path,
+            app,
+            state,
+            Some((scan.into(), directory.parse().map_err(|e| sql_error("refresh", e))?)),
+        )
+    }
+
+    fn start_native(
+        self: &Arc<Self>,
+        root: &Path,
+        app: AppHandle,
+        state: Arc<AppState>,
+        refresh: Option<(String, i64)>,
+    ) -> Result<ScanSnapshot, SnifferError> {
+        let _publication = self.publication.lock().map_err(|e| sql_error("scan", e))?;
+        self.set_app(app.clone());
+        if refresh.is_none() {
+            self.prune(7)?;
+        }
+        let root = root.canonicalize().map_err(|e| {
             SnifferError::new("notFound", "scan", true, format!("Could not open folder: {e}"))
         })?;
         if !root.is_dir() {
@@ -394,13 +565,19 @@ impl SnifferService {
             started_at: now,
             finished_at: None,
             error: None,
+            refreshed_directory_id: None,
         };
         self.db.lock().map_err(|e| sql_error("scan", e))?.execute("INSERT INTO scans(id,generation_id,root_display,root_native,status,revision,started_at,last_accessed) VALUES(?1,?2,?3,?4,'queued',1,?5,?5)", params![id,generation_id,display(&root),path_bytes(&root),now]).map_err(|e| sql_error("scan",e))?;
         let cancel = Arc::new(AtomicBool::new(false));
-        self.jobs
-            .lock()
-            .map_err(|e| sql_error("scan", e))?
-            .insert(id.clone(), JobControl { snapshot: snapshot.clone(), cancel: cancel.clone() });
+        self.jobs.lock().map_err(|e| sql_error("scan", e))?.insert(
+            id.clone(),
+            JobControl {
+                snapshot: snapshot.clone(),
+                cancel: cancel.clone(),
+                last_emitted: Instant::now(),
+                refresh,
+            },
+        );
         *active = Some(id.clone());
         drop(active);
         let service = Arc::clone(self);
@@ -422,12 +599,134 @@ impl SnifferService {
                         true,
                         "The scan worker stopped unexpectedly.",
                     )),
-                    &app,
+                    &|snapshot| {
+                        let _ = app.emit(PROGRESS_EVENT, snapshot);
+                    },
                 );
             }
             retry_pending_syncs(app, &state);
         });
         Ok(snapshot)
+    }
+
+    pub fn pin(&self, scan: Option<String>) -> Result<(), SnifferError> {
+        let _publication = self.publication.lock().map_err(|e| sql_error("pin", e))?;
+        if let Some(id) = &scan {
+            if self.get(Some(id))?.is_none() {
+                return Err(SnifferError::new("expired", "pin", false, "Scan expired."));
+            }
+        }
+        *self.displayed.lock().map_err(|e| sql_error("pin", e))? = scan;
+        self.prune(8)
+    }
+
+    pub fn set_app(&self, _app: AppHandle) {
+        #[cfg(not(test))]
+        if let Ok(mut current) = self.event_app.lock() {
+            *current = Some(_app);
+        }
+    }
+
+    pub fn mark_writes_stale(&self, roots: &[PathBuf]) {
+        let Ok(_publication) = self.publication.lock() else {
+            return;
+        };
+        let affected = (|| -> rusqlite::Result<Vec<String>> {
+            let db = self.db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let mut statement = db.prepare("SELECT id,root_native FROM scans")?;
+            let scans = statement
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut affected = Vec::new();
+            for (id, native) in scans {
+                let path = bytes_path(&native);
+                if roots.iter().any(|root| path.starts_with(root) || root.starts_with(&path)) {
+                    db.execute("UPDATE scans SET stale=1,revision=revision+1 WHERE id=?1", [&id])?;
+                    affected.push(id);
+                }
+            }
+            Ok(affected)
+        })()
+        .unwrap_or_default();
+        for id in affected {
+            self.update_job_quiet(&id, |s| {
+                s.stale = true;
+                s.revision += 1;
+            });
+            #[cfg(not(test))]
+            if let Ok(Some(snapshot)) = self.get(Some(&id)) {
+                if let Ok(app) = self.event_app.lock() {
+                    if let Some(app) = app.as_ref() {
+                        let _ = app.emit(PROGRESS_EVENT, &snapshot);
+                    }
+                }
+            }
+        }
+    }
+
+    fn prune(&self, maximum: usize) -> Result<(), SnifferError> {
+        let displayed = self.displayed.lock().map_err(|e| sql_error("retention", e))?.clone();
+        let mut protected = {
+            let mut actions = self.actions.lock().map_err(|e| sql_error("retention", e))?;
+            actions.retain(|_, action| action.review.expires_at >= now_ms());
+            actions.values().map(|action| action.scan_id.clone()).collect::<Vec<_>>()
+        };
+        protected.extend(
+            self.jobs
+                .lock()
+                .map_err(|e| sql_error("retention", e))?
+                .values()
+                .filter(|job| {
+                    matches!(
+                        job.snapshot.status,
+                        ScanStatus::Queued | ScanStatus::Scanning | ScanStatus::Cancelling
+                    )
+                })
+                .filter_map(|job| job.refresh.as_ref().map(|(scan, _)| scan.clone())),
+        );
+        let removed = {
+            let db = self.db.lock().map_err(|e| sql_error("retention", e))?;
+            let mut statement = db
+                .prepare("SELECT id,status,last_accessed FROM scans ORDER BY last_accessed ASC")
+                .map_err(|e| sql_error("retention", e))?;
+            let scans = statement
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                })
+                .map_err(|e| sql_error("retention", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| sql_error("retention", e))?;
+            let mut count = scans.len();
+            let mut removed = Vec::new();
+            for (id, status, accessed) in scans {
+                if matches!(status.as_str(), "queued" | "scanning" | "cancelling")
+                    || displayed.as_deref() == Some(&id)
+                    || protected.contains(&id)
+                {
+                    continue;
+                }
+                if count > maximum || accessed < now_ms() - RETENTION_MS {
+                    db.execute("DELETE FROM issues WHERE scan_id=?1", [&id])
+                        .map_err(|e| sql_error("retention", e))?;
+                    db.execute("DELETE FROM pending_directories WHERE scan_id=?1", [&id])
+                        .map_err(|e| sql_error("retention", e))?;
+                    db.execute("DELETE FROM scans WHERE id=?1", [&id])
+                        .map_err(|e| sql_error("retention", e))?;
+                    removed.push(id);
+                    count -= 1;
+                }
+            }
+            if !removed.is_empty() {
+                let _ =
+                    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum;");
+            }
+            removed
+        };
+        let mut jobs = self.jobs.lock().map_err(|e| sql_error("retention", e))?;
+        for id in removed {
+            jobs.remove(&id);
+        }
+        Ok(())
     }
 
     pub fn get(&self, id: Option<&str>) -> Result<Option<ScanSnapshot>, SnifferError> {
@@ -441,6 +740,11 @@ impl SnifferService {
             db.query_row("SELECT id,generation_id,root_display,root_node_id,status,revision,files,folders,bytes,issues,coverage,stale,current_directory,started_at,finished_at,error FROM scans ORDER BY started_at DESC LIMIT 1", [], row_snapshot).optional()
         };
         result.map_err(|e| sql_error("getScan", e))
+    }
+
+    pub fn get_published(&self, id: Option<&str>) -> Result<Option<ScanSnapshot>, SnifferError> {
+        let _publication = self.publication.lock().map_err(|e| sql_error("getScan", e))?;
+        self.get(id)
     }
 
     pub fn cancel(&self, id: &str, app: &AppHandle) -> Result<ScanSnapshot, SnifferError> {
@@ -466,6 +770,9 @@ impl SnifferService {
         app: AppHandle,
         coordinator: Arc<WorkCoordinator>,
     ) {
+        let emit = |snapshot: &ScanSnapshot| {
+            let _ = app.emit(PROGRESS_EVENT, snapshot);
+        };
         let mut permit = None;
         while permit.is_none() && !cancel.load(Ordering::Acquire) {
             permit = match coordinator.try_acquire(WorkRequest::new(
@@ -475,7 +782,7 @@ impl SnifferService {
             )) {
                 Ok(permit) => permit,
                 Err(error) => {
-                    self.finish(&id, ScanStatus::Failed, Some(sql_error("scan", error)), &app);
+                    self.finish(&id, ScanStatus::Failed, Some(sql_error("scan", error)), &emit);
                     return;
                 }
             };
@@ -484,24 +791,149 @@ impl SnifferService {
             }
         }
         if cancel.load(Ordering::Acquire) {
-            self.finish(&id, ScanStatus::Cancelled, None, &app);
+            self.finish(&id, ScanStatus::Cancelled, None, &emit);
             return;
         }
-        self.update_job(&id, &app, true, |s| {
+        self.update_job(&id, &emit, true, |s| {
             s.status = ScanStatus::Scanning;
         });
-        let result = self.traverse(&id, &root, &cancel, &app);
+        let result = self.traverse(&id, &root, &cancel, &emit).and_then(|()| {
+            if !cancel.load(Ordering::Acquire) {
+                self.publish_refresh(&id, &cancel)?;
+            }
+            Ok(())
+        });
         drop(permit);
         match result {
             Ok(()) if cancel.load(Ordering::Acquire) => {
-                self.finish(&id, ScanStatus::Cancelled, None, &app)
+                self.finish(&id, ScanStatus::Cancelled, None, &emit)
             }
-            Ok(()) => self.finish(&id, ScanStatus::Completed, None, &app),
+            Ok(()) => self.finish(&id, ScanStatus::Completed, None, &emit),
             Err(_e) if cancel.load(Ordering::Acquire) => {
-                self.finish(&id, ScanStatus::Cancelled, None, &app)
+                self.finish(&id, ScanStatus::Cancelled, None, &emit)
             }
-            Err(e) => self.finish(&id, ScanStatus::Failed, Some(e), &app),
+            Err(e) => self.finish(&id, ScanStatus::Failed, Some(e), &emit),
         }
+    }
+
+    fn publish_refresh(&self, scan: &str, cancel: &AtomicBool) -> Result<(), SnifferError> {
+        let _publication = self.publication.lock().map_err(|e| sql_error("refresh", e))?;
+        let _rollback = IndexRollback(&self.db);
+        let refresh = self
+            .jobs
+            .lock()
+            .map_err(|e| sql_error("refresh", e))?
+            .get(scan)
+            .and_then(|job| job.refresh.clone());
+        let Some((old_scan, old_directory)) = refresh else {
+            return Ok(());
+        };
+        let old = self.get(Some(&old_scan))?.ok_or_else(|| {
+            SnifferError::new("expired", "refresh", false, "Previous scan expired.")
+        })?;
+        let staged =
+            self.get(Some(scan))?.ok_or_else(|| sql_error("refresh", "Missing staged scan"))?;
+        let staged_root = staged
+            .root_node_id
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+            .ok_or_else(|| sql_error("refresh", "Missing staged root"))?;
+        let db = self.db.lock().map_err(|e| sql_error("refresh", e))?;
+        let (old_key, old_parent): (String, Option<i64>) = db
+            .query_row(
+                "SELECT path_key,parent_id FROM nodes WHERE scan_id=?1 AND id=?2",
+                params![old_scan, old_directory],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| sql_error("refresh", e))?;
+        let offset: i64 = db
+            .query_row("SELECT COALESCE(MAX(id),0) FROM nodes", [], |r| r.get(0))
+            .map_err(|e| sql_error("refresh", e))?;
+        let old_root = old
+            .root_node_id
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+            .ok_or_else(|| sql_error("refresh", "Missing old root"))?;
+        let new_root = if old_parent.is_none() {
+            staged_root
+        } else {
+            offset
+                .checked_add(old_root)
+                .ok_or_else(|| sql_error("refresh", "Node identity overflow"))?
+        };
+        let root_native: Vec<u8> = db
+            .query_row("SELECT root_native FROM scans WHERE id=?1", [&old_scan], |r| r.get(0))
+            .map_err(|e| sql_error("refresh", e))?;
+        let staged_retained: i64 = db
+            .query_row("SELECT COUNT(*) FROM issues WHERE scan_id=?1", [scan], |r| r.get(0))
+            .map_err(|e| sql_error("refresh", e))?;
+        db.execute_batch("BEGIN IMMEDIATE").map_err(|e| sql_error("refresh", e))?;
+        let result = (|| -> Result<(), SnifferError> {
+            db.execute("INSERT INTO nodes(id,scan_id,parent_id,name_display,path_display,path_native,path_key,depth,kind,size,files,folders,modified_at,state,fingerprint,extension,own_incomplete) SELECT id+?1,?2,CASE WHEN parent_id IS NULL THEN NULL ELSE parent_id+?1 END,name_display,path_display,path_native,path_key,depth,kind,size,files,folders,modified_at,state,fingerprint,extension,own_incomplete FROM nodes WHERE scan_id=?3 AND path_key NOT LIKE ?4",params![offset,scan,old_scan,format!("{old_key}%")]).map_err(|e|sql_error("refresh",e))?;
+            db.execute(
+                "UPDATE nodes SET parent_id=?2 WHERE id=?1",
+                params![staged_root, old_parent.map(|parent| parent + offset)],
+            )
+            .map_err(|e| sql_error("refresh", e))?;
+            db.execute("WITH RECURSIVE tree(id,key,depth) AS (SELECT id,'/',0 FROM nodes WHERE scan_id=?1 AND parent_id IS NULL UNION ALL SELECT n.id,tree.key||n.id||'/',tree.depth+1 FROM nodes n JOIN tree ON n.parent_id=tree.id WHERE n.scan_id=?1) UPDATE nodes SET path_key=(SELECT key FROM tree WHERE tree.id=nodes.id),depth=(SELECT depth FROM tree WHERE tree.id=nodes.id) WHERE scan_id=?1",[scan]).map_err(|e|sql_error("refresh",e))?;
+            db.execute("INSERT INTO issues(scan_id,node_id,category,path_display,code,message) SELECT ?1,i.node_id+?2,i.category,i.path_display,i.code,i.message FROM issues i JOIN nodes n ON n.id=i.node_id WHERE i.scan_id=?3 AND n.path_key NOT LIKE ?4",params![scan,offset,old_scan,format!("{old_key}%")]).map_err(|e|sql_error("refresh",e))?;
+            db.execute(
+                "UPDATE scans SET root_display=?2,root_native=?3,root_node_id=?4 WHERE id=?1",
+                params![scan, old.root, root_native, new_root],
+            )
+            .map_err(|e| sql_error("refresh", e))?;
+            if cancel.load(Ordering::Acquire) {
+                return Err(SnifferError::new(
+                    "cancelled",
+                    "refresh",
+                    false,
+                    "Refresh cancelled before publishing.",
+                ));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = db.execute_batch("ROLLBACK");
+            return result;
+        }
+        drop(db);
+        if let Err(error) = self.aggregate_ancestors(scan, staged_root) {
+            let _ = self.db.lock().map(|db| db.execute_batch("ROLLBACK"));
+            return Err(error);
+        }
+        let db = self.db.lock().map_err(|e| sql_error("refresh", e))?;
+        let (bytes, files, folders, root_state): (i64, i64, i64, String) = db
+            .query_row("SELECT size,files,folders,state FROM nodes WHERE id=?1", [new_root], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(|e| sql_error("refresh", e))?;
+        let merged_retained: i64 = db
+            .query_row("SELECT COUNT(*) FROM issues WHERE scan_id=?1", [scan], |r| r.get(0))
+            .map_err(|e| sql_error("refresh", e))?;
+        let staged_total = staged.issue_count.parse::<i64>().unwrap_or(staged_retained);
+        let issues = merged_retained
+            .checked_add(staged_total.saturating_sub(staged_retained))
+            .ok_or_else(|| sql_error("refresh", "Issue counter overflow"))?;
+        db.execute(
+            "DELETE FROM issues WHERE scan_id=?1 AND id NOT IN (SELECT id FROM issues WHERE scan_id=?1 ORDER BY id LIMIT ?2)",
+            params![scan, ISSUE_DETAIL_LIMIT],
+        )
+        .map_err(|e| sql_error("refresh", e))?;
+        db.execute_batch("COMMIT").map_err(|e| sql_error("refresh", e))?;
+        drop(db);
+        self.update_job_quiet(scan, |snapshot| {
+            snapshot.root = old.root;
+            snapshot.root_node_id = Some(new_root.to_string());
+            snapshot.refreshed_directory_id = Some(staged_root.to_string());
+            snapshot.logical_bytes = bytes.to_string();
+            snapshot.files_visited = files.to_string();
+            snapshot.folders_visited = folders.to_string();
+            snapshot.issue_count = issues.to_string();
+            snapshot.coverage_complete = root_state == "complete";
+            snapshot.stale |= old.stale && old_parent.is_some();
+            snapshot.revision += 1;
+        });
+        Ok(())
     }
 
     fn traverse(
@@ -509,13 +941,13 @@ impl SnifferService {
         scan_id: &str,
         root: &Path,
         cancel: &AtomicBool,
-        app: &AppHandle,
+        app: ProgressSink<'_>,
     ) -> Result<(), SnifferError> {
         let root_meta = fs::symlink_metadata(root)
             .map_err(|e| SnifferError::new("permissionDenied", "scan", true, e.to_string()))?;
         let root_id = {
             let db = self.db.lock().map_err(|e| sql_error("scan", e))?;
-            db.execute("INSERT INTO nodes(scan_id,parent_id,name_display,path_display,path_native,path_key,depth,kind,modified_at,fingerprint) VALUES(?1,NULL,?2,?3,?4,'/',0,'directory',?5,?6)",params![scan_id,root.file_name().unwrap_or(root.as_os_str()).to_string_lossy(),display(root),path_bytes(root),modified_ms(&root_meta),fingerprint(&root_meta)]).map_err(|e|sql_error("scan",e))?;
+            db.execute("INSERT INTO nodes(scan_id,parent_id,name_display,path_display,path_native,path_key,depth,kind,modified_at,fingerprint,state) VALUES(?1,NULL,?2,?3,?4,'/',0,'directory',?5,?6,'scanning')",params![scan_id,root.file_name().unwrap_or(root.as_os_str()).to_string_lossy(),display(root),path_bytes(root),modified_ms(&root_meta),fingerprint(root, &root_meta)]).map_err(|e|sql_error("scan",e))?;
             let node = db.last_insert_rowid();
             db.execute("UPDATE scans SET root_node_id=?2 WHERE id=?1", params![scan_id, node])
                 .map_err(|e| sql_error("scan", e))?;
@@ -563,25 +995,46 @@ impl SnifferService {
             if last.elapsed() >= PROGRESS_INTERVAL {
                 last = Instant::now();
             }
-            match fs::read_dir(&dir) {
+            // A queued directory may have been replaced since indexing it.
+            let entries = fs::symlink_metadata(&dir).and_then(|metadata| {
+                if is_link(&dir, &metadata) {
+                    Err(std::io::Error::other(
+                        "Directory became a link or reparse point and was not followed",
+                    ))
+                } else {
+                    fs::read_dir(&dir)
+                }
+            });
+            match entries {
                 Ok(entries) => {
+                    let mut batch = Vec::with_capacity(1000);
                     for child in entries {
                         if cancel.load(Ordering::Acquire) {
                             break;
                         }
-                        match child {
-                            Ok(child) => {
-                                self.index_child(scan_id, parent_id, depth + 1, &child.path())?
-                            }
-                            Err(e) => self.add_issue(
+                        batch.push(child.map(|entry| entry.path()));
+                        if batch.len() >= 1000 || last.elapsed() >= PROGRESS_INTERVAL {
+                            self.publish_batch(
                                 scan_id,
-                                Some(parent_id),
-                                "unreadableDirectory",
+                                parent_id,
+                                depth + 1,
                                 &dir,
-                                &e,
-                            )?,
+                                &mut batch,
+                                cancel,
+                                app,
+                            )?;
+                            last = Instant::now();
                         }
                     }
+                    self.publish_batch(
+                        scan_id,
+                        parent_id,
+                        depth + 1,
+                        &dir,
+                        &mut batch,
+                        cancel,
+                        app,
+                    )?;
                 }
                 Err(e) => self.add_issue(
                     scan_id,
@@ -595,16 +1048,112 @@ impl SnifferService {
                     &e,
                 )?,
             }
+            let _publication = self.publication.lock().map_err(|e| sql_error("scan", e))?;
+            if !cancel.load(Ordering::Acquire) {
+                self.db
+                    .lock()
+                    .map_err(|e| sql_error("scan", e))?
+                    .execute(
+                        "DELETE FROM pending_directories WHERE scan_id=?1 AND node_id=?2",
+                        params![scan_id, parent_id],
+                    )
+                    .map_err(|e| sql_error("scan", e))?;
+            }
+            self.aggregate_ancestors(scan_id, parent_id)?;
+            self.update_job_quiet(scan_id, |s| s.revision += 1);
+            if let Some(snapshot) = self.get(Some(scan_id))? {
+                self.persist_snapshot(&snapshot)?;
+            }
+            self.emit_progress_due(scan_id, app);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_batch(
+        &self,
+        scan: &str,
+        parent: i64,
+        depth: i64,
+        dir: &Path,
+        batch: &mut Vec<std::io::Result<PathBuf>>,
+        cancel: &AtomicBool,
+        app: ProgressSink<'_>,
+    ) -> Result<(), SnifferError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let _publication = self.publication.lock().map_err(|e| sql_error("scan", e))?;
+        let _rollback = IndexRollback(&self.db);
+        let previous = self.get(Some(scan))?.ok_or_else(|| sql_error("scan", "Missing job"))?;
+        self.db
+            .lock()
+            .map_err(|e| sql_error("scan", e))?
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| sql_error("scan", e))?;
+        let result = (|| {
+            for child in batch.drain(..) {
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                if self.index_bytes() > INDEX_BUDGET_BYTES {
+                    return Err(SnifferError::new("resourceLimit", "scan", false, "Folder Sniffer's index budget was reached. Committed partial results were retained."));
+                }
+                match child {
+                    Ok(path) => self.index_child(scan, parent, depth, &path)?,
+                    Err(error) => {
+                        self.add_issue(scan, Some(parent), "unreadableDirectory", dir, &error)?
+                    }
+                }
+            }
+            self.aggregate_ancestors(scan, parent)?;
+            if cancel.load(Ordering::Acquire) {
+                return Err(SnifferError::new(
+                    "cancelled",
+                    "scan",
+                    false,
+                    "Scan cancelled before committing this batch.",
+                ));
+            }
+            // The revision is published with the rows, never ahead of them.
+            self.update_job_quiet(scan, |snapshot| snapshot.revision += 1);
+            let snapshot = self.get(Some(scan))?.ok_or_else(|| sql_error("scan", "Missing job"))?;
+            self.persist_snapshot(&snapshot)?;
             self.db
                 .lock()
                 .map_err(|e| sql_error("scan", e))?
-                .execute(
-                    "DELETE FROM pending_directories WHERE scan_id=?1 AND node_id=?2",
-                    params![scan_id, parent_id],
-                )
+                .execute_batch("COMMIT")
                 .map_err(|e| sql_error("scan", e))?;
+            self.emit_progress_due(scan, app);
+            Ok(())
+        })();
+        if result.is_err() {
+            if let Ok(db) = self.db.lock() {
+                let _ = db.execute_batch("ROLLBACK");
+            }
+            self.update_job_quiet(scan, |snapshot| {
+                let status = snapshot.status.clone();
+                let revision = snapshot.revision.max(previous.revision);
+                *snapshot = previous;
+                snapshot.status = status;
+                snapshot.revision = revision;
+            });
         }
-        self.finalize_directories(scan_id)?;
+        result
+    }
+
+    fn aggregate_ancestors(&self, scan: &str, mut node: i64) -> Result<(), SnifferError> {
+        let db = self.db.lock().map_err(|e| sql_error("scan", e))?;
+        loop {
+            db.execute("UPDATE nodes AS n SET size=COALESCE((SELECT SUM(c.size) FROM nodes c WHERE c.parent_id=n.id),0),files=COALESCE((SELECT SUM(c.files) FROM nodes c WHERE c.parent_id=n.id),0),folders=COALESCE((SELECT SUM(c.folders+CASE WHEN c.kind='directory' THEN 1 ELSE 0 END) FROM nodes c WHERE c.parent_id=n.id),0),state=CASE WHEN n.own_incomplete=1 OR EXISTS(SELECT 1 FROM nodes c WHERE c.parent_id=n.id AND c.state='unreadable') THEN 'unreadable' WHEN EXISTS(SELECT 1 FROM pending_directories p WHERE p.scan_id=n.scan_id AND p.node_id=n.id) OR EXISTS(SELECT 1 FROM nodes c WHERE c.parent_id=n.id AND c.state='scanning') THEN 'scanning' WHEN n.state='partial' OR EXISTS(SELECT 1 FROM nodes c WHERE c.parent_id=n.id AND c.state='partial') THEN 'partial' ELSE 'complete' END WHERE n.scan_id=?1 AND n.id=?2", params![scan,node]).map_err(|e|sql_error("scan",e))?;
+            let parent: Option<i64> = db
+                .query_row("SELECT parent_id FROM nodes WHERE id=?1", [node], |r| r.get(0))
+                .map_err(|e| sql_error("scan", e))?;
+            match parent {
+                Some(parent) => node = parent,
+                None => break,
+            }
+        }
         Ok(())
     }
 
@@ -710,7 +1259,7 @@ impl SnifferService {
         let parent_key: String = db
             .query_row("SELECT path_key FROM nodes WHERE id=?1", [parent], |r| r.get(0))
             .map_err(|e| sql_error("scan", e))?;
-        db.execute("INSERT INTO nodes(scan_id,parent_id,name_display,path_display,path_native,path_key,depth,kind,size,files,modified_at,state,fingerprint,extension) VALUES(?1,?2,?3,?4,?5,'',?6,?7,?8,?9,?10,?11,?12,?13)",params![scan_id,parent,name,display(path),path_bytes(path),depth,kind,indexed_size,if kind=="file"{1}else{0},modified_ms(meta),state,fingerprint(meta),ext]).map_err(|e|sql_error("scan",e))?;
+        db.execute("INSERT INTO nodes(scan_id,parent_id,name_display,path_display,path_native,path_key,depth,kind,size,files,modified_at,state,fingerprint,extension) VALUES(?1,?2,?3,?4,?5,'',?6,?7,?8,?9,?10,?11,?12,?13)",params![scan_id,parent,name,display(path),path_bytes(path),depth,kind,indexed_size,if kind=="file"{1}else{0},modified_ms(meta),if kind == "directory" { "scanning" } else { state },fingerprint(path, meta),ext]).map_err(|e|sql_error("scan",e))?;
         let id = db.last_insert_rowid();
         db.execute(
             "UPDATE nodes SET path_key=?2 WHERE id=?1",
@@ -776,25 +1325,23 @@ impl SnifferService {
                 SnifferError::new("resourceLimit", "scan", false, "Issue counter overflowed.")
             })?
             .to_string();
-        job.snapshot.coverage_complete = false;
+        if category != "skippedLink" {
+            job.snapshot.coverage_complete = false;
+        }
         let count = job.snapshot.issue_count.parse::<i64>().unwrap_or(0);
         drop(jobs);
+        if category != "skippedLink" {
+            self.db
+                .lock()
+                .map_err(|e| sql_error("scan", e))?
+                .execute(
+                    "UPDATE nodes SET state='unreadable',own_incomplete=1 WHERE scan_id=?1 AND id=?2",
+                    params![scan_id, node],
+                )
+                .map_err(|e| sql_error("scan", e))?;
+        }
         if count <= ISSUE_DETAIL_LIMIT {
             self.db.lock().map_err(|e|sql_error("scan",e))?.execute("INSERT INTO issues(scan_id,node_id,category,path_display,code,message)VALUES(?1,?2,?3,?4,?5,?6)",params![scan_id,node,category,display(path),error.raw_os_error().map(|v|v.to_string()),error.to_string()]).map_err(|e|sql_error("scan",e))?;
-        }
-        Ok(())
-    }
-    fn finalize_directories(&self, scan_id: &str) -> Result<(), SnifferError> {
-        let db = self.db.lock().map_err(|e| sql_error("scan", e))?;
-        let max: i64 = db
-            .query_row(
-                "SELECT COALESCE(MAX(depth),0) FROM nodes WHERE scan_id=?1",
-                [scan_id],
-                |r| r.get(0),
-            )
-            .map_err(|e| sql_error("scan", e))?;
-        for depth in (0..=max).rev() {
-            db.execute("UPDATE nodes AS n SET size=COALESCE((SELECT SUM(c.size) FROM nodes c WHERE c.parent_id=n.id),0),files=COALESCE((SELECT SUM(c.files) FROM nodes c WHERE c.parent_id=n.id),0),folders=COALESCE((SELECT SUM(c.folders+CASE WHEN c.kind='directory' THEN 1 ELSE 0 END) FROM nodes c WHERE c.parent_id=n.id),0),state=CASE WHEN EXISTS(SELECT 1 FROM issues i WHERE i.scan_id=n.scan_id AND (i.node_id=n.id OR i.node_id IN(SELECT id FROM nodes d WHERE d.path_key LIKE n.path_key||'%'))) THEN 'unreadable' ELSE 'complete' END WHERE n.scan_id=?1 AND n.kind='directory' AND n.depth=?2",params![scan_id,depth]).map_err(|e|sql_error("scan",e))?;
         }
         Ok(())
     }
@@ -806,20 +1353,47 @@ impl SnifferService {
             }
         }
     }
-    fn update_job(&self, id: &str, app: &AppHandle, emit: bool, f: impl FnOnce(&mut ScanSnapshot)) {
+    fn emit_progress_due(&self, id: &str, app: ProgressSink<'_>) {
         if let Ok(mut jobs) = self.jobs.lock() {
-            if let Some(j) = jobs.get_mut(id) {
-                f(&mut j.snapshot);
-                if emit {
-                    j.snapshot.revision += 1;
-                    let _ = self.persist_snapshot(&j.snapshot);
-                    let _ = app.emit(PROGRESS_EVENT, &j.snapshot);
+            if let Some(job) = jobs.get_mut(id) {
+                if job.last_emitted.elapsed() >= PROGRESS_INTERVAL {
+                    job.last_emitted = Instant::now();
+                    app(&job.snapshot);
                 }
             }
         }
     }
-    fn finish(&self, id: &str, status: ScanStatus, error: Option<SnifferError>, app: &AppHandle) {
+    fn update_job(
+        &self,
+        id: &str,
+        app: ProgressSink<'_>,
+        emit: bool,
+        f: impl FnOnce(&mut ScanSnapshot),
+    ) {
         if let Ok(mut jobs) = self.jobs.lock() {
+            if let Some(j) = jobs.get_mut(id) {
+                f(&mut j.snapshot);
+                if emit {
+                    j.last_emitted = Instant::now();
+                    j.snapshot.revision += 1;
+                    let _ = self.persist_snapshot(&j.snapshot);
+                    app(&j.snapshot);
+                }
+            }
+        }
+    }
+    fn finish(
+        &self,
+        id: &str,
+        status: ScanStatus,
+        error: Option<SnifferError>,
+        app: ProgressSink<'_>,
+    ) {
+        let _publication = self.publication.lock().unwrap_or_else(|e| e.into_inner());
+        self.publication.clear_poison();
+        {
+            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            self.jobs.clear_poison();
             if let Some(j) = jobs.get_mut(id) {
                 if j.snapshot.status == ScanStatus::Cancelling && status == ScanStatus::Completed {
                     j.snapshot.status = ScanStatus::Cancelled
@@ -827,11 +1401,14 @@ impl SnifferService {
                     j.snapshot.status = status
                 }
                 j.snapshot.finished_at = Some(now_ms());
+                if j.snapshot.status != ScanStatus::Completed {
+                    j.snapshot.coverage_complete = false;
+                }
                 j.snapshot.current_directory = None;
                 j.snapshot.error = error;
                 j.snapshot.revision += 1;
                 let _ = self.persist_snapshot(&j.snapshot);
-                let _ = app.emit(PROGRESS_EVENT, &j.snapshot);
+                app(&j.snapshot);
             }
         }
         if let Ok(mut active) = self.active.lock() {
@@ -840,6 +1417,10 @@ impl SnifferService {
             }
         }
         if let Ok(db) = self.db.lock() {
+            let _ = db.execute(
+                "UPDATE nodes SET state='partial' WHERE scan_id=?1 AND state='scanning'",
+                [id],
+            );
             let _ = db.execute("DELETE FROM pending_directories WHERE scan_id=?1", [id]);
         }
     }
@@ -849,6 +1430,10 @@ impl SnifferService {
     }
 
     pub fn query(&self, q: QueryRequest) -> Result<EntryPage, SnifferError> {
+        let _publication = self.publication.lock().map_err(|e| sql_error("query", e))?;
+        self.query_published(q)
+    }
+    fn query_published(&self, q: QueryRequest) -> Result<EntryPage, SnifferError> {
         let snapshot = self.validate_generation(&q.scan_id, &q.generation_id)?;
         let limit = q.limit.clamp(1, PAGE_MAX) as usize;
         let signature = serde_json::to_string(&(
@@ -871,6 +1456,8 @@ impl SnifferService {
             .parse::<i64>()
             .map_err(|_| SnifferError::new("notFound", "query", false, "Invalid directory."))?;
         let db = self.db.lock().map_err(|e| sql_error("query", e))?;
+        db.execute("UPDATE scans SET last_accessed=?2 WHERE id=?1", params![q.scan_id, now_ms()])
+            .map_err(|e| sql_error("query", e))?;
         let dir_key: String = db
             .query_row(
                 "SELECT path_key FROM nodes WHERE scan_id=?1 AND id=?2 AND kind='directory'",
@@ -998,6 +1585,15 @@ impl SnifferService {
         generation: &str,
         node_id: &str,
     ) -> Result<EntryRow, SnifferError> {
+        let _publication = self.publication.lock().map_err(|e| sql_error("node", e))?;
+        self.node_published(scan_id, generation, node_id)
+    }
+    fn node_published(
+        &self,
+        scan_id: &str,
+        generation: &str,
+        node_id: &str,
+    ) -> Result<EntryRow, SnifferError> {
         self.validate_generation(scan_id, generation)?;
         let id = node_id
             .parse::<i64>()
@@ -1010,9 +1606,11 @@ impl SnifferService {
         scan_id: &str,
         generation: &str,
         directory: &str,
+        request: Option<QueryRequest>,
     ) -> Result<Summary, SnifferError> {
+        let _publication = self.publication.lock().map_err(|e| sql_error("summary", e))?;
         let snapshot = self.validate_generation(scan_id, generation)?;
-        let dir = self.node(scan_id, generation, directory)?;
+        let dir = self.node_published(scan_id, generation, directory)?;
         if dir.kind != "directory" {
             return Err(SnifferError::new(
                 "unsupported",
@@ -1020,6 +1618,65 @@ impl SnifferService {
                 false,
                 "Summary requires a directory.",
             ));
+        }
+        if let Some(mut query) = request {
+            query.scan_id = scan_id.into();
+            query.generation_id = generation.into();
+            query.directory_id = directory.into();
+            query.cursor = None;
+            query.limit = 40;
+            query.sort_by = "size".into();
+            query.sort_direction = "desc".into();
+            let all = self.query_published(query.clone())?;
+            let zero =
+                if query.min_size.as_deref().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) > 0 {
+                    "0".to_string()
+                } else {
+                    let mut zero_query = query.clone();
+                    zero_query.max_size = Some("0".into());
+                    self.query_published(zero_query)?.match_count
+                };
+            let mut tiles: Vec<MapTile> = all
+                .rows
+                .iter()
+                .filter(|row| row.logical_size != "0")
+                .map(|row| MapTile {
+                    kind: "entry".into(),
+                    node_id: Some(row.node_id.clone()),
+                    name: row.name.clone(),
+                    logical_size: row.logical_size.clone(),
+                    item_count: "1".into(),
+                })
+                .collect();
+            let displayed: u64 =
+                tiles.iter().map(|tile| tile.logical_size.parse::<u64>().unwrap_or(0)).sum();
+            let omitted = all.matched_bytes.parse::<u64>().unwrap_or(0).saturating_sub(displayed);
+            if omitted > 0 {
+                tiles.push(MapTile {
+                    kind: "other".into(),
+                    node_id: None,
+                    name: "Other".into(),
+                    logical_size: omitted.to_string(),
+                    item_count: all
+                        .match_count
+                        .parse::<u64>()
+                        .unwrap_or(0)
+                        .saturating_sub(zero.parse::<u64>().unwrap_or(0))
+                        .saturating_sub(tiles.len() as u64)
+                        .to_string(),
+                });
+            }
+            return Ok(Summary {
+                logical_bytes: dir.logical_size.clone(),
+                files: dir.files.clone().unwrap_or_default(),
+                folders: dir.folders.clone().unwrap_or_default(),
+                directory: dir,
+                zero_size_count: zero,
+                tiles,
+                revision: all.revision,
+                coverage_complete: all.coverage_complete,
+                stale: all.stale,
+            });
         }
         let db = self.db.lock().map_err(|e| sql_error("summary", e))?;
         let did = directory.parse::<i64>().unwrap_or(-1);
@@ -1079,15 +1736,16 @@ impl SnifferService {
         cursor: Option<&str>,
         limit: u32,
     ) -> Result<IssuePage, SnifferError> {
+        let _publication = self.publication.lock().map_err(|e| sql_error("issues", e))?;
         let offset = cursor.and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
         let limit = limit.clamp(1, PAGE_MAX) as usize;
         let db = self.db.lock().map_err(|e| sql_error("issues", e))?;
         let total: i64 = db
             .query_row("SELECT issues FROM scans WHERE id=?1", [scan_id], |r| r.get(0))
             .map_err(|_| SnifferError::new("expired", "issues", false, "Scan expired."))?;
-        let mut stmt=db.prepare("SELECT id,node_id,category,path_display,code,message FROM issues WHERE scan_id=?1 ORDER BY id").map_err(|e|sql_error("issues",e))?;
+        let mut stmt=db.prepare("SELECT id,node_id,category,path_display,code,message FROM issues WHERE scan_id=?1 AND (?2 IS NULL OR category=?2) ORDER BY id LIMIT ?3 OFFSET ?4").map_err(|e|sql_error("issues",e))?;
         let rows = stmt
-            .query_map([scan_id], |r| {
+            .query_map(params![scan_id, category, limit as i64, offset as i64], |r| {
                 Ok(IssueRow {
                     id: r.get::<_, i64>(0)?.to_string(),
                     node_id: r.get::<_, Option<i64>>(1)?.map(|v| v.to_string()),
@@ -1098,16 +1756,20 @@ impl SnifferService {
                 })
             })
             .map_err(|e| sql_error("issues", e))?
-            .filter_map(Result::ok)
-            .filter(|r| category.is_none_or(|c| c == r.category))
-            .skip(offset)
-            .take(limit)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| sql_error("issues", e))?;
         let retained: i64 = db
             .query_row("SELECT COUNT(*) FROM issues WHERE scan_id=?1", [scan_id], |r| r.get(0))
             .unwrap_or(0);
+        let matching: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM issues WHERE scan_id=?1 AND (?2 IS NULL OR category=?2)",
+                params![scan_id, category],
+                |r| r.get(0),
+            )
+            .map_err(|e| sql_error("issues", e))?;
         let next =
-            (offset + rows.len() < retained as usize).then(|| (offset + rows.len()).to_string());
+            (offset + rows.len() < matching as usize).then(|| (offset + rows.len()).to_string());
         Ok(IssuePage {
             rows,
             next_cursor: next,
@@ -1130,6 +1792,7 @@ impl SnifferService {
         Ok(s)
     }
     pub fn prepare_action(&self, r: PrepareActionRequest) -> Result<ActionReview, SnifferError> {
+        let _publication = self.publication.lock().map_err(|e| sql_error("action", e))?;
         let snapshot = self.validate_generation(&r.scan_id, &r.generation_id)?;
         let id = r
             .node_id
@@ -1146,14 +1809,20 @@ impl SnifferService {
         if r.action != "rename" && r.action != "recycle" {
             return Err(SnifferError::new("unsupported", "action", false, "Unsupported action."));
         }
+        if r.action == "recycle" || !cfg!(windows) {
+            return Err(SnifferError::new("unsupported", &r.action, false, "This operation is unavailable because the platform cannot guarantee an identity-bound filesystem operation. Use the operating system file manager."));
+        }
         let db = self.db.lock().map_err(|e| sql_error("action", e))?;
-        let (parent, native, kind): (i64, Vec<u8>, String) = db
+        let (parent, native, kind, indexed_fingerprint): (i64, Vec<u8>, String, String) = db
             .query_row(
-                "SELECT parent_id,path_native,kind FROM nodes WHERE scan_id=?1 AND id=?2",
+                "SELECT parent_id,path_native,kind,fingerprint FROM nodes WHERE scan_id=?1 AND id=?2",
                 params![r.scan_id, id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map_err(|_| SnifferError::new("notFound", "action", false, "Node was not found."))?;
+        let root_native: Vec<u8> = db
+            .query_row("SELECT root_native FROM scans WHERE id=?1", [&r.scan_id], |row| row.get(0))
+            .map_err(|e| sql_error("action", e))?;
         drop(db);
         if kind == "link" {
             return Err(SnifferError::new(
@@ -1164,13 +1833,12 @@ impl SnifferService {
             ));
         }
         let path = bytes_path(&native);
-        let meta = fs::symlink_metadata(&path)
-            .map_err(|e| SnifferError::new("staleTarget", "action", true, e.to_string()))?;
-        let new_path = if r.action == "rename" {
+        let root = bytes_path(&root_native);
+        validate_target(&root, &path, &indexed_fingerprint)?;
+        let destination = if r.action == "rename" {
             let name = validate_name(r.new_name.as_deref().unwrap_or(""))?;
-            Some(display(
-                &path
-                    .parent()
+            Some(
+                path.parent()
                     .ok_or_else(|| {
                         SnifferError::new(
                             "unsupported",
@@ -1180,7 +1848,7 @@ impl SnifferService {
                         )
                     })?
                     .join(name),
-            ))
+            )
         } else {
             None
         };
@@ -1191,7 +1859,7 @@ impl SnifferService {
             action: r.action,
             full_path: display(&path),
             kind,
-            new_path,
+            new_path: destination.as_deref().map(display),
             expires_at: expires,
         };
         let mut actions = self.actions.lock().map_err(|e| sql_error("action", e))?;
@@ -1204,7 +1872,9 @@ impl SnifferService {
                 generation_id: r.generation_id,
                 parent_id: parent,
                 native_path: native,
-                fingerprint: fingerprint(&meta),
+                fingerprint: indexed_fingerprint,
+                destination,
+                root,
             },
         );
         Ok(review)
@@ -1230,39 +1900,36 @@ impl SnifferService {
         }
         self.validate_generation(&action.scan_id, &action.generation_id)?;
         let path = bytes_path(&action.native_path);
-        let meta = fs::symlink_metadata(&path)
-            .map_err(|e| SnifferError::new("staleTarget", "action", true, e.to_string()))?;
-        if fingerprint(&meta) != action.fingerprint {
-            return Err(SnifferError::new(
-                "staleTarget",
-                "action",
+        let _permit = coordinator
+            .acquire_manual(WorkRequest::new(
+                vec![path.parent().unwrap_or(&path).to_path_buf()],
                 true,
-                "The item changed after review. Review it again.",
+                HeavyJobKind::Sniffer,
+            ))
+            .map_err(|e| sql_error("action", e))?;
+        let _publication = self.publication.lock().map_err(|e| sql_error("action", e))?;
+        self.validate_generation(&action.scan_id, &action.generation_id)?;
+        if now_ms() > action.review.expires_at {
+            return Err(SnifferError::new(
+                "expired",
+                "action",
+                false,
+                "Action review expired while waiting for other file operations.",
             ));
         }
-        let _permit = coordinator
-            .acquire_manual(WorkRequest::new(vec![path.clone()], true, HeavyJobKind::Sniffer))
-            .map_err(|e| sql_error("action", e))?;
-        let new_path = if action.review.action == "recycle" {
-            trash::delete(&path).map_err(|e| {
-                SnifferError::new(
-                    "unsupported",
-                    "recycle",
-                    true,
-                    format!("Could not move item to the Recycle Bin: {e}"),
-                )
-            })?;
-            None
-        } else {
-            let dest = PathBuf::from(action.review.new_path.as_ref().unwrap());
-            rename_no_replace(&path, &dest)?;
-            Some(display(&dest))
+        let dest = action.destination.as_ref().ok_or_else(|| {
+            SnifferError::new("unsupported", "action", false, "No safe destination is available.")
+        })?;
+        safe_rename(&action.root, &path, dest, &action.fingerprint)?;
+        let new_path = Some(display(dest));
+        // Filesystem success must never be turned into a retryable mutation failure.
+        let warning = match self.db.lock() {
+            Ok(db) => db.execute(
+                "UPDATE scans SET stale=1,revision=revision+1 WHERE id=?1",
+                [&action.scan_id],
+            ).err().map(|error|format!("Rename succeeded, but the index could not be marked stale: {error}. Refresh before relying on these results.")),
+            Err(error) => Some(format!("Rename succeeded, but the index is unavailable: {error}. Refresh before relying on these results.")),
         };
-        self.db
-            .lock()
-            .map_err(|e| sql_error("action", e))?
-            .execute("UPDATE scans SET stale=1,revision=revision+1 WHERE id=?1", [&action.scan_id])
-            .map_err(|e| sql_error("action", e))?;
         self.update_job_quiet(&action.scan_id, |s| {
             s.stale = true;
             s.revision += 1;
@@ -1272,6 +1939,7 @@ impl SnifferService {
             path: action.review.full_path,
             new_path,
             stale_directory_id: action.parent_id.to_string(),
+            warning,
         })
     }
     pub fn native_node_path(&self, scan_id: &str, node_id: &str) -> Result<PathBuf, SnifferError> {
@@ -1332,6 +2000,7 @@ fn row_snapshot(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScanSnapshot> {
         error: r
             .get::<_, Option<String>>(15)?
             .map(|m| SnifferError::new("failed", "scan", true, m)),
+        refreshed_directory_id: None,
     })
 }
 fn encode_cursor(scan: &str, revision: u64, signature: &str, offset: usize) -> String {
@@ -1358,7 +2027,13 @@ fn decode_cursor(
 }
 fn validate_name(name: &str) -> Result<&str, SnifferError> {
     let n = name.trim();
-    if n.is_empty() || n == "." || n == ".." || n.contains(['\\', '/']) || n.ends_with(['.', ' ']) {
+    if n != name
+        || n.is_empty()
+        || n == "."
+        || n == ".."
+        || n.contains(['\\', '/', '\0'])
+        || n.ends_with(['.', ' '])
+    {
         return Err(SnifferError::new(
             "unsupported",
             "rename",
@@ -1368,6 +2043,14 @@ fn validate_name(name: &str) -> Result<&str, SnifferError> {
     }
     #[cfg(windows)]
     {
+        if n.chars().any(|character| character < ' ' || "<>:\"|?*".contains(character)) {
+            return Err(SnifferError::new(
+                "unsupported",
+                "rename",
+                false,
+                "That filename contains a character forbidden by Windows.",
+            ));
+        }
         let stem = n.split('.').next().unwrap_or("").to_ascii_uppercase();
         if matches!(
             stem.as_str(),
@@ -1405,12 +2088,68 @@ fn validate_name(name: &str) -> Result<&str, SnifferError> {
     Ok(n)
 }
 #[cfg(windows)]
-fn rename_no_replace(source: &Path, dest: &Path) -> Result<(), SnifferError> {
+fn safe_rename(
+    root: &Path,
+    source: &Path,
+    dest: &Path,
+    expected: &str,
+) -> Result<(), SnifferError> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
-    let s: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+    if source.parent() != dest.parent() {
+        return Err(SnifferError::new(
+            "unsupported",
+            "rename",
+            false,
+            "Rename must remain in the indexed parent.",
+        ));
+    }
+    // Deny deletion/renaming of every ancestor while resolving the target. Opening
+    // each component no-follow also prevents a replacement junction redirect.
+    let mut ancestors = source.ancestors().skip(1).collect::<Vec<_>>();
+    ancestors.reverse();
+    let mut locks = Vec::with_capacity(ancestors.len());
+    for ancestor in ancestors {
+        let handle = open_identity(ancestor, true, false)
+            .map_err(|e| SnifferError::new("staleTarget", "rename", true, e.to_string()))?;
+        let meta = handle.metadata().map_err(|e| sql_error("rename", e))?;
+        if is_link(ancestor, &meta) {
+            return Err(SnifferError::new(
+                "staleTarget",
+                "rename",
+                false,
+                "An ancestor is a link or reparse point.",
+            ));
+        }
+        locks.push(handle);
+    }
+    let target = open_identity(source, true, true)
+        .map_err(|e| SnifferError::new("staleTarget", "rename", true, e.to_string()))?;
+    validate_target(root, source, expected)?;
+    // Win32 path conversion requires a trailing NUL even though FileNameLength
+    // excludes it. Keep the buffer terminator allocated, including aligned paths.
     let d: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
-    if unsafe { MoveFileExW(s.as_ptr(), d.as_ptr(), 0) } == 0 {
+    let length = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + d.len() * 2;
+    let mut storage = vec![0usize; length.div_ceil(std::mem::size_of::<usize>())];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = std::ptr::null_mut();
+        (*info).FileNameLength = ((d.len() - 1) * 2) as u32;
+        std::ptr::copy_nonoverlapping(d.as_ptr(), (*info).FileName.as_mut_ptr(), d.len());
+    }
+    if unsafe {
+        SetFileInformationByHandle(
+            target.as_raw_handle(),
+            FileRenameInfo,
+            info.cast(),
+            length as u32,
+        )
+    } == 0
+    {
         let e = std::io::Error::last_os_error();
         return Err(SnifferError::new(
             if e.kind() == std::io::ErrorKind::AlreadyExists { "nameCollision" } else { "failed" },
@@ -1422,16 +2161,18 @@ fn rename_no_replace(source: &Path, dest: &Path) -> Result<(), SnifferError> {
     Ok(())
 }
 #[cfg(not(windows))]
-fn rename_no_replace(source: &Path, dest: &Path) -> Result<(), SnifferError> {
-    if dest.exists() {
-        return Err(SnifferError::new(
-            "nameCollision",
-            "rename",
-            false,
-            "An item with that name already exists.",
-        ));
-    }
-    fs::rename(source, dest).map_err(|e| SnifferError::new("failed", "rename", true, e.to_string()))
+fn safe_rename(
+    _root: &Path,
+    _source: &Path,
+    _dest: &Path,
+    _expected: &str,
+) -> Result<(), SnifferError> {
+    Err(SnifferError::new(
+        "unsupported",
+        "rename",
+        false,
+        "Identity-bound no-replace rename is unavailable on this platform.",
+    ))
 }
 
 #[cfg(test)]
@@ -1460,6 +2201,7 @@ mod tests {
             started_at: now_ms(),
             finished_at: Some(now_ms()),
             error: None,
+            refreshed_directory_id: None,
         };
         let db = service.db.lock().unwrap();
         db.execute("INSERT INTO scans(id,generation_id,root_display,root_native,root_node_id,status,revision,files,folders,bytes,issues,coverage,stale,started_at,last_accessed) VALUES('scan','generation',?1,?2,1,'completed',7,250,1,31375,0,1,0,?3,?3)", params![display(&root), path_bytes(&root), now_ms()]).unwrap();
@@ -1474,7 +2216,12 @@ mod tests {
         drop(db);
         service.jobs.lock().unwrap().insert(
             "scan".into(),
-            JobControl { snapshot: snapshot.clone(), cancel: Arc::new(AtomicBool::new(false)) },
+            JobControl {
+                snapshot: snapshot.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                last_emitted: Instant::now(),
+                refresh: None,
+            },
         );
         (dir, service, snapshot)
     }
@@ -1503,5 +2250,323 @@ mod tests {
             service.query(QueryRequest { search: "%".into(), cursor: None, ..request }).unwrap();
         assert_eq!(literal.rows.len(), 1);
         assert_eq!(literal.rows[0].name, "100%real.txt");
+    }
+
+    #[test]
+    fn filtered_summary_matches_query_and_bounds_tiles() {
+        let (_dir, service, snapshot) = fixture();
+        let query = QueryRequest {
+            scan_id: snapshot.id.clone(),
+            generation_id: snapshot.generation_id.clone(),
+            directory_id: "1".into(),
+            scope: "subtreeFiles".into(),
+            min_size: Some("101".into()),
+            ..Default::default()
+        };
+        let page = service.query(query.clone()).unwrap();
+        let summary =
+            service.summary(&snapshot.id, &snapshot.generation_id, "1", Some(query)).unwrap();
+        assert_eq!(summary.tiles.len(), 41);
+        assert_eq!(summary.tiles.last().unwrap().kind, "other");
+        let bytes: u64 =
+            summary.tiles.iter().map(|tile| tile.logical_size.parse::<u64>().unwrap()).sum();
+        assert_eq!(bytes.to_string(), page.matched_bytes);
+        assert_eq!(summary.zero_size_count, "0");
+    }
+
+    #[test]
+    fn category_issue_cursor_terminates_at_filtered_count() {
+        let (_dir, service, _) = fixture();
+        {
+            let db = service.db.lock().unwrap();
+            for category in ["permissionDenied", "skippedLink", "skippedLink"] {
+                db.execute("INSERT INTO issues(scan_id,category,path_display,message) VALUES('scan',?1,'path','message')",[category]).unwrap();
+            }
+            db.execute("UPDATE scans SET issues=3 WHERE id='scan'", []).unwrap();
+        }
+        let page = service.issues("scan", Some("permissionDenied"), None, 1).unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert!(page.next_cursor.is_none());
+        let missing = service.issues("scan", Some("vanished"), None, 1).unwrap();
+        assert!(missing.rows.is_empty());
+        assert!(missing.next_cursor.is_none());
+    }
+
+    #[test]
+    fn retention_protects_displayed_and_reviewed_scans() {
+        let (_dir, service, _) = fixture();
+        {
+            let db = service.db.lock().unwrap();
+            for index in 0..12 {
+                db.execute("INSERT INTO scans(id,generation_id,root_display,root_native,status,revision,started_at,last_accessed) VALUES(?1,'generation','root',X'','completed',1,?2,?2)",params![format!("old-{index}"),now_ms()-100+index]).unwrap();
+            }
+        }
+        service.pin(Some("old-0".into())).unwrap();
+        assert!(service.get(Some("old-0")).unwrap().is_some());
+        let count: i64 = service
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM scans", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 8);
+    }
+
+    #[test]
+    fn aggregate_partial_children_without_claiming_empty_complete_directory() {
+        let (_dir, service, _) = fixture();
+        {
+            let db = service.db.lock().unwrap();
+            db.execute("UPDATE nodes SET state='scanning' WHERE id=2", []).unwrap();
+            db.execute("INSERT INTO pending_directories VALUES('scan',2,X'',1)", []).unwrap();
+        }
+        service.aggregate_ancestors("scan", 2).unwrap();
+        let root = service.node("scan", "generation", "1").unwrap();
+        assert_eq!(root.logical_size, "31375");
+        assert_eq!(root.status, "scanning");
+        service.db.lock().unwrap().execute("DELETE FROM pending_directories", []).unwrap();
+        service.aggregate_ancestors("scan", 2).unwrap();
+        assert_eq!(service.node("scan", "generation", "1").unwrap().status, "complete");
+    }
+
+    #[test]
+    fn overlapping_writes_invalidate_scan_and_old_cursors() {
+        let (_dir, service, snapshot) = fixture();
+        let query = QueryRequest {
+            scan_id: "scan".into(),
+            generation_id: "generation".into(),
+            directory_id: "2".into(),
+            ..Default::default()
+        };
+        let first = service.query(query.clone()).unwrap();
+        service.mark_writes_stale(&[PathBuf::from(snapshot.root).join("nested")]);
+        assert!(service.get(Some("scan")).unwrap().unwrap().stale);
+        let error = service.query(QueryRequest { cursor: first.next_cursor, ..query }).unwrap_err();
+        assert_eq!(error.code, "staleCursor");
+    }
+
+    #[test]
+    fn action_rejects_replaced_identity_and_root() {
+        let (dir, service, _) = fixture();
+        let path = dir.path().join("root").join("target.txt");
+        fs::write(&path, b"original").unwrap();
+        let original = fingerprint(&path, &fs::symlink_metadata(&path).unwrap());
+        service.db.lock().unwrap().execute("INSERT INTO nodes(scan_id,parent_id,name_display,path_display,path_native,path_key,depth,kind,fingerprint) VALUES('scan',1,'target.txt',?1,?2,'/999/',1,'file',?3)",params![display(&path),path_bytes(&path),original]).unwrap();
+        let node = service.db.lock().unwrap().last_insert_rowid().to_string();
+        fs::rename(&path, path.with_extension("old")).unwrap();
+        fs::write(&path, b"replaced").unwrap();
+        let request = PrepareActionRequest {
+            scan_id: "scan".into(),
+            generation_id: "generation".into(),
+            node_id: node,
+            action: "rename".into(),
+            new_name: Some("renamed.txt".into()),
+        };
+        let error = service.prepare_action(request).unwrap_err();
+        assert_eq!(error.code, if cfg!(windows) { "staleTarget" } else { "unsupported" });
+        let error = service
+            .prepare_action(PrepareActionRequest {
+                scan_id: "scan".into(),
+                generation_id: "generation".into(),
+                node_id: "1".into(),
+                action: "rename".into(),
+                new_name: Some("renamed".into()),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "unsupported");
+        assert_eq!(fs::read(&path).unwrap(), b"replaced");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identity_bound_rename_preserves_collision_and_supports_case_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let collision = dir.path().join("collision.txt");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&collision, b"collision").unwrap();
+        let expected = fingerprint(&source, &fs::symlink_metadata(&source).unwrap());
+        let result = safe_rename(dir.path(), &source, &collision, &expected);
+        assert!(
+            result.is_err(),
+            "unexpected rename success: source={:?}, destination={:?}",
+            fs::read(&source),
+            fs::read(&collision)
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert_eq!(fs::read(&collision).unwrap(), b"collision");
+        let renamed = dir.path().join("SOURCE.txt");
+        safe_rename(dir.path(), &source, &renamed, &expected).unwrap();
+        assert_eq!(fs::read(&renamed).unwrap(), b"source");
+    }
+
+    #[test]
+    fn invalid_names_are_not_silently_normalized() {
+        for name in ["trailing ", " leading", "nul\0suffix", "dot.", "bad/name"] {
+            assert!(validate_name(name).is_err(), "{name:?}");
+        }
+        #[cfg(windows)]
+        for name in ["file:stream", "CON.txt", "bad?name"] {
+            assert!(validate_name(name).is_err());
+        }
+    }
+
+    fn staged_fixture(service: &SnifferService, old: &ScanSnapshot) -> ScanSnapshot {
+        let mut snapshot = old.clone();
+        snapshot.id = "replacement".into();
+        snapshot.generation_id = "replacement-generation".into();
+        snapshot.root = display(&PathBuf::from(&old.root).join("nested"));
+        snapshot.root_node_id = Some("300".into());
+        snapshot.status = ScanStatus::Scanning;
+        snapshot.logical_bytes = "500".into();
+        snapshot.files_visited = "1".into();
+        snapshot.folders_visited = "0".into();
+        {
+            let db = service.db.lock().unwrap();
+            db.execute("INSERT INTO nodes(id,scan_id,parent_id,name_display,path_display,path_native,path_key,depth,kind,size,files) VALUES(299,'scan',1,'sibling','sibling',X'','/299/',1,'file',10,1)",[]).unwrap();
+            db.execute("UPDATE nodes SET size=size+10,files=files+1 WHERE id=1", []).unwrap();
+            db.execute("INSERT INTO scans(id,generation_id,root_display,root_native,root_node_id,status,revision,started_at,last_accessed) VALUES('replacement','replacement-generation',?1,?2,300,'scanning',7,?3,?3)",params![snapshot.root,path_bytes(Path::new(&snapshot.root)),now_ms()]).unwrap();
+            db.execute("INSERT INTO nodes(id,scan_id,parent_id,name_display,path_display,path_native,path_key,depth,kind,size,files) VALUES(300,'replacement',NULL,'nested',?1,?2,'/',0,'directory',500,1)",params![snapshot.root,path_bytes(Path::new(&snapshot.root))]).unwrap();
+            db.execute("INSERT INTO nodes(id,scan_id,parent_id,name_display,path_display,path_native,path_key,depth,kind,size,files) VALUES(301,'replacement',300,'new.txt','new.txt',X'','/301/',1,'file',500,1)",[]).unwrap();
+        }
+        service.jobs.lock().unwrap().insert(
+            snapshot.id.clone(),
+            JobControl {
+                snapshot: snapshot.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                last_emitted: Instant::now(),
+                refresh: Some(("scan".into(), 2)),
+            },
+        );
+        snapshot
+    }
+
+    #[test]
+    fn subtree_refresh_preserves_siblings_and_publishes_ancestor_totals() {
+        let (_dir, service, old) = fixture();
+        let staged = staged_fixture(&service, &old);
+        {
+            let db = service.db.lock().unwrap();
+            db.execute("INSERT INTO issues(scan_id,node_id,category,path_display,message) VALUES('scan',299,'old','sibling','old issue')", []).unwrap();
+            db.execute("INSERT INTO issues(scan_id,node_id,category,path_display,message) VALUES('replacement',301,'new','new.txt','new issue')", []).unwrap();
+        }
+        service.update_job_quiet("scan", |snapshot| snapshot.issue_count = "1".into());
+        service.update_job_quiet("replacement", |snapshot| snapshot.issue_count = "10005".into());
+        service.publish_refresh(&staged.id, &AtomicBool::new(false)).unwrap();
+        let published = service.get(Some(&staged.id)).unwrap().unwrap();
+        assert_eq!(published.root, old.root);
+        assert_eq!(published.logical_bytes, "510");
+        assert_eq!(published.issue_count, "10006");
+        assert_eq!(published.refreshed_directory_id.as_deref(), Some("300"));
+        let page = service
+            .query(QueryRequest {
+                scan_id: published.id.clone(),
+                generation_id: published.generation_id.clone(),
+                directory_id: published.root_node_id.clone().unwrap(),
+                scope: "subtreeFiles".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.matched_bytes, "510");
+        assert_eq!(service.node("scan", "generation", "1").unwrap().logical_size, "31385");
+    }
+
+    #[test]
+    fn cancelled_refresh_does_not_publish_replacement() {
+        let (_dir, service, old) = fixture();
+        let staged = staged_fixture(&service, &old);
+        let error = service.publish_refresh(&staged.id, &AtomicBool::new(true)).unwrap_err();
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(service.get(Some(&staged.id)).unwrap().unwrap().root, staged.root);
+        assert_eq!(service.node("scan", "generation", "1").unwrap().logical_size, "31385");
+        assert_eq!(service.node(&staged.id, &staged.generation_id, "300").unwrap().parent_id, None);
+    }
+
+    #[test]
+    fn cancelled_batch_rolls_back_rows_and_counters() {
+        let (dir, service, snapshot) = fixture();
+        let path = dir.path().join("root/new.txt");
+        fs::write(&path, b"new").unwrap();
+        let mut batch = vec![Ok(path.clone())];
+        let error = service
+            .publish_batch(
+                "scan",
+                1,
+                1,
+                path.parent().unwrap(),
+                &mut batch,
+                &AtomicBool::new(true),
+                &|_| {},
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(
+            service.get(Some("scan")).unwrap().unwrap().files_visited,
+            snapshot.files_visited
+        );
+        let count: i64 = service
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM nodes WHERE path_display=?1", [display(&path)], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(service.db.lock().unwrap().is_autocommit());
+    }
+
+    #[test]
+    fn wide_traversal_commits_exact_bounded_results_without_rescanning() {
+        let (dir, service, _) = fixture();
+        let root = dir.path().join("root");
+        for index in 0..1100 {
+            fs::write(root.join(format!("wide-{index}.txt")), b"abc").unwrap();
+        }
+        fs::create_dir(root.join("empty")).unwrap();
+        service.db.lock().unwrap().execute("DELETE FROM nodes", []).unwrap();
+        service.update_job_quiet("scan", |snapshot| {
+            snapshot.status = ScanStatus::Scanning;
+            snapshot.root_node_id = None;
+            snapshot.files_visited = "0".into();
+            snapshot.folders_visited = "0".into();
+            snapshot.logical_bytes = "0".into();
+        });
+        let updates = Mutex::new(Vec::new());
+        service
+            .traverse("scan", &root, &AtomicBool::new(false), &|snapshot| {
+                updates.lock().unwrap().push(snapshot.clone())
+            })
+            .unwrap();
+        service.finish("scan", ScanStatus::Completed, None, &|snapshot| {
+            updates.lock().unwrap().push(snapshot.clone())
+        });
+        let completed = service.get(Some("scan")).unwrap().unwrap();
+        assert_eq!(completed.files_visited, "1100");
+        assert_eq!(completed.folders_visited, "1");
+        assert_eq!(completed.logical_bytes, "3300");
+        let root_id = completed.root_node_id.unwrap();
+        let summary = service.summary("scan", "generation", &root_id, None).unwrap();
+        assert_eq!(summary.logical_bytes, "3300");
+        assert_eq!(summary.directory.status, "complete");
+        assert_eq!(summary.tiles.len(), 41);
+        assert_eq!(summary.zero_size_count, "1");
+        let query = QueryRequest {
+            scan_id: "scan".into(),
+            generation_id: "generation".into(),
+            directory_id: root_id,
+            scope: "subtreeFiles".into(),
+            ..Default::default()
+        };
+        let first = service.query(query.clone()).unwrap();
+        let second = service.query(QueryRequest { cursor: first.next_cursor, ..query }).unwrap();
+        assert_eq!(first.rows.len(), 100);
+        assert_eq!(second.rows.len(), 100);
+        assert!(!second
+            .rows
+            .iter()
+            .any(|row| first.rows.iter().any(|previous| previous.node_id == row.node_id)));
+        assert!(updates.lock().unwrap().windows(2).all(|pair| pair[0].revision < pair[1].revision));
     }
 }

@@ -142,6 +142,7 @@ pub fn run() {
             commands::schedule::set_schedule,
             commands::sniffer::start_sniffer_scan,
             commands::sniffer::get_sniffer_scan,
+            commands::sniffer::pin_sniffer_scan,
             commands::sniffer::cancel_sniffer_scan,
             commands::sniffer::query_sniffer_entries,
             commands::sniffer::get_sniffer_summary,

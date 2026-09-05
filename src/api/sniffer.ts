@@ -13,6 +13,8 @@ export const startSnifferScan = (root: string) =>
   invoke<SnifferScan>("start_sniffer_scan", { root });
 export const getSnifferScan = (scanId?: string) =>
   invoke<SnifferScan | null>("get_sniffer_scan", { scanId });
+export const pinSnifferScan = (scanId: string | null) =>
+  invoke<void>("pin_sniffer_scan", { scanId });
 export const cancelSnifferScan = (scanId: string) =>
   invoke<SnifferScan>("cancel_sniffer_scan", { scanId });
 export const querySnifferEntries = (request: SnifferQuery) =>
@@ -21,11 +23,13 @@ export const getSnifferSummary = (
   scanId: string,
   generationId: string,
   directoryId: string,
+  request?: SnifferQuery,
 ) =>
   invoke<SnifferSummary>("get_sniffer_summary", {
     scanId,
     generationId,
     directoryId,
+    request,
   });
 export const getSnifferNode = (
   scanId: string,
@@ -55,10 +59,12 @@ export const prepareSnifferAction = (request: {
   newName?: string;
 }) => invoke<SnifferActionReview>("prepare_sniffer_action", { request });
 export const executeSnifferAction = (token: string) =>
-  invoke<{ action: string; path: string; newPath: string | null }>(
-    "execute_sniffer_action",
-    { token },
-  );
+  invoke<{
+    action: string;
+    path: string;
+    newPath: string | null;
+    warning: string | null;
+  }>("execute_sniffer_action", { token });
 export const showSnifferItemProperties = (scanId: string, nodeId: string) =>
   invoke<void>("show_sniffer_item_properties", { scanId, nodeId });
 export const querySnifferIssues = (

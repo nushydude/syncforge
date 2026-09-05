@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FolderSnifferView } from "../components/sniffer/FolderSnifferView";
 import { querySnifferEntries, startSnifferScan } from "../api/sniffer";
 
@@ -41,6 +41,7 @@ vi.mock("../api/pairs", () => ({
 }));
 vi.mock("../api/sniffer", () => ({
   getSnifferScan: vi.fn().mockResolvedValue(null),
+  pinSnifferScan: vi.fn().mockResolvedValue(undefined),
   startSnifferScan: vi.fn(),
   cancelSnifferScan: vi.fn(),
   querySnifferEntries: vi.fn(),
@@ -71,6 +72,8 @@ vi.mock("../api/sniffer", () => ({
   prepareSnifferAction: vi.fn(),
   executeSnifferAction: vi.fn(),
   showSnifferItemProperties: vi.fn(),
+  getSnifferNode: vi.fn(),
+  querySnifferIssues: vi.fn(),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => undefined),
@@ -81,6 +84,10 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 }));
 
 describe("FolderSnifferView", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("queries bounded indexed pages and labels incomplete zero-size results", async () => {
     vi.mocked(startSnifferScan).mockResolvedValue(scan);
     vi.mocked(querySnifferEntries).mockResolvedValue({
@@ -107,5 +114,49 @@ describe("FolderSnifferView", () => {
         expect.objectContaining({ cursor: "next-page", limit: 100 }),
       ),
     );
+  });
+
+  it("commits navigation only after a cursor-free directory query succeeds", async () => {
+    const folder = {
+      ...rows[0],
+      nodeId: "folder-1",
+      name: "Nested",
+      fullPath: "C:/files/Nested",
+      relativePath: "Nested",
+      kind: "directory" as const,
+    };
+    vi.mocked(startSnifferScan).mockResolvedValue(scan);
+    vi.mocked(querySnifferEntries).mockResolvedValue({
+      rows: [folder, ...rows.slice(1)],
+      nextCursor: "next-page",
+      matchCount: "250",
+      matchedBytes: "0",
+      directoryBytes: "0",
+      revision: 3,
+      coverageComplete: true,
+      stale: false,
+    });
+
+    render(<FolderSnifferView />);
+    fireEvent.click(screen.getByRole("button", { name: "Choose a folder" }));
+    await screen.findByText("Nested");
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await waitFor(() =>
+      expect(querySnifferEntries).toHaveBeenCalledWith(
+        expect.objectContaining({ cursor: "next-page" }),
+      ),
+    );
+
+    fireEvent.doubleClick(screen.getByText("Nested"));
+    await waitFor(() =>
+      expect(querySnifferEntries).toHaveBeenCalledWith(
+        expect.objectContaining({
+          directoryId: "folder-1",
+          cursor: undefined,
+        }),
+      ),
+    );
+    expect(screen.getByRole("button", { name: "Nested" })).toBeInTheDocument();
+    expect(screen.getByText("Page 1")).toBeInTheDocument();
   });
 });
