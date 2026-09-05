@@ -19,6 +19,7 @@ import {
 
 vi.mock("../api/pairs", () => ({
   listPairs: vi.fn(),
+  getLastSyncedAtByPair: vi.fn(),
   savePair: vi.fn(),
   deletePair: vi.fn(),
   setSchedule: vi.fn(),
@@ -55,8 +56,14 @@ describe("pairsStore", () => {
 
   it("loads pairs from the backend", async () => {
     vi.mocked(pairsApi.listPairs).mockResolvedValue([samplePair]);
+    vi.mocked(pairsApi.getLastSyncedAtByPair).mockResolvedValue({
+      "pair-1": 1_700_000_000_000,
+    });
     await loadPairs();
     expect(getPairsState().pairs).toEqual([samplePair]);
+    expect(getPairsState().lastSyncedAtByPair).toEqual({
+      "pair-1": 1_700_000_000_000,
+    });
     expect(getPairsState().loading).toBe(false);
   });
 

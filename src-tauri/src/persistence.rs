@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -325,6 +326,18 @@ impl Database {
             )
         })
         .collect()
+    }
+
+    pub fn last_synced_at_by_pair(&self) -> Result<HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pair_id, MAX(finished_at)
+             FROM runs
+             WHERE status = 'completed' AND finished_at IS NOT NULL
+             GROUP BY pair_id",
+        )?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        rows.collect::<std::result::Result<HashMap<_, _>, rusqlite::Error>>().map_err(Into::into)
     }
 
     #[allow(dead_code)]
@@ -838,6 +851,9 @@ impl DatabaseManager {
 
     pub fn list_pairs(&self) -> Result<Vec<FolderPair>> {
         self.read(Database::list_pairs)
+    }
+    pub fn last_synced_at_by_pair(&self) -> Result<HashMap<String, i64>> {
+        self.read(Database::last_synced_at_by_pair)
     }
     pub fn save_pair(&self, pair: &FolderPair) -> Result<FolderPair> {
         self.write(|db| db.save_pair(pair))
@@ -1691,5 +1707,49 @@ mod tests {
             db.get_duplicate_scan("scan-1").expect("load interrupted scan").expect("scan");
         assert_eq!(interrupted.status, DuplicateScanStatus::Interrupted);
         assert!(interrupted.error.unwrap_or_default().contains("interrupted"));
+    }
+
+    #[test]
+    fn last_synced_at_by_pair_uses_latest_completed_run() {
+        let (_dir, db) = temp_db();
+        let pair = FolderPair {
+            id: new_pair_id(),
+            name: "History lookup".into(),
+            left_path: "/a".into(),
+            right_path: "/b".into(),
+            mode: SyncMode::Synchronize,
+            filters: Filters::default(),
+            conflict_policy: ConflictPolicy::NewerWins,
+            enabled: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        db.save_pair(&pair).expect("save pair");
+
+        for (run_id, finished_at, status) in [
+            ("completed-old", Some(20), RunStatus::Completed),
+            ("completed-new", Some(40), RunStatus::Completed),
+            ("failed-newer", Some(60), RunStatus::Failed),
+            ("cancelled-newer", Some(80), RunStatus::Cancelled),
+        ] {
+            db.save_run(&RunReport {
+                run_id: run_id.into(),
+                pair_id: pair.id.clone(),
+                started_at: finished_at.unwrap_or(0) - 1,
+                finished_at,
+                status,
+                files_copied: 0,
+                files_deleted: 0,
+                bytes_transferred: 0,
+                errors: vec![],
+            })
+            .expect("save run");
+        }
+
+        let last_synced = db.last_synced_at_by_pair().expect("last synced lookup");
+        assert_eq!(last_synced.get(&pair.id), Some(&40));
     }
 }

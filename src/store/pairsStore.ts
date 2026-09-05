@@ -33,6 +33,8 @@ export interface PairPreviewState {
 
 export interface PairsStoreState {
   pairs: FolderPair[];
+  /** Most recent completed sync timestamp per pair, loaded from history. */
+  lastSyncedAtByPair: Record<string, number>;
   selectedId: string | null;
   editing: FolderPair | null;
   editorOpen: boolean;
@@ -86,6 +88,7 @@ function emptyPair(): FolderPair {
 function emptyState(): PairsStoreState {
   return {
     pairs: [],
+    lastSyncedAtByPair: {},
     selectedId: null,
     editing: null,
     editorOpen: false,
@@ -243,10 +246,19 @@ export async function loadPairs(): Promise<void> {
   state = { ...state, loading: true, error: null };
   emit();
   try {
-    const pairs = await pairsApi.listPairs();
+    const [pairsResult, lastSyncedResult] = await Promise.allSettled([
+      pairsApi.listPairs(),
+      pairsApi.getLastSyncedAtByPair(),
+    ]);
+    if (pairsResult.status === "rejected") {
+      throw pairsResult.reason;
+    }
+    const pairs = pairsResult.value;
     state = {
       ...state,
       pairs,
+      lastSyncedAtByPair:
+        lastSyncedResult.status === "fulfilled" ? lastSyncedResult.value : {},
       loading: false,
       selectedId:
         state.selectedId && pairs.some((p) => p.id === state.selectedId)
@@ -260,6 +272,20 @@ export async function loadPairs(): Promise<void> {
       error: e instanceof Error ? e.message : String(e),
     };
   }
+  emit();
+}
+
+export function setLastSyncedAt(pairId: string, timestamp: number): void {
+  if (state.lastSyncedAtByPair[pairId] === timestamp) {
+    return;
+  }
+  state = {
+    ...state,
+    lastSyncedAtByPair: {
+      ...state.lastSyncedAtByPair,
+      [pairId]: timestamp,
+    },
+  };
   emit();
 }
 

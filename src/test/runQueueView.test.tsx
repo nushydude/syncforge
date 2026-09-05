@@ -13,6 +13,7 @@ import type { FolderPair } from "../types";
 
 vi.mock("../api/pairs", () => ({
   listPairs: vi.fn(),
+  getLastSyncedAtByPair: vi.fn().mockResolvedValue({}),
   savePair: vi.fn(),
   deletePair: vi.fn(),
   setSchedule: vi.fn(),

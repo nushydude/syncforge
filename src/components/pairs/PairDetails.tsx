@@ -20,6 +20,7 @@ import {
 } from "../../store/runStore";
 import type { RunStoreState } from "../../store/runStore";
 import type { ConflictPolicy, FolderPair, SyncMode } from "../../types";
+import { LastSyncedText } from "./LastSyncedText";
 
 interface PairDetailsProps {
   pair: FolderPair;
@@ -86,6 +87,12 @@ export function PairDetails({ pair }: PairDetailsProps) {
         [pair.id],
       ),
     );
+  const lastSyncedAt = usePairsStore(
+    useCallback(
+      (s: PairsStoreState) => s.lastSyncedAtByPair[pair.id],
+      [pair.id],
+    ),
+  );
   const hasPendingConflicts = pendingConflicts?.pair.id === pair.id;
   const scanBusy = previewLoading || previewQueued;
   // Warnings still deserve a look, so only a warning-free empty plan is "clean".
@@ -227,6 +234,12 @@ export function PairDetails({ pair }: PairDetailsProps) {
             <div>
               <dt>Status</dt>
               <dd>{pair.enabled ? "Enabled" : "Disabled"}</dd>
+            </div>
+            <div>
+              <dt>Last synced</dt>
+              <dd>
+                <LastSyncedText timestamp={lastSyncedAt} />
+              </dd>
             </div>
             <div>
               <dt>Watch for changes</dt>

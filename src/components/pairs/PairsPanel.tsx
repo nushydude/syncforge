@@ -7,6 +7,7 @@ import type { PairsStoreState } from "../../store/pairsStore";
 import {
   dismissWatchSkipped,
   ensureWatchSkippedListener,
+  ensureProgressListener,
 } from "../../store/runStore";
 import type { RunStoreState } from "../../store/runStore";
 import { RunQueuePanel } from "../run/RunQueuePanel";
@@ -34,6 +35,7 @@ export function PairsPanel() {
   useEffect(() => {
     void loadPairs();
     void ensureWatchSkippedListener();
+    void ensureProgressListener();
   }, []);
 
   const showEmpty = !loading && pairs.length === 0 && editing === null;

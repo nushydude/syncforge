@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tauri::{AppHandle, State};
@@ -29,6 +30,13 @@ fn validate_pair_paths(left: &str, right: &str) -> Result<(), String> {
 #[tauri::command]
 pub fn list_pairs(state: State<'_, Arc<AppState>>) -> Result<Vec<FolderPair>, String> {
     state.db.list_pairs().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_last_synced_at_by_pair(
+    state: State<'_, Arc<AppState>>,
+) -> Result<HashMap<String, i64>, String> {
+    state.db.last_synced_at_by_pair().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
