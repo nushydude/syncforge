@@ -208,13 +208,19 @@ function patchRun(pairId: string, patch: Partial<PairRunState>): void {
   };
 }
 
-async function ensureProgressListener(): Promise<void> {
+export async function ensureProgressListener(): Promise<void> {
   if (unlistenProgress) {
     return;
   }
   unlistenProgress = await listen<SyncProgress>("sync://progress", (event) => {
     const progress = event.payload;
     const pairId = progress.pairId;
+    if (
+      progress.report?.status === "completed" &&
+      progress.report.finishedAt != null
+    ) {
+      setLastSyncedAt(pairId, progress.report.finishedAt);
+    }
     // Only UI-owned runs drive the queue view; watch/schedule runs are ignored.
     if (state.activePairId !== pairId || !activeRunIds.has(pairId)) {
       return;
@@ -349,9 +355,6 @@ async function executeRun(
       report,
       progress: progress ? { ...progress, report, phase: report.status } : null,
     });
-    if (report.status === "completed" && report.finishedAt != null) {
-      setLastSyncedAt(pair.id, report.finishedAt);
-    }
     // The backend consumes a reused plan, so the cached preview is now stale.
     clearPairPreview(pair.id);
     emit();

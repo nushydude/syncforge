@@ -276,6 +276,9 @@ export async function loadPairs(): Promise<void> {
 }
 
 export function setLastSyncedAt(pairId: string, timestamp: number): void {
+  if (state.lastSyncedAtByPair[pairId] === timestamp) {
+    return;
+  }
   state = {
     ...state,
     lastSyncedAtByPair: {
