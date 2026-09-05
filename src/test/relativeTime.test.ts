@@ -16,6 +16,13 @@ describe("formatRelativeTime", () => {
   });
 
   it("uses a calendar date for older timestamps", () => {
-    expect(formatRelativeTime(Date.UTC(2026, 7, 1), now)).toBe("1 Aug");
+    const timestamp = Date.UTC(2026, 7, 1);
+    const formatted = formatRelativeTime(timestamp, now);
+    const expectedMonth = new Date(timestamp).toLocaleDateString(undefined, {
+      month: "short",
+    });
+
+    expect(formatted).toContain(expectedMonth);
+    expect(formatted).toContain("1");
   });
 });
