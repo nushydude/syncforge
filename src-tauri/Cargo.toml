@@ -1,6 +1,6 @@
 [package]
 name = "syncforge"
-version = "0.7.1"
+version = "0.8.0"
 description = "SyncForge — modern desktop folder sync"
 authors = ["SyncForge"]
 edition = "2021"
