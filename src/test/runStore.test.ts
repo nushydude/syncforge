@@ -62,6 +62,7 @@ const samplePair: FolderPair = {
   filters: { include: [], exclude: [] },
   conflictPolicy: "newerWins",
   enabled: true,
+  continueOnError: true,
   watchEnabled: false,
   scheduleEnabled: false,
   scheduleCron: null,

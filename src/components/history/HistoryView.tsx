@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from "react";
 import { useHistoryStore } from "../../hooks/useHistoryStore";
 import { selectPairsList, usePairsStore } from "../../hooks/usePairsStore";
+import { runStatusLabel } from "../../lib/syncStats";
 import {
   clearRunSelection,
   loadHistory,
@@ -12,23 +13,6 @@ import { RunDetail } from "./RunDetail";
 
 function formatTimestamp(ms: number): string {
   return new Date(ms).toLocaleString();
-}
-
-function statusLabel(status: string): string {
-  switch (status) {
-    case "completed":
-      return "Completed";
-    case "failed":
-      return "Failed";
-    case "cancelled":
-      return "Cancelled";
-    case "interrupted":
-      return "Interrupted";
-    case "running":
-      return "Running";
-    default:
-      return status;
-  }
 }
 
 const selectHistoryList = (s: HistoryStoreState) => ({
@@ -116,7 +100,7 @@ export function HistoryView({ active = true }: HistoryViewProps) {
               >
                 <span className="history-run-pair">{pairName(run.pairId)}</span>
                 <span className={`history-run-status status-${run.status}`}>
-                  {statusLabel(run.status)}
+                  {runStatusLabel(run.status)}
                 </span>
                 <span className="history-run-time">
                   {formatTimestamp(run.startedAt)}

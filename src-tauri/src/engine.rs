@@ -57,8 +57,8 @@ pub struct RunOptions {
     pub verify_hashes: bool,
     pub use_recycle_bin: bool,
     pub conflict_resolutions: HashMap<String, ConflictResolution>,
-    /// When true, the first non-conflict action failure ends the apply loop (manual default).
-    pub stop_on_error: bool,
+    /// Overrides the folder pair's error handling for this run.
+    pub stop_on_error: Option<bool>,
     /// Hash file contents when metadata matches to catch same-second edits.
     pub content_hash_compare: bool,
     /// Maximum file size (bytes) eligible for content hashing during planning.
@@ -74,7 +74,7 @@ impl Default for RunOptions {
             verify_hashes: false,
             use_recycle_bin: true,
             conflict_resolutions: HashMap::new(),
-            stop_on_error: true,
+            stop_on_error: None,
             content_hash_compare: false,
             content_hash_max_bytes: 50 * 1024 * 1024,
             plan: None,
@@ -194,27 +194,34 @@ pub fn safe_copy_file(src: &Path, dest: &Path, verify: bool) -> io::Result<u64> 
     if temp.exists() {
         fs::remove_file(&temp)?;
     }
-    let bytes = fs::copy(src, &temp)?;
-    if verify {
-        let src_hash = hashing::hash_file(src)?;
-        let dest_hash = hashing::hash_file(&temp)?;
-        if src_hash != dest_hash {
-            let _ = fs::remove_file(&temp);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("hash mismatch after copy: {src:?} -> {dest:?}"),
-            ));
+    let result = (|| {
+        let bytes = fs::copy(src, &temp)?;
+        if verify {
+            let src_hash = hashing::hash_file(src)?;
+            let dest_hash = hashing::hash_file(&temp)?;
+            if src_hash != dest_hash {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("hash mismatch after copy: {src:?} -> {dest:?}"),
+                ));
+            }
         }
+        commit_temp_file(&temp, dest)?;
+        Ok(bytes)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
     }
-    commit_temp_file(&temp, dest)?;
-    Ok(bytes)
+    result
 }
 
 pub fn delete_path(path: &Path, use_recycle_bin: bool) -> io::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    if path.is_dir() {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() {
         if use_recycle_bin {
             trash::delete(path).map_err(|e| io::Error::other(e.to_string()))?;
         } else {
@@ -372,6 +379,7 @@ where
         plan: provided_plan,
         plan_preconditions,
     } = options;
+    let stop_on_error = stop_on_error.unwrap_or(!pair.continue_on_error);
 
     let mut progress =
         |phase: &str, current: u32, total: u32, path: Option<&str>, message: Option<&str>| {
@@ -442,13 +450,21 @@ where
     let mut initial_validation_budget = ValidationBudget::default();
     if let Some(index) = precondition_index.as_ref() {
         for action in &plan.actions {
-            validate_action_precondition(
+            if preview_file_error(&plan, action).is_some() {
+                continue;
+            }
+            match validate_action_precondition(
                 action,
                 left_root,
                 right_root,
                 index,
                 &mut initial_validation_budget,
-            )?;
+            ) {
+                Ok(()) => {}
+                // Validate again before applying the action and record any remaining file error.
+                Err(PreconditionError::FileAccess(_)) if !stop_on_error => {}
+                Err(error) => return Err(error.to_string()),
+            }
         }
     }
 
@@ -493,24 +509,34 @@ where
         let current = index as u32 + 1;
         last_current = current;
         let path = action_path(action);
-        if let Some(index) = precondition_index.as_ref() {
-            if let Err(error) = validate_action_precondition(
-                action,
-                left_root,
-                right_root,
-                index,
-                &mut action_validation_budget,
-            ) {
-                let _ = flush_run_items(db, &mut run_items);
-                return Err(error);
-            }
-        }
         progress("running", current, total, Some(path), None);
 
         let item_id = Uuid::new_v4().to_string();
         let kind = action_kind(action);
         last_executed_path = Some(path);
-        let result = execute_action(action, left_root, right_root, verify_hashes, use_recycle_bin);
+        let result = if let Some(error) = preview_file_error(&plan, action) {
+            Err(error.to_owned())
+        } else {
+            let precondition = precondition_index.as_ref().map_or(Ok(()), |index| {
+                validate_action_precondition(
+                    action,
+                    left_root,
+                    right_root,
+                    index,
+                    &mut action_validation_budget,
+                )
+            });
+            match precondition {
+                Ok(()) => {
+                    execute_action(action, left_root, right_root, verify_hashes, use_recycle_bin)
+                }
+                Err(PreconditionError::FileAccess(message)) if !stop_on_error => Err(message),
+                Err(error) => {
+                    flush_run_items(db, &mut run_items)?;
+                    return Err(error.to_string());
+                }
+            }
+        };
 
         match result {
             Ok(stats) => {
@@ -578,17 +604,18 @@ where
     flush_run_items(db, &mut run_items)?;
 
     let can_advance_snapshot = report.errors.is_empty()
-        && !stopped_on_error
         && !plan.actions.iter().any(|action| matches!(action, SyncAction::Skip { .. }));
     if can_advance_snapshot {
         progress("scanning", total, total, None, Some("Capturing snapshot"));
         save_post_run_snapshot(db, pair, left_root, right_root)?;
     }
 
-    report.status = if report.errors.is_empty() && !stopped_on_error {
+    report.status = if stopped_on_error {
+        RunStatus::Failed
+    } else if report.errors.is_empty() {
         RunStatus::Completed
     } else {
-        RunStatus::Failed
+        RunStatus::CompletedWithErrors
     };
     report.finished_at = Some(now_millis());
     with_db(db, |db| db.save_run(report).map_err(|e| e.to_string()))?;
@@ -597,11 +624,12 @@ where
     emit(ProgressEvent::Owned(SyncProgress {
         run_id: run_id.to_string(),
         pair_id: pair.id.clone(),
-        phase: if report.status == RunStatus::Completed {
-            "completed".into()
-        } else {
-            "failed".into()
-        },
+        phase: match report.status {
+            RunStatus::Completed => "completed",
+            RunStatus::CompletedWithErrors => "completedWithErrors",
+            _ => "failed",
+        }
+        .into(),
         current: last_current,
         total,
         path: final_path,
@@ -610,6 +638,25 @@ where
     }));
 
     Ok(report.clone())
+}
+
+fn preview_file_error<'a>(plan: &'a SyncPlan, action: &SyncAction) -> Option<&'a str> {
+    let errors = &plan.preview_file_errors;
+    if errors.is_empty() {
+        return None;
+    }
+    let path = action_path(action);
+    if let Some(error) = errors.get(path) {
+        return Some(error);
+    }
+    if matches!(action, SyncAction::DeleteLeft { .. } | SyncAction::DeleteRight { .. }) {
+        let prefix = format!("{path}/");
+        return errors
+            .range(prefix.clone()..)
+            .next()
+            .and_then(|(path, error)| path.starts_with(&prefix).then_some(error.as_str()));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -622,7 +669,8 @@ fn validate_plan_preconditions(
     let index = PreconditionIndex::new(preconditions);
     let mut budget = ValidationBudget::default();
     for action in &plan.actions {
-        validate_action_precondition(action, left_root, right_root, &index, &mut budget)?;
+        validate_action_precondition(action, left_root, right_root, &index, &mut budget)
+            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -663,13 +711,21 @@ impl<'a> PreconditionIndex<'a> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum PreconditionError {
+    #[error("{0}")]
+    FileAccess(String),
+    #[error("{0}")]
+    UnsafePlan(String),
+}
+
 fn validate_action_precondition(
     action: &SyncAction,
     left_root: &Path,
     right_root: &Path,
     index: &PreconditionIndex<'_>,
     budget: &mut ValidationBudget,
-) -> Result<(), String> {
+) -> Result<(), PreconditionError> {
     let path = action_path(action);
     match action {
         SyncAction::CopyLeftToRight { .. } => {
@@ -751,7 +807,7 @@ fn validate_subtree(
     directory: &str,
     label: &str,
     budget: &mut ValidationBudget,
-) -> Result<(), String> {
+) -> Result<(), PreconditionError> {
     let prefix = format!("{directory}/");
     let expected_paths: std::collections::HashSet<&str> = entries
         .iter()
@@ -762,7 +818,9 @@ fn validate_subtree(
     let subtree_root = join_relative(root, directory);
     for entry_result in WalkDir::new(&subtree_root).follow_links(false).into_iter() {
         let entry = entry_result.map_err(|error| {
-            format!("Preview validation failed while scanning {directory}: {error}")
+            PreconditionError::FileAccess(format!(
+                "Preview validation failed while scanning {directory}: {error}"
+            ))
         })?;
         let entry_path = entry.path();
         let Ok(relative) = entry_path.strip_prefix(root) else {
@@ -770,7 +828,9 @@ fn validate_subtree(
         };
         let relative_path = relative.to_string_lossy().replace('\\', "/");
         if relative_path != directory && !expected_paths.contains(relative_path.as_str()) {
-            return Err(format!("Preview is stale: {label} changed at {relative_path}"));
+            return Err(PreconditionError::UnsafePlan(format!(
+                "Preview is stale: {label} changed at {relative_path}"
+            )));
         }
     }
     let start = entries.partition_point(|entry| entry.relative_path.as_str() < prefix.as_str());
@@ -789,16 +849,28 @@ fn validate_precondition(
     relative_path: &str,
     label: &str,
     budget: &mut ValidationBudget,
-) -> Result<(), String> {
+) -> Result<(), PreconditionError> {
     const PRECONDITION_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
     const PRECONDITION_HASH_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
     const PRECONDITION_HASH_BUDGET_FILES: usize = 10_000;
     let path = join_relative(root, relative_path);
-    let actual = fs::metadata(&path).ok();
+    let actual = match fs::metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(PreconditionError::FileAccess(format!(
+                "Preview validation failed at {relative_path}: {error}"
+            )));
+        }
+    };
     match (expected, actual) {
         (None, None) => Ok(()),
-        (None, Some(_)) => Err(format!("Preview is stale: {label} changed at {relative_path}")),
-        (Some(_), None) => Err(format!("Preview is stale: {label} disappeared at {relative_path}")),
+        (None, Some(_)) => Err(PreconditionError::UnsafePlan(format!(
+            "Preview is stale: {label} changed at {relative_path}"
+        ))),
+        (Some(_), None) => Err(PreconditionError::UnsafePlan(format!(
+            "Preview is stale: {label} disappeared at {relative_path}"
+        ))),
         (Some(expected), Some(actual)) => {
             let (modified_secs, modified_nanos) = crate::scanner::metadata_modified(&actual);
             if expected.is_dir != actual.is_dir()
@@ -806,12 +878,14 @@ fn validate_precondition(
                 || expected.modified_secs != modified_secs
                 || expected.modified_nanos != modified_nanos
             {
-                return Err(format!("Preview is stale: {label} changed at {relative_path}"));
+                return Err(PreconditionError::UnsafePlan(format!(
+                    "Preview is stale: {label} changed at {relative_path}"
+                )));
             }
             if !expected.is_dir && expected.size > PRECONDITION_HASH_MAX_BYTES {
-                return Err(format!(
+                return Err(PreconditionError::UnsafePlan(format!(
                     "Preview cannot safely validate large file at {relative_path}; preview again"
-                ));
+                )));
             }
             if !expected.is_dir && expected.size > 0 && expected.size <= PRECONDITION_HASH_MAX_BYTES
             {
@@ -820,7 +894,9 @@ fn validate_precondition(
                 if budget.hashed_bytes > PRECONDITION_HASH_BUDGET_BYTES
                     || budget.hashed_files > PRECONDITION_HASH_BUDGET_FILES
                 {
-                    return Err("Preview validation exceeds the bounded content budget".into());
+                    return Err(PreconditionError::UnsafePlan(
+                        "Preview validation exceeds the bounded content budget".into(),
+                    ));
                 }
             }
             // Scans intentionally avoid storing hashes for every entry. Rehash
@@ -828,16 +904,24 @@ fn validate_precondition(
             // reusable preview's stale-plan guard.
             if expected.size > 0 && expected.size <= PRECONDITION_HASH_MAX_BYTES {
                 let actual_hash = crate::hashing::hash_file(&path).map_err(|error| {
-                    format!("Preview validation failed at {relative_path}: {error}")
+                    if error.kind() == io::ErrorKind::NotFound {
+                        PreconditionError::UnsafePlan(format!(
+                            "Preview is stale: {label} disappeared at {relative_path}"
+                        ))
+                    } else {
+                        PreconditionError::FileAccess(format!(
+                            "Preview validation failed at {relative_path}: {error}"
+                        ))
+                    }
                 })?;
                 if expected
                     .hash
                     .as_deref()
                     .is_some_and(|expected_hash| actual_hash != expected_hash)
                 {
-                    return Err(format!(
+                    return Err(PreconditionError::UnsafePlan(format!(
                         "Preview is stale: {label} content changed at {relative_path}"
-                    ));
+                    )));
                 }
             }
             Ok(())
@@ -1029,6 +1113,7 @@ mod tests {
             scan_skipped_right: 0,
             scan_warnings: vec![],
             requires_attention: false,
+            preview_file_errors: Default::default(),
         };
         let expected = FileEntry {
             relative_path: "file.txt".into(),
@@ -1144,6 +1229,7 @@ mod tests {
             filters: crate::models::Filters::default(),
             conflict_policy: crate::models::ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1209,6 +1295,7 @@ mod tests {
             filters: crate::models::Filters::default(),
             conflict_policy: crate::models::ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1257,6 +1344,7 @@ mod tests {
             filters: crate::models::Filters::default(),
             conflict_policy: crate::models::ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1309,6 +1397,7 @@ mod tests {
             filters: crate::models::Filters::default(),
             conflict_policy: crate::models::ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1354,6 +1443,7 @@ mod tests {
             filters: crate::models::Filters::default(),
             conflict_policy: crate::models::ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1381,6 +1471,15 @@ mod tests {
 
     #[test]
     fn stop_on_error_does_not_apply_remaining_actions() {
+        run_after_file_error(false, RunStatus::Failed);
+    }
+
+    #[test]
+    fn continue_on_error_applies_remaining_actions() {
+        run_after_file_error(true, RunStatus::CompletedWithErrors);
+    }
+
+    fn run_after_file_error(continue_on_error: bool, expected_status: RunStatus) {
         let data_dir = TempDir::new().expect("tempdir");
         let db = Mutex::new(
             crate::persistence::Database::open(&data_dir.path().join("test.db")).expect("db"),
@@ -1396,13 +1495,14 @@ mod tests {
 
         let pair = crate::models::FolderPair {
             id: crate::persistence::new_pair_id(),
-            name: "StopOnError".into(),
+            name: "File error handling".into(),
             left_path: left_dir.to_string_lossy().into_owned(),
             right_path: right_dir.to_string_lossy().into_owned(),
             mode: crate::models::SyncMode::Echo,
             filters: crate::models::Filters::default(),
             conflict_policy: crate::models::ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1412,24 +1512,24 @@ mod tests {
         db.lock().expect("lock").save_pair(&pair).expect("save pair");
 
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
-        let report = run_pair_impl(
-            &db,
-            &pair,
-            RunOptions { stop_on_error: true, ..Default::default() },
-            &cancel,
-            |_| {},
-        )
-        .expect("run returns report");
+        let report = run_pair_impl(&db, &pair, RunOptions::default(), &cancel, |_| {})
+            .expect("run returns report");
 
-        assert_eq!(report.status, RunStatus::Failed);
-        assert!(!report.errors.is_empty());
-        assert!(
-            !right_dir.join("ok.txt").exists(),
-            "second copy must not run after first non-conflict failure"
-        );
+        assert_eq!(report.status, expected_status);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].starts_with("blocked.txt:"));
+        assert_eq!(right_dir.join("ok.txt").exists(), continue_on_error);
+        assert!(right_dir.join("blocked.txt").is_dir());
+        assert!(!temp_copy_path(&right_dir.join("blocked.txt")).exists());
 
-        let items = db.lock().expect("lock").list_run_items(&report.run_id).expect("items");
-        assert_eq!(items.len(), 1, "only the failing action should be recorded");
+        let db = db.lock().expect("lock");
+        let items = db.list_run_items(&report.run_id).expect("items");
+        assert_eq!(items.len(), 1 + usize::from(continue_on_error));
+        assert_eq!(items[0].path, "blocked.txt");
+        assert_eq!(items[0].status, "failed");
+        assert_eq!(db.get_run(&report.run_id).expect("history"), Some(report));
+        assert!(db.latest_snapshot(&pair.id).expect("snapshot").is_none());
+        assert!(db.last_synced_at_by_pair().expect("last synced").is_empty());
     }
 
     #[test]
@@ -1451,6 +1551,7 @@ mod tests {
             filters: crate::models::Filters::default(),
             conflict_policy: crate::models::ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1470,6 +1571,7 @@ mod tests {
             scan_skipped_right: 0,
             scan_warnings: vec![],
             requires_attention: false,
+            preview_file_errors: Default::default(),
         };
         crate::persistence::reset_run_item_batch_counter();
         reset_progress_emit_counter();
@@ -1495,6 +1597,7 @@ mod tests {
             scan_skipped_right: 0,
             scan_warnings: vec![],
             requires_attention: false,
+            preview_file_errors: Default::default(),
         };
         crate::persistence::fail_next_run_item_batch();
         let error = run_pair_impl(
@@ -1536,6 +1639,7 @@ mod tests {
             filters: crate::models::Filters::default(),
             conflict_policy: crate::models::ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,

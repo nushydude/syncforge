@@ -214,7 +214,6 @@ pub(crate) fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: Stri
                 verify_hashes: false,
                 use_recycle_bin: true,
                 conflict_resolutions: Default::default(),
-                stop_on_error: true,
                 plan: Some(plan),
                 ..Default::default()
             };
@@ -321,7 +320,6 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
                 verify_hashes: false,
                 use_recycle_bin: true,
                 conflict_resolutions: Default::default(),
-                stop_on_error: true,
                 plan: Some(plan),
                 ..Default::default()
             };
@@ -335,7 +333,10 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
             progress_sink.flush();
             let report = result?;
 
-            if report.status == RunStatus::Completed || report.status == RunStatus::Failed {
+            if matches!(
+                report.status,
+                RunStatus::Completed | RunStatus::CompletedWithErrors | RunStatus::Failed
+            ) {
                 notify_sync_report(&app_emit, &pair_name, &report);
             }
             Ok(())

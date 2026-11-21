@@ -47,6 +47,7 @@ const basePair: FolderPair = {
   filters: { include: [], exclude: [] },
   conflictPolicy: "newerWins",
   enabled: true,
+  continueOnError: true,
   watchEnabled: false,
   scheduleEnabled: false,
   scheduleCron: null,
@@ -65,6 +66,29 @@ describe("sync queue view", () => {
     updateAppSettings({ confirmBeforeRun: false });
     vi.mocked(pairsApi.listPairs).mockResolvedValue([basePair, photosPair]);
     vi.mocked(runApi.runPair).mockImplementation(() => new Promise(() => {}));
+  });
+
+  it("shows a run that continues past a file error as completed with errors", async () => {
+    vi.mocked(runApi.runPair).mockResolvedValue({
+      runId: "run-with-errors",
+      pairId: basePair.id,
+      startedAt: 1,
+      finishedAt: 2,
+      status: "completedWithErrors",
+      filesCopied: 3,
+      filesDeleted: 0,
+      bytesTransferred: 2048,
+      errors: ["locked.txt: Access is denied."],
+    });
+
+    render(<PairsPanel />);
+    fireEvent.click(await screen.findByRole("button", { name: /^Docs/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Run sync" }));
+    expect(
+      await screen.findByRole("heading", { name: "Completed with errors" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Done with errors")).toBeInTheDocument();
+    expect(screen.getByText(/Copied 3 .* 1 error/)).toBeInTheDocument();
   });
 
   it("queues a second pair while the first one runs", async () => {

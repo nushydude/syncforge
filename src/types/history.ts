@@ -1,6 +1,7 @@
 export type RunStatus =
   | "running"
   | "completed"
+  | "completedWithErrors"
   | "failed"
   | "cancelled"
   | "interrupted";

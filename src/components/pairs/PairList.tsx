@@ -28,6 +28,8 @@ function statusBadge(run: PairRunState | undefined): string | null {
       return "Needs input";
     case "completed":
       return "Done";
+    case "completedWithErrors":
+      return "Done with errors";
     case "failed":
       return "Failed";
     case "cancelled":

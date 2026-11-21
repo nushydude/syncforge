@@ -15,6 +15,7 @@ const pair: FolderPair = {
   filters: { include: [], exclude: [] },
   conflictPolicy: "ask",
   enabled: true,
+  continueOnError: true,
   watchEnabled: false,
   scheduleEnabled: false,
   createdAt: 0,

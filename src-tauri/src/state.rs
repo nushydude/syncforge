@@ -56,7 +56,12 @@ impl PreviewPlanStore {
         let id = uuid::Uuid::new_v4().to_string();
         let estimated_bytes = serde_json::to_vec(&plan).map(|bytes| bytes.len()).unwrap_or(0)
             + serde_json::to_vec(&left_preconditions).map(|bytes| bytes.len()).unwrap_or(0)
-            + serde_json::to_vec(&right_preconditions).map(|bytes| bytes.len()).unwrap_or(0);
+            + serde_json::to_vec(&right_preconditions).map(|bytes| bytes.len()).unwrap_or(0)
+            + plan
+                .preview_file_errors
+                .iter()
+                .map(|(path, error)| path.len() + error.len())
+                .sum::<usize>();
         if estimated_bytes > PREVIEW_PLAN_MAX_BYTES {
             return Err("preview plan exceeds the bounded storage limit".into());
         }
@@ -700,6 +705,7 @@ mod tests {
             scan_skipped_right: 0,
             scan_warnings: vec![],
             requires_attention: false,
+            preview_file_errors: Default::default(),
         };
         let id = store
             .insert("pair-a".into(), "fingerprint-a".into(), plan, vec![], vec![], 100)

@@ -5,6 +5,7 @@ export type SyncProgressPhase =
   | "scanning"
   | "running"
   | "completed"
+  | "completedWithErrors"
   | "failed"
   | "cancelled";
 
@@ -23,7 +24,7 @@ export interface RunPairOptions {
   verifyHashes?: boolean;
   useRecycleBin?: boolean;
   conflictResolutions?: Record<string, ConflictChoice>;
-  /** When true (default), the first non-conflict action failure stops the run. */
+  /** Overrides the folder pair's error handling for this run. */
   stopOnError?: boolean;
   planId?: string;
 }

@@ -42,6 +42,7 @@ export type PairRunStatus =
   | "running"
   | "awaitingInput"
   | "completed"
+  | "completedWithErrors"
   | "failed"
   | "cancelled";
 
@@ -264,7 +265,7 @@ export function dismissWatchSkipped(): void {
 
 function finishRun(
   pairId: string,
-  status: Extract<PairRunStatus, "completed" | "failed" | "cancelled">,
+  status: SettledRunStatus,
   patch: Partial<PairRunState> = {},
 ): void {
   activeRunIds.delete(pairId);
@@ -275,14 +276,17 @@ function finishRun(
   clearActiveJob(pairId);
 }
 
-function statusFromReport(
-  report: RunReport,
-): Extract<PairRunStatus, "completed" | "failed" | "cancelled"> {
+type SettledRunStatus = Extract<
+  PairRunStatus,
+  "completed" | "completedWithErrors" | "failed" | "cancelled"
+>;
+
+function statusFromReport(report: RunReport): SettledRunStatus {
   switch (report.status) {
+    case "completedWithErrors":
     case "failed":
-      return "failed";
     case "cancelled":
-      return "cancelled";
+      return report.status;
     default:
       return "completed";
   }

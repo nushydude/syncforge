@@ -41,6 +41,7 @@ const samplePair: FolderPair = {
   filters: { include: ["*.txt"], exclude: [] },
   conflictPolicy: "newerWins",
   enabled: true,
+  continueOnError: true,
   watchEnabled: false,
   scheduleEnabled: false,
   scheduleCron: null,
@@ -79,6 +80,7 @@ describe("pairsStore", () => {
     expect(editing).not.toBeNull();
     expect(editing?.id).toBe("");
     expect(editing?.name).toBe("");
+    expect(editing?.continueOnError).toBe(true);
     expect(getPairsState().editorOpen).toBe(true);
   });
 

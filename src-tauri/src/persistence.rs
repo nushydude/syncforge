@@ -118,6 +118,7 @@ impl Database {
                     filters_json TEXT NOT NULL,
                     conflict_policy TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    continue_on_error INTEGER NOT NULL DEFAULT 1,
                     watch_enabled INTEGER NOT NULL DEFAULT 0,
                     schedule_enabled INTEGER NOT NULL DEFAULT 0,
                     schedule_cron TEXT,
@@ -180,6 +181,7 @@ impl Database {
 
         self.migrate_watch_enabled()?;
         self.migrate_schedule_fields()?;
+        self.migrate_continue_on_error()?;
         self.migrate_duplicate_scans()?;
 
         Ok(())
@@ -241,6 +243,26 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_continue_on_error(&self) -> Result<()> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let has_column: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pairs') WHERE name = 'continue_on_error')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_column {
+            transaction.execute(
+                "ALTER TABLE pairs ADD COLUMN continue_on_error INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn migrate_duplicate_scans(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS duplicate_scans (
@@ -271,7 +293,8 @@ impl Database {
     pub fn list_pairs(&self) -> Result<Vec<FolderPair>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, left_path, right_path, mode, filters_json, conflict_policy,
-                    enabled, watch_enabled, schedule_enabled, schedule_cron, created_at, updated_at
+                    enabled, watch_enabled, schedule_enabled, schedule_cron, created_at, updated_at,
+                    continue_on_error
              FROM pairs
              ORDER BY name COLLATE NOCASE",
         )?;
@@ -290,6 +313,7 @@ impl Database {
                 row.get::<_, Option<String>>(10)?,
                 row.get::<_, i64>(11)?,
                 row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
             ))
         })?;
 
@@ -308,6 +332,7 @@ impl Database {
                 schedule_cron,
                 created_at,
                 updated_at,
+                continue_on_error,
             ) = row?;
             row_to_pair(
                 id,
@@ -323,6 +348,7 @@ impl Database {
                 schedule_cron,
                 created_at,
                 updated_at,
+                continue_on_error,
             )
         })
         .collect()
@@ -472,8 +498,9 @@ impl Database {
         self.conn.execute(
             "INSERT INTO pairs (
                 id, name, left_path, right_path, mode, filters_json, conflict_policy,
-                enabled, watch_enabled, schedule_enabled, schedule_cron, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                enabled, watch_enabled, schedule_enabled, schedule_cron, created_at, updated_at,
+                continue_on_error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 left_path = excluded.left_path,
@@ -482,6 +509,7 @@ impl Database {
                 filters_json = excluded.filters_json,
                 conflict_policy = excluded.conflict_policy,
                 enabled = excluded.enabled,
+                continue_on_error = excluded.continue_on_error,
                 watch_enabled = excluded.watch_enabled,
                 schedule_enabled = excluded.schedule_enabled,
                 schedule_cron = excluded.schedule_cron,
@@ -500,6 +528,7 @@ impl Database {
                 pair.schedule_cron,
                 pair.created_at,
                 pair.updated_at,
+                pair.continue_on_error as i64,
             ],
         )?;
 
@@ -517,7 +546,8 @@ impl Database {
     pub fn get_pair(&self, id: &str) -> Result<Option<FolderPair>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, left_path, right_path, mode, filters_json, conflict_policy,
-                    enabled, watch_enabled, schedule_enabled, schedule_cron, created_at, updated_at
+                    enabled, watch_enabled, schedule_enabled, schedule_cron, created_at, updated_at,
+                    continue_on_error
              FROM pairs WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id])?;
@@ -536,6 +566,7 @@ impl Database {
                 row.get(10)?,
                 row.get(11)?,
                 row.get(12)?,
+                row.get(13)?,
             )?;
             return Ok(Some(pair));
         }
@@ -973,6 +1004,7 @@ fn row_to_pair(
     schedule_cron: Option<String>,
     created_at: i64,
     updated_at: i64,
+    continue_on_error: i64,
 ) -> Result<FolderPair> {
     Ok(FolderPair {
         id,
@@ -983,6 +1015,7 @@ fn row_to_pair(
         filters: serde_json::from_str(&filters_json)?,
         conflict_policy: str_to_conflict_policy(&conflict_policy)?,
         enabled: enabled != 0,
+        continue_on_error: continue_on_error != 0,
         watch_enabled: watch_enabled != 0,
         schedule_enabled: schedule_enabled != 0,
         schedule_cron,
@@ -1069,6 +1102,7 @@ fn run_status_to_str(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Running => "running",
         RunStatus::Completed => "completed",
+        RunStatus::CompletedWithErrors => "completedWithErrors",
         RunStatus::Failed => "failed",
         RunStatus::Cancelled => "cancelled",
         RunStatus::Interrupted => "interrupted",
@@ -1091,6 +1125,33 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = Database::open(&path).expect("open db");
         (dir, db)
+    }
+
+    #[test]
+    fn existing_pairs_continue_on_error_by_default_and_can_opt_out() {
+        let (dir, db) = temp_db();
+        db.conn
+            .execute_batch(
+                "ALTER TABLE pairs DROP COLUMN continue_on_error;
+                 INSERT INTO pairs (id, name, left_path, right_path, mode, filters_json,
+                                    conflict_policy, created_at, updated_at)
+                 VALUES ('legacy', 'Existing pair', 'left', 'right', 'echo',
+                         '{\"include\":[],\"exclude\":[]}', 'left', 1, 2);",
+            )
+            .expect("legacy pairs table");
+        drop(db);
+
+        let path = dir.path().join("test.db");
+        let db = Database::open(&path).expect("migrate database");
+        let mut pair = db.list_pairs().expect("list migrated pairs").remove(0);
+        assert!(pair.continue_on_error);
+
+        pair.continue_on_error = false;
+        db.save_pair(&pair).expect("save opt-out");
+        drop(db);
+        let db = Database::open(&path).expect("reopen database");
+        assert!(!db.get_pair(&pair.id).expect("load opt-out").unwrap().continue_on_error);
+        assert!(!db.list_pairs().expect("list pairs")[0].continue_on_error);
     }
 
     fn snapshot_count_for_pair(db: &Database, pair_id: &str) -> i64 {
@@ -1128,6 +1189,7 @@ mod tests {
                 filters: Filters::default(),
                 conflict_policy: ConflictPolicy::NewerWins,
                 enabled: true,
+                continue_on_error: true,
                 watch_enabled: false,
                 schedule_enabled: false,
                 schedule_cron: None,
@@ -1165,6 +1227,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1207,6 +1270,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1242,6 +1306,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1283,6 +1348,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1335,6 +1401,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: true,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1363,6 +1430,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: true,
             schedule_cron: Some("0 9 * * *".into()),
@@ -1394,6 +1462,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::Ask,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1422,6 +1491,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1484,6 +1554,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1527,6 +1598,7 @@ mod tests {
                 filters: Filters::default(),
                 conflict_policy: ConflictPolicy::NewerWins,
                 enabled: true,
+                continue_on_error: true,
                 watch_enabled: false,
                 schedule_enabled: false,
                 schedule_cron: None,
@@ -1615,6 +1687,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::Ask,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -1721,6 +1794,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,

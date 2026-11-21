@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -12,6 +12,8 @@ pub struct FolderPair {
     pub filters: Filters,
     pub conflict_policy: ConflictPolicy,
     pub enabled: bool,
+    #[serde(default = "default_continue_on_error")]
+    pub continue_on_error: bool,
     #[serde(default)]
     pub watch_enabled: bool,
     #[serde(default)]
@@ -20,6 +22,10 @@ pub struct FolderPair {
     pub schedule_cron: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+fn default_continue_on_error() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +94,8 @@ pub struct SyncPlan {
     /// When true, destructive sync modes must not run until the user resolves scan issues.
     #[serde(default)]
     pub requires_attention: bool,
+    #[serde(skip)]
+    pub(crate) preview_file_errors: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +136,7 @@ pub struct PreviewActionPage {
 pub enum RunStatus {
     Running,
     Completed,
+    CompletedWithErrors,
     Failed,
     Cancelled,
     Interrupted,
@@ -206,6 +215,7 @@ mod tests {
             filters: Filters { include: vec!["*.txt".into()], exclude: vec!["*.tmp".into()] },
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -256,6 +266,7 @@ mod tests {
             scan_skipped_right: 0,
             scan_warnings: vec![],
             requires_attention: false,
+            preview_file_errors: Default::default(),
         };
         let json = serde_json::to_string(&plan).expect("serialize");
         let back: SyncPlan = serde_json::from_str(&json).expect("deserialize");

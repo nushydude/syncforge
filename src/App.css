@@ -1467,6 +1467,11 @@ button:disabled {
   background: #f0fdf4;
 }
 
+.run-progress-completedWithErrors {
+  border-color: #fde68a;
+  background: #fffbeb;
+}
+
 .run-queue {
   margin: 0 1.5rem 0.75rem;
   padding: 0.75rem 1rem;
@@ -1589,6 +1594,11 @@ button:disabled {
 .pair-item-badge.badge-failed {
   background: #fee2e2;
   color: #b91c1c;
+}
+
+.pair-item-badge.badge-completedWithErrors {
+  color: #92400e;
+  background: #fef3c7;
 }
 
 .sniffer-view {
@@ -2774,6 +2784,10 @@ html[data-theme="dark"] .dev-build-badge {
 
 .history-run-status.status-failed {
   color: #b91c1c;
+}
+
+.history-run-status.status-completedWithErrors {
+  color: #92400e;
 }
 
 .history-run-status.status-cancelled {
