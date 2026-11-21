@@ -142,6 +142,7 @@ pub fn build_sync_plan(
         scan_skipped_right: scan.skipped_right,
         scan_warnings: scan.warnings.into_iter().chain(hash_warnings.iter().cloned()).collect(),
         requires_attention: scan.requires_attention || !hash_warnings.is_empty(),
+        preview_file_errors: Default::default(),
     }
 }
 

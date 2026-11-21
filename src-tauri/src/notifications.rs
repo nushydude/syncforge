@@ -12,13 +12,18 @@ pub fn notify_sync_report(app: &AppHandle, pair_name: &str, report: &RunReport) 
                 report.files_copied, report.files_deleted
             ),
         ),
-        RunStatus::Failed => {
+        RunStatus::CompletedWithErrors | RunStatus::Failed => {
             let detail = report
                 .errors
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "See SyncForge for details.".into());
-            (format!("Sync failed: {pair_name}"), detail)
+            let outcome = if report.status == RunStatus::CompletedWithErrors {
+                "Sync completed with errors"
+            } else {
+                "Sync failed"
+            };
+            (format!("{outcome}: {pair_name}"), detail)
         }
         RunStatus::Cancelled => {
             (format!("Sync cancelled: {pair_name}"), "The sync run was cancelled.".into())

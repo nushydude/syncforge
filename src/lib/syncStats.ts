@@ -1,4 +1,21 @@
-import type { RunItem, RunReport } from "../types";
+import type { RunItem, RunReport, RunStatus } from "../types";
+
+export function runStatusLabel(status: RunStatus): string {
+  switch (status) {
+    case "completed":
+      return "Completed";
+    case "completedWithErrors":
+      return "Completed with errors";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Cancelled";
+    case "interrupted":
+      return "Interrupted";
+    case "running":
+      return "Running";
+  }
+}
 
 export interface SyncStats {
   filesCopied: number;

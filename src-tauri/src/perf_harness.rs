@@ -22,6 +22,7 @@ fn run_generated_fixture_and_write_counters() {
         filters: Filters::default(),
         conflict_policy: ConflictPolicy::NewerWins,
         enabled: true,
+        continue_on_error: true,
         watch_enabled: false,
         schedule_enabled: false,
         schedule_cron: None,

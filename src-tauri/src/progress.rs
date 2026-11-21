@@ -80,7 +80,10 @@ where
         let now = (self.clock)();
         let phase_changed = self.last_phase.as_deref() != Some(progress.phase.as_str());
         let terminal = progress.report.is_some()
-            || matches!(progress.phase.as_str(), "completed" | "failed" | "cancelled");
+            || matches!(
+                progress.phase.as_str(),
+                "completed" | "completedWithErrors" | "failed" | "cancelled"
+            );
         let due = self.last_emit.is_none_or(|last| now.duration_since(last) >= PROGRESS_INTERVAL);
         if phase_changed || terminal || due {
             if terminal {

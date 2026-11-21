@@ -78,6 +78,7 @@ function emptyPair(): FolderPair {
     conflictPolicy: settings.defaultConflictPolicy ?? defaultConflictPolicy,
     enabled: true,
     watchEnabled: false,
+    continueOnError: true,
     scheduleEnabled: false,
     scheduleCron: null,
     createdAt: 0,

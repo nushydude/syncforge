@@ -6,6 +6,7 @@ import { exportRunAsCsv, exportRunAsJson } from "../../lib/exportRun";
 import {
   formatBytes,
   formatDuration,
+  runStatusLabel,
   statsFromReport,
   statsFromItems,
 } from "../../lib/syncStats";
@@ -95,7 +96,7 @@ export function RunDetail() {
       <dl className="run-detail-stats">
         <div>
           <dt>Status</dt>
-          <dd>{report.status}</dd>
+          <dd>{runStatusLabel(report.status)}</dd>
         </div>
         <div>
           <dt>Duration</dt>

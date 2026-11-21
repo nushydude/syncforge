@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -132,7 +133,7 @@ pub(crate) fn build_preview_observed(
 
     let scan = ScanIntegrity::from_sides(&left_scan, &right_scan);
 
-    let plan = build_sync_plan(
+    let mut plan = build_sync_plan(
         &pair.id,
         pair.mode,
         pair.conflict_policy,
@@ -169,6 +170,7 @@ pub(crate) fn build_preview_observed(
         &mut preview_hash_bytes,
         &mut preview_hash_files,
         cancel,
+        pair.continue_on_error.then_some(&mut plan.preview_file_errors),
         &mut |files, path| on_scan("hashing left", files, path),
     )?;
 
@@ -179,8 +181,15 @@ pub(crate) fn build_preview_observed(
         &mut preview_hash_bytes,
         &mut preview_hash_files,
         cancel,
+        pair.continue_on_error.then_some(&mut plan.preview_file_errors),
         &mut |files, path| on_scan("hashing right", files, path),
     )?;
+    if let Some(first_error) = plan.preview_file_errors.values().next() {
+        plan.scan_warnings.push(format!(
+            "{} file(s) could not be verified. Affected actions will be skipped. {first_error}",
+            plan.preview_file_errors.len()
+        ));
+    }
     Ok((plan, left_scan.entries, right_scan.entries))
 }
 
@@ -192,6 +201,7 @@ fn populate_preview_hashes_for_actions(
     hashed_bytes: &mut u64,
     hashed_files: &mut usize,
     cancel: &Arc<AtomicBool>,
+    mut file_errors: Option<&mut BTreeMap<String, String>>,
     on_hash: &mut dyn FnMut(u64, &str),
 ) -> Result<(), String> {
     const PREVIEW_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -199,15 +209,15 @@ fn populate_preview_hashes_for_actions(
     const PREVIEW_SUBTREE_HASH_MAX_FILES: usize = 10_000;
     let paths: HashSet<&str> = actions
         .iter()
-        .map(|action| match action {
+        .filter_map(|action| match action {
             SyncAction::CopyLeftToRight { path }
             | SyncAction::CopyRightToLeft { path }
             | SyncAction::DeleteLeft { path }
             | SyncAction::DeleteRight { path }
             | SyncAction::CreateDirLeft { path }
             | SyncAction::CreateDirRight { path }
-            | SyncAction::Conflict { path, .. }
-            | SyncAction::Skip { path, .. } => path.as_str(),
+            | SyncAction::Conflict { path, .. } => Some(path.as_str()),
+            SyncAction::Skip { .. } => None,
         })
         .collect();
     let deleted_directories: HashSet<&str> = actions
@@ -255,10 +265,18 @@ fn populate_preview_hashes_for_actions(
         }
         on_hash(*hashed_files as u64, &entry.relative_path);
         let path = root.join(entry.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        entry.hash =
-            Some(crate::hashing::hash_file(&path).map_err(|error| {
-                format!("content hash failed at {}: {error}", entry.relative_path)
-            })?);
+        match crate::hashing::hash_file(&path) {
+            Ok(hash) => entry.hash = Some(hash),
+            Err(error) => {
+                let message = format!("content hash failed at {}: {error}", entry.relative_path);
+                match file_errors.as_deref_mut() {
+                    Some(file_errors) if error.kind() != ErrorKind::NotFound => {
+                        file_errors.insert(entry.relative_path.clone(), message);
+                    }
+                    _ => return Err(message),
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -448,6 +466,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::NewerWins,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -529,6 +548,75 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn continue_on_error_skips_files_locked_during_preview() {
+        run_preview_with_locked_file(true);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn continue_on_error_skips_files_locked_after_preview() {
+        run_preview_with_locked_file(false);
+    }
+
+    #[cfg(windows)]
+    fn run_preview_with_locked_file(lock_before_preview: bool) {
+        use crate::engine::{run_pair_impl, PlanPreconditions, RunOptions};
+        use crate::models::RunStatus;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::{atomic::AtomicBool, Arc};
+
+        let data_dir = TempDir::new().expect("tempdir");
+        let db = Database::open(&data_dir.path().join("test.db")).expect("db");
+        let left = data_dir.path().join("left");
+        let right = data_dir.path().join("right");
+        fs::create_dir_all(&left).expect("mkdir left");
+        fs::create_dir_all(&right).expect("mkdir right");
+        fs::write(left.join("locked.txt"), "locked").expect("write");
+        fs::write(left.join("ok.txt"), "ok").expect("write");
+        let lock_file = || {
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(left.join("locked.txt"))
+                .expect("hold exclusive file handle")
+        };
+        let lock = lock_before_preview.then(lock_file);
+        save_echo_pair(&db, "preview-lock", &left, &right);
+        let pair = db.get_pair("preview-lock").expect("load pair").expect("pair");
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let (plan, left_preconditions, right_preconditions) =
+            super::build_preview(&pair, None, &cancel).expect("preview with locked file");
+        assert_eq!(plan.preview_file_errors.contains_key("locked.txt"), lock_before_preview);
+        assert!(!plan.requires_attention);
+        drop(lock);
+        let lock = (!lock_before_preview).then(lock_file);
+
+        let options = RunOptions {
+            plan: Some(plan),
+            plan_preconditions: Some(PlanPreconditions {
+                left: left_preconditions,
+                right: right_preconditions,
+            }),
+            ..RunOptions::default()
+        };
+        let report = run_pair_impl(&db, &pair, options, &cancel, |_| {}).expect("run preview");
+        assert_eq!(report.status, RunStatus::CompletedWithErrors);
+        assert_eq!(report.files_copied, 1);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].starts_with("locked.txt:"));
+        assert!(!right.join("locked.txt").exists());
+        assert!(right.join("ok.txt").exists());
+        drop(lock);
+
+        let retry = run_pair_impl(&db, &pair, RunOptions::default(), &cancel, |_| {})
+            .expect("retry with fresh scan");
+        assert_eq!(retry.status, RunStatus::Completed);
+        assert!(right.join("locked.txt").exists());
+    }
+
+    #[test]
     fn preview_pair_command_delegates_to_impl() {
         let data_dir = TempDir::new().expect("tempdir");
         let db = Database::open(&data_dir.path().join("test.db")).expect("db");
@@ -575,6 +663,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::Ask,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,
@@ -612,6 +701,7 @@ mod tests {
             filters: Filters::default(),
             conflict_policy: ConflictPolicy::Ask,
             enabled: true,
+            continue_on_error: true,
             watch_enabled: false,
             schedule_enabled: false,
             schedule_cron: None,

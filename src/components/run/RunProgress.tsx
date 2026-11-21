@@ -1,5 +1,6 @@
 import { memo, useCallback } from "react";
 import { useRunStore } from "../../hooks/useRunStore";
+import { runStatusLabel } from "../../lib/syncStats";
 import {
   cancelPairRun,
   dismissPairRun,
@@ -16,11 +17,10 @@ function phaseLabel(run: PairRunState): string {
     case "awaitingInput":
       return "Waiting for conflict choices";
     case "completed":
-      return "Completed";
+    case "completedWithErrors":
     case "failed":
-      return "Failed";
     case "cancelled":
-      return "Cancelled";
+      return runStatusLabel(run.status);
     default:
       break;
   }

@@ -33,14 +33,9 @@ pub struct RunPairOptions {
     pub use_recycle_bin: bool,
     #[serde(default)]
     pub conflict_resolutions: HashMap<String, ConflictResolution>,
-    #[serde(default = "default_stop_on_error")]
-    pub stop_on_error: bool,
+    pub stop_on_error: Option<bool>,
     #[serde(default)]
     pub plan_id: Option<String>,
-}
-
-fn default_stop_on_error() -> bool {
-    true
 }
 
 fn default_recycle_bin() -> bool {
@@ -131,7 +126,10 @@ pub async fn run_pair(
     let result = task_result?;
 
     if let Ok(ref report) = result {
-        if report.status == RunStatus::Completed || report.status == RunStatus::Failed {
+        if matches!(
+            report.status,
+            RunStatus::Completed | RunStatus::CompletedWithErrors | RunStatus::Failed
+        ) {
             notify_sync_report(&app, &pair_name, report);
         }
     }

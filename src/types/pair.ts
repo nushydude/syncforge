@@ -23,6 +23,7 @@ export interface FolderPair {
   filters: Filters;
   conflictPolicy: ConflictPolicy;
   enabled: boolean;
+  continueOnError: boolean;
   watchEnabled: boolean;
   scheduleEnabled: boolean;
   scheduleCron?: string | null;

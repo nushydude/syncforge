@@ -232,6 +232,10 @@ export function PairDetails({ pair }: PairDetailsProps) {
               <dd>{conflictPolicyLabel(pair.conflictPolicy)}</dd>
             </div>
             <div>
+              <dt>On file errors</dt>
+              <dd>{pair.continueOnError ? "Continue syncing" : "Stop sync"}</dd>
+            </div>
+            <div>
               <dt>Status</dt>
               <dd>{pair.enabled ? "Enabled" : "Disabled"}</dd>
             </div>

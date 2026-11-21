@@ -224,6 +224,16 @@ export function PairEditor() {
       <label className="field checkbox-field">
         <input
           type="checkbox"
+          checked={editing.continueOnError}
+          onChange={(e) => updateEditing({ continueOnError: e.target.checked })}
+          disabled={saving}
+        />
+        Continue on file errors
+      </label>
+
+      <label className="field checkbox-field">
+        <input
+          type="checkbox"
           checked={editing.enabled}
           onChange={(e) => updateEditing({ enabled: e.target.checked })}
           disabled={saving}
