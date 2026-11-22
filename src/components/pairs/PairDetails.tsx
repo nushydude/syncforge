@@ -24,6 +24,7 @@ import { LastSyncedText } from "./LastSyncedText";
 
 interface PairDetailsProps {
   pair: FolderPair;
+  onViewReport?: (runId: string) => void;
 }
 
 function modeLabel(mode: SyncMode): string {
@@ -56,7 +57,7 @@ function listLabel(values: string[]): string {
   return values.length > 0 ? values.join(", ") : "None";
 }
 
-export function PairDetails({ pair }: PairDetailsProps) {
+export function PairDetails({ pair, onViewReport }: PairDetailsProps) {
   const [showResults, setShowResults] = useState(false);
   const resultsTitleRef = useRef<HTMLHeadingElement>(null);
   const resultsTriggerRef = useRef<HTMLButtonElement>(null);
@@ -157,7 +158,7 @@ export function PairDetails({ pair }: PairDetailsProps) {
         scanPath={scanPath}
         onCancel={() => void cancelPairPreview(pair.id)}
       />
-      <RunProgress pairId={pair.id} />
+      <RunProgress pairId={pair.id} onViewReport={onViewReport} />
 
       {showResults && previewPlan ? (
         <>

@@ -1451,6 +1451,18 @@ button:disabled {
   white-space: nowrap;
 }
 
+.run-progress-actions,
+.run-detail-items-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.run-detail-items-header {
+  justify-content: space-between;
+}
+
 .run-progress-summary {
   margin: 0.5rem 0 0;
   font-size: 0.875rem;

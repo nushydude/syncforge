@@ -32,6 +32,7 @@ pub async fn get_run_detail(
     run_id: String,
     cursor: Option<usize>,
     limit: Option<usize>,
+    action_filter: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<RunDetail>, String> {
     let db = std::sync::Arc::clone(&state.db);
@@ -44,8 +45,12 @@ pub async fn get_run_detail(
         let Some(report) = db.get_run(&run_id).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        let (items, has_more) =
-            db.list_run_items_page(&run_id, cursor, limit).map_err(|e| e.to_string())?;
+        let (items, has_more) = if action_filter.is_none() {
+            db.list_run_items_page(&run_id, cursor, limit)
+        } else {
+            db.list_run_items_page_filtered(&run_id, cursor, limit, action_filter.as_deref())
+        }
+        .map_err(|e| e.to_string())?;
         let next_cursor = has_more.then_some(
             cursor.checked_add(items.len()).ok_or_else(|| "history cursor overflow".to_string())?,
         );

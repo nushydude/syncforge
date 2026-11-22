@@ -1,10 +1,11 @@
 import * as historyApi from "../api/history";
-import type { RunDetail, RunReport } from "../types";
+import type { RunActionFilter, RunDetail, RunReport } from "../types";
 
 export interface HistoryStoreState {
   runs: RunReport[];
   pairFilter: string | null;
   selectedRunId: string | null;
+  actionFilter: RunActionFilter | null;
   detail: RunDetail | null;
   loading: boolean;
   detailLoading: boolean;
@@ -18,6 +19,7 @@ let state: HistoryStoreState = {
   runs: [],
   pairFilter: null,
   selectedRunId: null,
+  actionFilter: null,
   detail: null,
   loading: false,
   detailLoading: false,
@@ -54,6 +56,7 @@ export async function loadHistory(pairFilter?: string | null): Promise<void> {
     error: null,
     pairFilter: filter,
     selectedRunId: null,
+    actionFilter: null,
     detail: null,
     detailLoading: false,
     detailPageLoading: false,
@@ -73,7 +76,11 @@ export async function loadHistory(pairFilter?: string | null): Promise<void> {
     state = {
       ...state,
       loading: false,
-      error: e instanceof Error ? e.message : String(e),
+      error: state.selectedRunId
+        ? state.error
+        : e instanceof Error
+          ? e.message
+          : String(e),
     };
   }
   emit();
@@ -83,20 +90,27 @@ export function setPairFilter(pairId: string | null): void {
   void loadHistory(pairId);
 }
 
-export async function selectRun(runId: string): Promise<void> {
+export async function selectRun(
+  runId: string,
+  actionFilter: RunActionFilter | null = null,
+): Promise<void> {
   const requestId = ++historyDetailRequestId;
+  const previous = state.selectedRunId === runId ? state.detail : null;
   state = {
     ...state,
     selectedRunId: runId,
+    actionFilter,
     detailLoading: true,
     detailPageLoading: false,
-    detail: null,
+    detail: previous ? { report: previous.report, items: [] } : null,
     error: null,
   };
   emit();
 
   try {
-    const detail = await historyApi.getRunDetail(runId);
+    const detail = actionFilter
+      ? await historyApi.getRunDetail(runId, 0, undefined, actionFilter)
+      : await historyApi.getRunDetail(runId);
     if (requestId !== historyDetailRequestId) {
       return;
     }
@@ -128,7 +142,14 @@ export async function loadMoreRunItems(): Promise<void> {
   state = { ...state, detailPageLoading: true };
   emit();
   try {
-    const next = await historyApi.getRunDetail(runId, detail.nextCursor);
+    const next = state.actionFilter
+      ? await historyApi.getRunDetail(
+          runId,
+          detail.nextCursor,
+          undefined,
+          state.actionFilter,
+        )
+      : await historyApi.getRunDetail(runId, detail.nextCursor);
     if (requestId !== historyDetailRequestId || !next) {
       if (requestId === historyDetailRequestId) {
         state = { ...state, detailPageLoading: false };
@@ -164,6 +185,7 @@ export function clearRunSelection(): void {
   state = {
     ...state,
     selectedRunId: null,
+    actionFilter: null,
     detail: null,
     detailLoading: false,
     detailPageLoading: false,
@@ -179,6 +201,7 @@ export function resetHistoryStoreForTests(): void {
     runs: [],
     pairFilter: null,
     selectedRunId: null,
+    actionFilter: null,
     detail: null,
     loading: false,
     detailLoading: false,

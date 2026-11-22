@@ -34,6 +34,17 @@ export interface RunDetail {
   nextCursor?: number;
 }
 
+export type RunActionFilter =
+  | "deletions"
+  | "copyLeftToRight"
+  | "copyRightToLeft"
+  | "createDirLeft"
+  | "createDirRight"
+  | "deleteLeft"
+  | "deleteRight"
+  | "conflict"
+  | "skip";
+
 export interface Snapshot {
   id: string;
   pairId: string;
