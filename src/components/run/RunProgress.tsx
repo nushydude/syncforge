@@ -36,8 +36,10 @@ function phaseLabel(run: PairRunState): string {
 
 export const RunProgress = memo(function RunProgress({
   pairId,
+  onViewReport,
 }: {
   pairId: string;
+  onViewReport?: (runId: string) => void;
 }) {
   const selectRun = useCallback(
     (s: RunStoreState) => getPairRun(s, pairId),
@@ -81,9 +83,16 @@ export const RunProgress = memo(function RunProgress({
             Cancel
           </button>
         ) : (
-          <button type="button" onClick={() => dismissPairRun(pairId)}>
-            Dismiss
-          </button>
+          <div className="run-progress-actions">
+            {report && onViewReport && (
+              <button type="button" onClick={() => onViewReport(report.runId)}>
+                View run report
+              </button>
+            )}
+            <button type="button" onClick={() => dismissPairRun(pairId)}>
+              Dismiss
+            </button>
+          </div>
         )}
       </header>
 

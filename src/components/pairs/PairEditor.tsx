@@ -41,7 +41,9 @@ const selectPairEditor = (s: PairsStoreState) => ({
   scheduleDescription: s.scheduleDescription,
 });
 
-export function PairEditor() {
+export function PairEditor({
+  onViewReport,
+}: { onViewReport?: (runId: string) => void } = {}) {
   const {
     editing,
     saving,
@@ -136,7 +138,9 @@ export function PairEditor() {
           onCancel={() => void cancelPairPreview(editingId)}
         />
       )}
-      {!isNew && <RunProgress pairId={editing.id} />}
+      {!isNew && (
+        <RunProgress pairId={editing.id} onViewReport={onViewReport} />
+      )}
 
       {error && (
         <p className="form-error" role="alert">

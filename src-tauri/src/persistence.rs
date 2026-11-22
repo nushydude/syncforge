@@ -176,7 +176,9 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_runs_pair_started
                  ON runs(pair_id, started_at DESC);
              CREATE INDEX IF NOT EXISTS idx_run_items_run_path
-                 ON run_items(run_id, path COLLATE NOCASE, id);",
+                 ON run_items(run_id, path COLLATE NOCASE, id);
+             CREATE INDEX IF NOT EXISTS idx_run_items_run_action_path
+                 ON run_items(run_id, action, path COLLATE NOCASE, id);",
         )?;
 
         self.migrate_watch_enabled()?;
@@ -813,11 +815,12 @@ impl Database {
         Ok(items)
     }
 
-    pub fn list_run_items_page(
+    pub fn list_run_items_page_filtered(
         &self,
         run_id: &str,
         cursor: usize,
         limit: usize,
+        action_filter: Option<&str>,
     ) -> Result<(Vec<RunItem>, bool)> {
         let limit = limit.min(RUN_ITEMS_PAGE_MAX);
         if limit == 0 {
@@ -825,13 +828,32 @@ impl Database {
         }
         let cursor = i64::try_from(cursor).map_err(|_| rusqlite::Error::InvalidQuery)?;
         let query_limit = i64::try_from(limit + 1).map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, path, action, status, message, bytes
-             FROM run_items WHERE run_id = ?1
-             ORDER BY path COLLATE NOCASE, id LIMIT ?2 OFFSET ?3",
-        )?;
+        let query = match action_filter {
+            None => {
+                "SELECT id, run_id, path, action, status, message, bytes
+                     FROM run_items WHERE run_id = ?1
+                     ORDER BY path COLLATE NOCASE, id LIMIT ?2 OFFSET ?3"
+            }
+            Some("deletions") => {
+                // Search the two action ranges instead of walking every path in a large run.
+                "SELECT id, run_id, path, action, status, message, bytes
+                     FROM run_items INDEXED BY idx_run_items_run_action_path
+                     WHERE run_id = ?1 AND action IN ('deleteLeft', 'deleteRight')
+                     ORDER BY path COLLATE NOCASE, id LIMIT ?2 OFFSET ?3"
+            }
+            Some(_) => {
+                "SELECT id, run_id, path, action, status, message, bytes
+                     FROM run_items WHERE run_id = ?1 AND action = ?4
+                     ORDER BY path COLLATE NOCASE, id LIMIT ?2 OFFSET ?3"
+            }
+        };
+        let mut stmt = self.conn.prepare(query)?;
         let mut items = Vec::new();
-        let mut rows = stmt.query(params![run_id, query_limit, cursor])?;
+        let mut rows = if let Some(filter) = action_filter.filter(|filter| *filter != "deletions") {
+            stmt.query(params![run_id, query_limit, cursor, filter])?
+        } else {
+            stmt.query(params![run_id, query_limit, cursor])?
+        };
         while let Some(row) = rows.next()? {
             let bytes: Option<i64> = row.get(6)?;
             items.push(RunItem {
@@ -933,7 +955,16 @@ impl DatabaseManager {
         cursor: usize,
         limit: usize,
     ) -> Result<(Vec<RunItem>, bool)> {
-        self.read(|db| db.list_run_items_page(run_id, cursor, limit))
+        self.read(|db| db.list_run_items_page_filtered(run_id, cursor, limit, None))
+    }
+    pub fn list_run_items_page_filtered(
+        &self,
+        run_id: &str,
+        cursor: usize,
+        limit: usize,
+        action_filter: Option<&str>,
+    ) -> Result<(Vec<RunItem>, bool)> {
+        self.read(|db| db.list_run_items_page_filtered(run_id, cursor, limit, action_filter))
     }
 }
 
@@ -1125,6 +1156,49 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = Database::open(&path).expect("open db");
         (dir, db)
+    }
+
+    #[test]
+    fn action_filter_pages_sparse_matches_in_path_order() {
+        let (_dir, db) = temp_db();
+        db.conn.execute_batch("PRAGMA foreign_keys = OFF").expect("disable foreign keys");
+        for index in 0..450 {
+            let action = match index {
+                40 => "deleteRight",
+                240 => "deleteLeft",
+                440 => "deleteRight",
+                _ => "copyLeftToRight",
+            };
+            db.conn
+                .execute(
+                    "INSERT INTO run_items (id, run_id, path, action, status)
+                 VALUES (?1, 'run', ?2, ?3, 'completed')",
+                    params![format!("id-{index}"), format!("file-{index:03}"), action],
+                )
+                .expect("insert item");
+        }
+        let (first, has_more) =
+            db.list_run_items_page_filtered("run", 0, 2, Some("deletions")).expect("first page");
+        assert!(has_more);
+        assert_eq!(
+            first.iter().map(|item| item.path.as_str()).collect::<Vec<_>>(),
+            vec!["file-040", "file-240"]
+        );
+        let (second, has_more) =
+            db.list_run_items_page_filtered("run", 2, 2, Some("deletions")).expect("second page");
+        assert!(!has_more);
+        assert_eq!(second[0].path, "file-440");
+        let (right, _) =
+            db.list_run_items_page_filtered("run", 0, 10, Some("deleteRight")).expect("right");
+        assert_eq!(right.len(), 2);
+        let (all, has_more) = db.list_run_items_page_filtered("run", 0, 2, None).expect("all");
+        assert!(has_more);
+        assert_eq!(all[0].path, "file-000");
+        let query_plan: String = db.conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT id FROM run_items WHERE run_id = ?1 AND action = ?2 ORDER BY path COLLATE NOCASE, id LIMIT 200",
+            params!["run", "deleteRight"], |row| row.get(3),
+        ).expect("query plan");
+        assert!(query_plan.contains("idx_run_items_run_action_path"), "{query_plan}");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { HistoryView } from "../history/HistoryView";
 import { usePairsStore } from "../../hooks/usePairsStore";
 import { useRunStore } from "../../hooks/useRunStore";
@@ -28,6 +28,11 @@ const selectWatchSkipped = (s: RunStoreState) => s.watchSkipped;
 
 export function PairsPanel() {
   const [section, setSection] = useState<"pairs" | "history">("pairs");
+  const [reportRunId, setReportRunId] = useState<string>();
+  const openRunReport = useCallback((runId: string) => {
+    setReportRunId(runId);
+    setSection("history");
+  }, []);
   const { pairs, editing, editorOpen, selectedId, loading, error } =
     usePairsStore(selectPairsPanel);
   const watchSkipped = useRunStore(selectWatchSkipped);
@@ -65,7 +70,10 @@ export function PairsPanel() {
           role="tab"
           aria-selected={section === "history"}
           className={section === "history" ? "active" : ""}
-          onClick={() => setSection("history")}
+          onClick={() => {
+            setReportRunId(undefined);
+            setSection("history");
+          }}
         >
           Sync history
         </button>
@@ -73,7 +81,7 @@ export function PairsPanel() {
       {/* Visible on both tabs so a parked queue is never a mystery. */}
       <RunQueuePanel />
       {section === "history" ? (
-        <HistoryView active />
+        <HistoryView active initialRunId={reportRunId} />
       ) : (
         <>
           {watchSkipped && (
@@ -115,9 +123,9 @@ export function PairsPanel() {
                   </button>
                 </div>
               ) : editing && editorOpen ? (
-                <PairEditor />
+                <PairEditor onViewReport={openRunReport} />
               ) : selectedPair ? (
-                <PairDetails pair={selectedPair} />
+                <PairDetails pair={selectedPair} onViewReport={openRunReport} />
               ) : (
                 <div className="pairs-hint">
                   <p>Select a pair from the list or create a new one.</p>

@@ -26,9 +26,10 @@ const selectHistoryList = (s: HistoryStoreState) => ({
 interface HistoryViewProps {
   /** When false, history is not fetched (panel may stay mounted but hidden). */
   active?: boolean;
+  initialRunId?: string;
 }
 
-export function HistoryView({ active = true }: HistoryViewProps) {
+export function HistoryView({ active = true, initialRunId }: HistoryViewProps) {
   const pairs = usePairsStore(selectPairsList);
   const pairNames = useMemo(
     () => pairs.map((p) => ({ id: p.id, name: p.name })),
@@ -44,7 +45,8 @@ export function HistoryView({ active = true }: HistoryViewProps) {
     }
     historyLoadedRef.current = true;
     void loadHistory();
-  }, [active]);
+    if (initialRunId) void selectRun(initialRunId);
+  }, [active, initialRunId]);
 
   const pairNameById = useMemo(
     () => new Map(pairNames.map((p) => [p.id, p.name])),

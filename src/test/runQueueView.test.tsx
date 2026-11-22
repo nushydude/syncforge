@@ -2,6 +2,11 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as pairsApi from "../api/pairs";
 import * as runApi from "../api/run";
+import * as historyApi from "../api/history";
+import {
+  resetHistoryStoreForTests,
+  setPairFilter,
+} from "../store/historyStore";
 import { PairsPanel } from "../components/pairs/PairsPanel";
 import { resetPairsStoreForTests } from "../store/pairsStore";
 import { getRunState, resetRunStoreForTests } from "../store/runStore";
@@ -34,7 +39,7 @@ vi.mock("../api/run", () => ({
 }));
 
 vi.mock("../api/history", () => ({
-  listRuns: vi.fn().mockResolvedValue([]),
+  getHistory: vi.fn().mockResolvedValue([]),
   getRunDetail: vi.fn(),
 }));
 
@@ -62,6 +67,7 @@ describe("sync queue view", () => {
     vi.clearAllMocks();
     resetRunStoreForTests();
     resetPairsStoreForTests();
+    resetHistoryStoreForTests();
     resetSettingsForTests();
     updateAppSettings({ confirmBeforeRun: false });
     vi.mocked(pairsApi.listPairs).mockResolvedValue([basePair, photosPair]);
@@ -69,17 +75,40 @@ describe("sync queue view", () => {
   });
 
   it("shows a run that continues past a file error as completed with errors", async () => {
-    vi.mocked(runApi.runPair).mockResolvedValue({
+    const report = {
       runId: "run-with-errors",
       pairId: basePair.id,
       startedAt: 1,
       finishedAt: 2,
-      status: "completedWithErrors",
+      status: "completedWithErrors" as const,
       filesCopied: 3,
       filesDeleted: 0,
       bytesTransferred: 2048,
       errors: ["locked.txt: Access is denied."],
-    });
+    };
+    vi.mocked(runApi.runPair).mockResolvedValue(report);
+    vi.mocked(historyApi.getRunDetail)
+      .mockResolvedValueOnce({
+        report,
+        items: [
+          {
+            id: "folder",
+            runId: report.runId,
+            path: "folder",
+            action: "createDirRight",
+            status: "completed",
+          },
+          ...[1, 2, 3].map((n) => ({
+            id: `file-${n}`,
+            runId: report.runId,
+            path: `folder/file-${n}`,
+            action: "copyLeftToRight",
+            status: "completed",
+          })),
+        ],
+      })
+      .mockResolvedValueOnce({ report, items: [] });
+    setPairFilter(photosPair.id);
 
     render(<PairsPanel />);
     fireEvent.click(await screen.findByRole("button", { name: /^Docs/ }));
@@ -89,6 +118,30 @@ describe("sync queue view", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Done with errors")).toBeInTheDocument();
     expect(screen.getByText(/Copied 3 .* 1 error/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "View run report" }));
+    expect(screen.getByRole("tab", { name: "Sync history" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(await screen.findByText(report.errors[0])).toBeInTheDocument();
+    expect(screen.getByText(/Summary: 3 file change/)).toBeInTheDocument();
+    expect(historyApi.getRunDetail).toHaveBeenCalledWith(report.runId);
+    expect(screen.getByRole("combobox", { name: "Pair" })).toHaveValue(
+      photosPair.id,
+    );
+    fireEvent.change(screen.getByRole("combobox", { name: "Action" }), {
+      target: { value: "deletions" },
+    });
+    expect(
+      await screen.findByText("No items match this action."),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Summary: 3 file change/)).toBeInTheDocument();
+    expect(historyApi.getRunDetail).toHaveBeenLastCalledWith(
+      report.runId,
+      0,
+      undefined,
+      "deletions",
+    );
   });
 
   it("queues a second pair while the first one runs", async () => {

@@ -3,6 +3,7 @@ import * as historyApi from "../api/history";
 import type { RunDetail, RunReport } from "../types";
 import {
   getHistoryState,
+  loadMoreRunItems,
   loadHistory,
   resetHistoryStoreForTests,
   selectRun,
@@ -136,5 +137,35 @@ describe("historyStore", () => {
     await selectRun("run-a");
     expect(getHistoryState().detail).toEqual(detail);
     expect(getHistoryState().selectedRunId).toBe("run-a");
+  });
+
+  it("keeps the action filter on later pages and resets the cursor on change", async () => {
+    const deletion = { ...detail.items[0], action: "deleteRight" };
+    vi.mocked(historyApi.getRunDetail)
+      .mockResolvedValueOnce({ report: runA, items: [deletion], nextCursor: 1 })
+      .mockResolvedValueOnce({
+        report: runA,
+        items: [{ ...deletion, id: "item-2" }],
+      })
+      .mockResolvedValueOnce(detail);
+
+    await selectRun(runA.runId, "deletions");
+    await loadMoreRunItems();
+    expect(historyApi.getRunDetail).toHaveBeenNthCalledWith(
+      2,
+      runA.runId,
+      1,
+      undefined,
+      "deletions",
+    );
+    expect(getHistoryState().detail?.items).toHaveLength(2);
+    await selectRun(runA.runId, "copyLeftToRight");
+    expect(historyApi.getRunDetail).toHaveBeenLastCalledWith(
+      runA.runId,
+      0,
+      undefined,
+      "copyLeftToRight",
+    );
+    expect(getHistoryState().detail).toEqual(detail);
   });
 });
