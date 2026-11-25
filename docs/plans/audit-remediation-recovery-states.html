@@ -1,0 +1,162 @@
+<style>
+  #syncforge-recovery-states {
+    color-scheme: light dark;
+    --sync-panel: light-dark(#fff, #1e293b);
+    --sync-surface: light-dark(#f8fafc, #0f172a);
+    --sync-text: light-dark(#0f172a, #e2e8f0);
+    --sync-muted: light-dark(#475569, #cbd5e1);
+    --sync-border: light-dark(#cbd5e1, #475569);
+    --sync-alert: light-dark(#991b1b, #fecaca);
+    --sync-link: light-dark(#1d4ed8, #bfdbfe);
+    --sync-primary: light-dark(#1d4ed8, #93c5fd);
+    --sync-primary-text: light-dark(#fff, #0f172a);
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    font:
+      14px/1.45 Inter,
+      system-ui,
+      sans-serif;
+    color: var(--sync-text);
+  }
+  #syncforge-recovery-states * {
+    box-sizing: border-box;
+  }
+  #syncforge-recovery-states section {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 14px;
+    gap: 9px;
+    border: 1px solid var(--sync-border);
+    border-radius: 8px;
+    background: var(--sync-panel);
+  }
+  #syncforge-recovery-states h3 {
+    margin: 0;
+    font-size: 16px;
+  }
+  #syncforge-recovery-states p {
+    margin: 0;
+  }
+  #syncforge-recovery-states code {
+    overflow-wrap: anywhere;
+  }
+  #syncforge-recovery-states .context {
+    color: var(--sync-muted);
+    font-size: 12px;
+  }
+  #syncforge-recovery-states .problem {
+    color: var(--sync-alert);
+  }
+  #syncforge-recovery-states .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: auto;
+  }
+  #syncforge-recovery-states .action {
+    padding: 5px 9px;
+    border: 1px solid var(--sync-border);
+    border-radius: 5px;
+    background: var(--sync-surface);
+  }
+  #syncforge-recovery-states .primary {
+    background: var(--sync-primary);
+    border-color: var(--sync-primary);
+    color: var(--sync-primary-text);
+  }
+  #syncforge-recovery-states .row {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 4px 12px;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--sync-border);
+  }
+  #syncforge-recovery-states .focus {
+    outline: 2px solid var(--sync-link);
+    outline-offset: 2px;
+  }
+  @media (max-width: 590px) {
+    #syncforge-recovery-states {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>
+<div
+  id="syncforge-recovery-states"
+  aria-label="Proposed SyncForge recovery states"
+>
+  <section>
+    <p class="context">Pairs › Edit pair</p>
+    <h3>Choose separate folders</h3>
+    <p>Left <code>D:\Photos</code><br />Right <code>D:\Photos\Backup</code></p>
+    <p class="problem">
+      One folder is inside the other. Choose separate folders before you preview
+      or run this pair.
+    </p>
+    <div class="actions">
+      <span class="action primary">Browse right folder</span>
+    </div>
+  </section>
+  <section>
+    <p class="context">Pairs › Sync preview</p>
+    <h3>Preview needs refreshing</h3>
+    <p>
+      The pair or its files changed after this preview. Sync has stopped before
+      applying the stale plan.
+    </p>
+    <div class="actions">
+      <span class="action primary">Refresh preview</span
+      ><span class="action">Dismiss</span>
+    </div>
+  </section>
+  <section>
+    <p class="context">History › Run queue › Resolve</p>
+    <h3>Resolve conflicts</h3>
+    <p><code>album/cover.jpg</code></p>
+    <div class="actions">
+      <span class="action focus">○ Use left</span
+      ><span class="action">○ Use right</span
+      ><span class="action">○ Keep both</span><span class="action">○ Skip</span>
+    </div>
+    <div class="actions">
+      <span class="action">Continue sync</span
+      ><span class="action">Cancel</span>
+    </div>
+  </section>
+  <section>
+    <p class="context">Duplicates › Cleanup results</p>
+    <h3>1 recycled, 1 skipped</h3>
+    <div class="row"><code>cover-copy.jpg</code><span>Recycled</span></div>
+    <div class="row">
+      <code>cover-old.jpg</code><span>Changed since review</span>
+    </div>
+    <div class="actions"><span class="action primary">Rescan folder</span></div>
+  </section>
+  <section>
+    <p class="context">History › Photos backup</p>
+    <h3>Run report</h3>
+    <div class="actions">
+      <span class="action">Export JSON</span
+      ><span class="action">Export CSV</span>
+    </div>
+    <div class="row">
+      <code>album/cover.jpg</code><span>Copy completed</span>
+    </div>
+    <p class="problem">
+      Couldn’t load the next page. Showing the items already loaded.
+    </p>
+    <div class="actions"><span class="action">Retry next page</span></div>
+  </section>
+  <section>
+    <p class="context">Pairs › Watch status</p>
+    <h3>Watch paused for Media backup</h3>
+    <p class="problem">
+      Right folder is unavailable. Watching will resume when the folder is
+      accessible.
+    </p>
+    <div class="row"><span>Photos backup</span><span>Watching</span></div>
+  </section>
+</div>
