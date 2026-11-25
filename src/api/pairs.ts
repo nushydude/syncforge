@@ -1,8 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { FolderPair } from "../types";
+import type { FolderPair, WatchPairHealth } from "../types";
 
 export function listPairs(): Promise<FolderPair[]> {
   return invoke<FolderPair[]>("list_pairs");
+}
+
+export function getWatchHealth(): Promise<WatchPairHealth[]> {
+  return invoke<WatchPairHealth[]>("get_watch_health");
 }
 
 export function getLastSyncedAtByPair(): Promise<Record<string, number>> {

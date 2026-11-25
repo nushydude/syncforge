@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as previewApi from "../api/preview";
 import * as runApi from "../api/run";
+import * as pairsApi from "../api/pairs";
 import type { FolderPair, RunReport } from "../types";
 import {
   cancelConflictResolution,
@@ -14,6 +15,7 @@ import {
   enqueuePairRun,
   enqueuePairRuns,
   ensureWatchSkippedListener,
+  ensureWatchHealthListener,
   getPairRun,
   getRunState,
   isPairBusy,
@@ -297,6 +299,30 @@ describe("runStore", () => {
     });
     dismissWatchSkipped();
     expect(getRunState().watchSkipped).toBeNull();
+  });
+
+  it("keeps a live Watch health event when the initial request resolves later", async () => {
+    let finishHealth!: (
+      health: Awaited<ReturnType<typeof pairsApi.getWatchHealth>>,
+    ) => void;
+    vi.spyOn(pairsApi, "getWatchHealth").mockImplementation(
+      () => new Promise((resolve) => (finishHealth = resolve)),
+    );
+
+    const listening = ensureWatchHealthListener();
+    await vi.waitFor(() => expect(finishHealth).toBeDefined());
+    const watching = { pairId: samplePair.id, status: "watching", issues: [] };
+    listenHandlers["watch://health"]({ payload: [watching] });
+    finishHealth([
+      {
+        pairId: samplePair.id,
+        status: "degraded",
+        issues: ["Right unavailable"],
+      },
+    ]);
+    await listening;
+
+    expect(getRunState().watchHealth[samplePair.id]).toEqual(watching);
   });
 
   it("ignores progress when no UI run is active", async () => {

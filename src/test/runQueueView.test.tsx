@@ -19,6 +19,7 @@ import type { FolderPair } from "../types";
 
 vi.mock("../api/pairs", () => ({
   listPairs: vi.fn(),
+  getWatchHealth: vi.fn().mockResolvedValue([]),
   getLastSyncedAtByPair: vi.fn().mockResolvedValue({}),
   savePair: vi.fn(),
   deletePair: vi.fn(),
@@ -72,7 +73,34 @@ describe("sync queue view", () => {
     resetSettingsForTests();
     updateAppSettings({ confirmBeforeRun: false });
     vi.mocked(pairsApi.listPairs).mockResolvedValue([basePair, photosPair]);
+    vi.mocked(pairsApi.getWatchHealth).mockResolvedValue([]);
     vi.mocked(runApi.runPair).mockImplementation(() => new Promise(() => {}));
+  });
+
+  it("shows the degraded Watch pair while a healthy pair remains watching", async () => {
+    vi.mocked(pairsApi.listPairs).mockResolvedValue([
+      { ...basePair, watchEnabled: true },
+      { ...photosPair, watchEnabled: true },
+    ]);
+    vi.mocked(pairsApi.getWatchHealth).mockResolvedValue([
+      {
+        pairId: basePair.id,
+        status: "degraded",
+        issues: ["Right folder is unavailable."],
+      },
+      { pairId: photosPair.id, status: "watching", issues: [] },
+    ]);
+    render(<PairsPanel />);
+    expect(
+      await screen.findByText("Watch paused for Docs"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Right folder is unavailable."),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Photos/ }));
+    expect(
+      screen.getByText("Watching", { selector: "dd" }),
+    ).toBeInTheDocument();
   });
 
   it("associates a rejected draft's root error with both folder fields", async () => {

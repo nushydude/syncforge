@@ -122,14 +122,14 @@ pub fn pair_root_keys(
 }
 
 #[cfg(unix)]
-fn root_identity(path: &std::path::Path) -> std::io::Result<String> {
+pub(crate) fn root_identity(path: &std::path::Path) -> std::io::Result<String> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path)?;
     Ok(format!("{}:{}", meta.dev(), meta.ino()))
 }
 
 #[cfg(windows)]
-fn root_identity(path: &std::path::Path) -> std::io::Result<String> {
+pub(crate) fn root_identity(path: &std::path::Path) -> std::io::Result<String> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{

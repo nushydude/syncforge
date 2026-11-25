@@ -59,7 +59,7 @@ pub fn save_pair(
 
     let saved = state.db.save_pair(&pair).map_err(|e| e.to_string())?;
 
-    refresh_watch_service(&app, &state)?;
+    let _ = refresh_watch_service(&app, &state);
     refresh_schedule_service(&app, &state)?;
     Ok(saved)
 }
@@ -78,7 +78,7 @@ pub fn delete_pair(
         }
     })?;
 
-    refresh_watch_service(&app, &state)?;
+    let _ = refresh_watch_service(&app, &state);
     refresh_schedule_service(&app, &state)?;
     Ok(())
 }

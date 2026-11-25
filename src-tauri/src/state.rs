@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use crate::models::PreviewActionPage;
@@ -12,8 +11,6 @@ use crate::scheduler::ScheduleService;
 use crate::sniffer::SnifferService;
 use crate::watcher::WatchService;
 
-/// Ignore watch events for this long after a pair's sync completes (self-write feedback).
-pub const WATCH_SUPPRESS_AFTER_RUN_MS: u64 = 2000;
 /// Global heavy-job concurrency cap to protect disks, shares, CPU hashing, and SQLite.
 pub const HEAVY_JOB_CAPACITY: usize = 2;
 pub const PREVIEW_PAGE_MAX: usize = 200;
@@ -313,6 +310,9 @@ impl WorkCoordinator {
     pub async fn wait_for_release(self: &Arc<Self>, request: WorkRequest) {
         loop {
             let notified = self.released.notified();
+            tokio::pin!(notified);
+            // Register before examining admission, so a release cannot be lost between the check and await.
+            notified.as_mut().enable();
             let ready = self
                 .heavy_jobs
                 .lock()
@@ -394,6 +394,11 @@ pub struct AppState {
     pub sniffer: Arc<SnifferService>,
     /// Per-pair cancel flags while a sync run is active.
     pub active_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Serializes admission, pending registration and release as one transition.
+    pair_admission: Mutex<()>,
+    pub capacity_waiters: Mutex<HashSet<(String, AutomaticReason)>>,
+    pub watch_failed_fingerprints: Mutex<HashMap<String, HashMap<String, String>>>,
+    pub watch_gate: Mutex<WatchGate>,
     /// Per-pair cancel flags while a preview scan is active.
     pub preview_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Pair ids whose debounced watch sync could not start while that pair was busy.
@@ -404,8 +409,6 @@ pub struct AppState {
     pub pending_automatic_syncs: Mutex<HashSet<String>>,
     /// Pair ids currently executing sync (manual, watch, or schedule).
     pub sync_in_progress: Mutex<HashSet<String>>,
-    /// Ignore watch events for a pair until this instant (post-run suppression).
-    pub watch_suppress_until: Mutex<HashMap<String, Instant>>,
     pub watch_service: Mutex<Option<WatchService>>,
     pub schedule_service: Mutex<Option<ScheduleService>>,
     pub preview_plans: Mutex<PreviewPlanStore>,
@@ -429,12 +432,15 @@ impl AppState {
             active_duplicate_jobs: Mutex::new(HashSet::new()),
             sniffer,
             active_runs: Mutex::new(HashMap::new()),
+            pair_admission: Mutex::new(()),
+            capacity_waiters: Mutex::new(HashSet::new()),
+            watch_failed_fingerprints: Mutex::new(HashMap::new()),
+            watch_gate: Mutex::new(WatchGate::default()),
             preview_cancels: Mutex::new(HashMap::new()),
             pending_watch_syncs: Mutex::new(HashSet::new()),
             pending_schedule_syncs: Mutex::new(HashSet::new()),
             pending_automatic_syncs: Mutex::new(HashSet::new()),
             sync_in_progress: Mutex::new(HashSet::new()),
-            watch_suppress_until: Mutex::new(HashMap::new()),
             watch_service: Mutex::new(None),
             schedule_service: Mutex::new(None),
             preview_plans: Mutex::new(PreviewPlanStore::new()),
@@ -442,8 +448,95 @@ impl AppState {
     }
 }
 
+/// Registration health and deferred Watch intent share one lock so recovery
+/// cannot race with a request that observes a degraded pair.
+#[derive(Default)]
+pub struct WatchGate {
+    epoch: u64,
+    recheck: bool,
+    healthy: HashMap<String, RegisteredWatch>,
+    paused: HashSet<String>,
+}
+
+#[derive(Clone)]
+pub struct RegisteredWatch {
+    pub config_fingerprint: String,
+    pub roots: Vec<(PathBuf, String)>,
+}
+
+impl WatchGate {
+    pub fn request(&mut self, pair: &crate::models::FolderPair) -> bool {
+        self.request_with(&pair.id, &crate::commands::preview::config_fingerprint(pair), |path| {
+            crate::path_normalization::root_identity(path).ok()
+        })
+    }
+    pub(crate) fn request_with(
+        &mut self,
+        pair_id: &str,
+        config_fingerprint: &str,
+        identify: impl Fn(&std::path::Path) -> Option<String>,
+    ) -> bool {
+        let ready = self.healthy.get(pair_id).is_some_and(|registration| {
+            registration.config_fingerprint == config_fingerprint
+                && registration.roots.len() == 2
+                && registration.roots.iter().all(|(path, expected)| {
+                    path.is_dir() && identify(path).as_ref() == Some(expected)
+                })
+        });
+        if ready {
+            true
+        } else {
+            if self.healthy.remove(pair_id).is_some() {
+                self.recheck = true;
+            }
+            self.paused.insert(pair_id.to_owned());
+            false
+        }
+    }
+    pub fn publish(
+        &mut self,
+        epoch: u64,
+        healthy: HashMap<String, RegisteredWatch>,
+        configured: &HashSet<String>,
+    ) -> Vec<String> {
+        if self.epoch != epoch || self.recheck {
+            return Vec::new();
+        }
+        self.healthy = healthy;
+        self.paused.retain(|id| configured.contains(id));
+        let ready: Vec<_> =
+            self.paused.iter().filter(|id| self.healthy.contains_key(*id)).cloned().collect();
+        for id in &ready {
+            self.paused.remove(id);
+        }
+        ready
+    }
+    pub fn mark_unhealthy(&mut self, pair_id: &str) {
+        self.healthy.remove(pair_id);
+        self.paused.insert(pair_id.to_owned());
+        self.recheck = true;
+    }
+    pub fn take_recheck(&mut self) -> bool {
+        std::mem::take(&mut self.recheck)
+    }
+    pub fn invalidate(&mut self) -> u64 {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.healthy.clear();
+        self.epoch
+    }
+}
+
+pub(crate) fn watch_is_ready_or_defer(state: &AppState, pair: &crate::models::FolderPair) -> bool {
+    state.watch_gate.lock().map(|mut gate| gate.request(pair)).unwrap_or(false)
+}
+
 /// Reserves a run slot for `pair_id`. Different pairs may run concurrently.
 pub fn try_acquire_pair_run(state: &AppState, pair_id: &str) -> Result<Arc<AtomicBool>, String> {
+    let _guard = state.pair_admission.lock().map_err(|e| e.to_string())?;
+    acquire_pair_run_locked(state, pair_id)
+}
+
+fn acquire_pair_run_locked(state: &AppState, pair_id: &str) -> Result<Arc<AtomicBool>, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut runs = state.active_runs.lock().map_err(|e| e.to_string())?;
     if runs.contains_key(pair_id) {
@@ -456,13 +549,14 @@ pub fn try_acquire_pair_run(state: &AppState, pair_id: &str) -> Result<Arc<Atomi
     Ok(cancel)
 }
 
-/// Clears the run slot when it matches `slot` and arms post-run watch suppression.
+/// Clears the run slot when it matches `slot` and transfers pending reasons.
 /// Returns whether a pending watch sync and/or scheduled sync were queued for this pair.
 pub fn release_pair_run_slot(
     state: &AppState,
     pair_id: &str,
     slot: &Arc<AtomicBool>,
 ) -> Option<(bool, bool)> {
+    let _guard = state.pair_admission.lock().ok()?;
     let mut runs = state.active_runs.lock().ok()?;
     let active = runs.get(pair_id)?;
     if !Arc::ptr_eq(active, slot) {
@@ -474,13 +568,6 @@ pub fn release_pair_run_slot(
     if let Ok(mut in_progress) = state.sync_in_progress.lock() {
         in_progress.remove(pair_id);
     }
-    if let Ok(mut suppress) = state.watch_suppress_until.lock() {
-        suppress.insert(
-            pair_id.to_string(),
-            Instant::now() + Duration::from_millis(WATCH_SUPPRESS_AFTER_RUN_MS),
-        );
-    }
-
     let watch_pending =
         state.pending_watch_syncs.lock().ok().is_some_and(|mut g| g.remove(pair_id));
     let schedule_pending =
@@ -494,64 +581,106 @@ pub fn release_pair_run_slot(
     Some((watch_pending, schedule_pending))
 }
 
-pub fn should_ignore_watch_event(state: &AppState, pair_id: &str) -> bool {
-    if let Ok(in_progress) = state.sync_in_progress.lock() {
-        if in_progress.contains(pair_id) {
-            return true;
-        }
-    }
-    if let Ok(suppress) = state.watch_suppress_until.lock() {
-        if let Some(until) = suppress.get(pair_id) {
-            if Instant::now() < *until {
-                return true;
-            }
-        }
-    }
-    false
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub enum AutomaticReason {
+    Watch,
+    Schedule,
 }
 
+fn enqueue_locked(state: &AppState, pair_id: &str, reason: AutomaticReason) -> bool {
+    let target = match reason {
+        AutomaticReason::Watch => &state.pending_watch_syncs,
+        AutomaticReason::Schedule => &state.pending_schedule_syncs,
+    };
+    let inserted =
+        target.lock().map(|mut pending| pending.insert(pair_id.to_owned())).unwrap_or(false);
+    if let Ok(mut all) = state.pending_automatic_syncs.lock() {
+        all.insert(pair_id.to_owned());
+    }
+    inserted
+}
+
+fn dequeue_locked(state: &AppState, pair_id: &str, reason: AutomaticReason) {
+    let target = match reason {
+        AutomaticReason::Watch => &state.pending_watch_syncs,
+        AutomaticReason::Schedule => &state.pending_schedule_syncs,
+    };
+    if let Ok(mut pending) = target.lock() {
+        pending.remove(pair_id);
+    }
+    let watch = state.pending_watch_syncs.lock().map(|g| g.contains(pair_id)).unwrap_or(true);
+    let schedule = state.pending_schedule_syncs.lock().map(|g| g.contains(pair_id)).unwrap_or(true);
+    if !watch && !schedule {
+        if let Ok(mut all) = state.pending_automatic_syncs.lock() {
+            all.remove(pair_id);
+        }
+    }
+}
+
+/// Atomically owns a slot or records the triggering reason for its owner to drain.
+pub(crate) fn acquire_or_enqueue(
+    state: &AppState,
+    pair_id: &str,
+    reason: AutomaticReason,
+) -> Result<Option<Arc<AtomicBool>>, String> {
+    let _guard = state.pair_admission.lock().map_err(|e| e.to_string())?;
+    if state.active_runs.lock().map_err(|e| e.to_string())?.contains_key(pair_id) {
+        enqueue_locked(state, pair_id, reason);
+        return Ok(None);
+    }
+    let slot = acquire_pair_run_locked(state, pair_id)?;
+    dequeue_locked(state, pair_id, reason);
+    Ok(Some(slot))
+}
+
+/// Releases ownership and records the retry without a release/enqueue gap.
+pub(crate) fn defer_for_capacity(
+    state: &AppState,
+    pair_id: &str,
+    slot: &Arc<AtomicBool>,
+    reason: AutomaticReason,
+) -> bool {
+    let Ok(_guard) = state.pair_admission.lock() else {
+        return false;
+    };
+    let Ok(mut runs) = state.active_runs.lock() else {
+        return false;
+    };
+    if !runs.get(pair_id).is_some_and(|active| Arc::ptr_eq(active, slot)) {
+        return false;
+    }
+    runs.remove(pair_id);
+    if let Ok(mut progress) = state.sync_in_progress.lock() {
+        progress.remove(pair_id);
+    }
+    enqueue_locked(state, pair_id, reason);
+    true
+}
+
+pub(crate) fn take_pending_sync(state: &AppState, reason: AutomaticReason) -> Option<String> {
+    let _guard = state.pair_admission.lock().ok()?;
+    let target = match reason {
+        AutomaticReason::Watch => &state.pending_watch_syncs,
+        AutomaticReason::Schedule => &state.pending_schedule_syncs,
+    };
+    let id = target.lock().ok()?.iter().next().cloned()?;
+    dequeue_locked(state, &id, reason);
+    Some(id)
+}
+
+#[cfg(test)]
 pub(crate) fn enqueue_pending_watch_sync(state: &AppState, pair_id: impl Into<String>) -> bool {
-    let pair_id = pair_id.into();
-    if let Ok(mut automatic) = state.pending_automatic_syncs.lock() {
-        if !automatic.insert(pair_id.clone()) {
-            return false;
-        }
-    }
-    if let Ok(mut guard) = state.pending_watch_syncs.lock() {
-        return guard.insert(pair_id);
-    }
-    false
+    let Ok(_guard) = state.pair_admission.lock() else {
+        return false;
+    };
+    enqueue_locked(state, &pair_id.into(), AutomaticReason::Watch)
 }
-
+#[cfg(test)]
 pub(crate) fn enqueue_pending_schedule_sync(state: &AppState, pair_id: impl Into<String>) -> bool {
-    let pair_id = pair_id.into();
-    if let Ok(mut automatic) = state.pending_automatic_syncs.lock() {
-        if !automatic.insert(pair_id.clone()) {
-            return false;
-        }
-    }
-    if let Ok(mut guard) = state.pending_schedule_syncs.lock() {
-        return guard.insert(pair_id);
-    }
-    false
-}
-
-pub(crate) fn dequeue_pending_watch_sync(state: &AppState, pair_id: &str) {
-    if let Ok(mut guard) = state.pending_watch_syncs.lock() {
-        guard.remove(pair_id);
-    }
-    if let Ok(mut automatic) = state.pending_automatic_syncs.lock() {
-        automatic.remove(pair_id);
-    }
-}
-
-pub(crate) fn dequeue_pending_schedule_sync(state: &AppState, pair_id: &str) {
-    if let Ok(mut guard) = state.pending_schedule_syncs.lock() {
-        guard.remove(pair_id);
-    }
-    if let Ok(mut automatic) = state.pending_automatic_syncs.lock() {
-        automatic.remove(pair_id);
-    }
+    let Ok(_guard) = state.pair_admission.lock() else {
+        return false;
+    };
+    enqueue_locked(state, &pair_id.into(), AutomaticReason::Schedule)
 }
 
 #[cfg(test)]
@@ -683,11 +812,11 @@ mod tests {
     }
 
     #[test]
-    fn automatic_queue_has_one_entry_per_pair_across_reasons() {
+    fn automatic_queue_preserves_both_reasons_with_one_pair_entry() {
         let data_dir = TempDir::new().expect("tempdir");
         let state = AppState::new(data_dir.path().to_path_buf()).expect("app state");
         assert!(enqueue_pending_watch_sync(&state, "pair-a"));
-        assert!(!enqueue_pending_schedule_sync(&state, "pair-a"));
+        assert!(enqueue_pending_schedule_sync(&state, "pair-a"));
         assert!(enqueue_pending_schedule_sync(&state, "pair-b"));
         assert_eq!(state.pending_automatic_syncs.lock().unwrap().len(), 2);
     }
@@ -816,24 +945,6 @@ mod tests {
     }
 
     #[test]
-    fn watch_suppression_blocks_events_until_deadline() {
-        let data_dir = TempDir::new().expect("tempdir");
-        let state = AppState::new(data_dir.path().to_path_buf()).expect("app state");
-        let slot = try_acquire_pair_run(&state, "pair-a").expect("acquire");
-
-        assert!(should_ignore_watch_event(&state, "pair-a"));
-
-        let _ = release_pair_run_slot(&state, "pair-a", &slot);
-
-        assert!(should_ignore_watch_event(&state, "pair-a"));
-        {
-            let mut suppress = state.watch_suppress_until.lock().expect("lock");
-            suppress.insert("pair-a".into(), Instant::now() - Duration::from_millis(1));
-        }
-        assert!(!should_ignore_watch_event(&state, "pair-a"));
-    }
-
-    #[test]
     fn pending_watch_and_schedule_queues_are_separate() {
         let data_dir = TempDir::new().expect("tempdir");
         let state = AppState::new(data_dir.path().to_path_buf()).expect("app state");
@@ -864,9 +975,67 @@ mod tests {
         let slot = try_acquire_pair_run(&state, "pair-a").expect("acquire");
         let pending = release_pair_run_slot(&state, "pair-a", &slot).expect("release");
 
-        assert_eq!(pending, (true, false));
+        assert_eq!(pending, (true, true));
         assert!(state.pending_watch_syncs.lock().expect("lock").contains("pair-b"));
         assert!(state.pending_schedule_syncs.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn atomic_admission_race_never_strands_watch_or_schedule() {
+        for reason in [AutomaticReason::Watch, AutomaticReason::Schedule] {
+            for _ in 0..20 {
+                let data_dir = TempDir::new().unwrap();
+                let state = Arc::new(AppState::new(data_dir.path().to_path_buf()).unwrap());
+                let slot = try_acquire_pair_run(&state, "pair").unwrap();
+                let barrier = Arc::new(Barrier::new(3));
+                let start = Arc::clone(&barrier);
+                let dispatch_state = Arc::clone(&state);
+                let dispatch = thread::spawn(move || {
+                    start.wait();
+                    acquire_or_enqueue(&dispatch_state, "pair", reason).unwrap()
+                });
+                let start = Arc::clone(&barrier);
+                let release_state = Arc::clone(&state);
+                let release = thread::spawn(move || {
+                    start.wait();
+                    release_pair_run_slot(&release_state, "pair", &slot).unwrap()
+                });
+                barrier.wait();
+                let acquired = dispatch.join().unwrap();
+                let pending = release.join().unwrap();
+                let delivered = match reason {
+                    AutomaticReason::Watch => pending.0,
+                    AutomaticReason::Schedule => pending.1,
+                };
+                assert!(
+                    acquired.is_some() || delivered,
+                    "reason must be owned or handed to release"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dirty_events_during_active_run_coalesce_and_survive_release() {
+        let data_dir = TempDir::new().unwrap();
+        let state = AppState::new(data_dir.path().to_path_buf()).unwrap();
+        let active = try_acquire_pair_run(&state, "pair").unwrap();
+        for _ in 0..20 {
+            assert!(acquire_or_enqueue(&state, "pair", AutomaticReason::Watch).unwrap().is_none());
+        }
+        assert_eq!(state.pending_watch_syncs.lock().unwrap().len(), 1);
+        assert_eq!(release_pair_run_slot(&state, "pair", &active), Some((true, false)));
+    }
+
+    #[test]
+    fn capacity_deferral_keeps_both_reasons_until_retry_admission() {
+        let data_dir = TempDir::new().unwrap();
+        let state = AppState::new(data_dir.path().to_path_buf()).unwrap();
+        let slot = try_acquire_pair_run(&state, "pair").unwrap();
+        assert!(acquire_or_enqueue(&state, "pair", AutomaticReason::Schedule).unwrap().is_none());
+        assert!(defer_for_capacity(&state, "pair", &slot, AutomaticReason::Watch));
+        let next = acquire_or_enqueue(&state, "pair", AutomaticReason::Watch).unwrap().unwrap();
+        assert_eq!(release_pair_run_slot(&state, "pair", &next), Some((false, true)));
     }
 
     #[test]

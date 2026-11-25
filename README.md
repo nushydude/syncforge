@@ -17,6 +17,8 @@ Echo removes eligible files from the right folder and records retained directori
 
 A run based on a reviewed preview stops if its plan expires or the observed files change. Refresh and review the new preview to continue. Synchronize uses a verified baseline for the current roots to decide whether a missing file represents a deletion. The first sync for a new setup establishes that baseline.
 
+If Watch loses access to one folder, that pair pauses while other pairs keep watching. SyncForge retries the registration and checks for changes once both folders are available again.
+
 The Duplicates workspace can find candidate copies by exact content hash, file size, or filename, then move reviewed files to the Recycle Bin. Hash scanning streams file contents and only hashes files that share a size, so large files are not loaded into memory.
 
 ## Installation

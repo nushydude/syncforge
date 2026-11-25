@@ -90,7 +90,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            refresh_watch_service(app.handle(), &app_state)?;
+            let _ = refresh_watch_service(app.handle(), &app_state);
             refresh_schedule_service(app.handle(), &app_state)?;
 
             #[cfg(desktop)]
@@ -138,6 +138,7 @@ pub fn run() {
             commands::run::run_pair,
             commands::run::cancel_run,
             commands::history::get_history,
+            watcher::get_watch_health,
             commands::history::get_run_detail,
             commands::schedule::set_schedule,
             commands::sniffer::start_sniffer_scan,

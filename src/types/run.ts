@@ -38,3 +38,9 @@ export interface WatchSkippedNotice {
   pairId: string;
   reason: string;
 }
+
+export interface WatchPairHealth {
+  pairId: string;
+  status: "watching" | "degraded";
+  issues: string[];
+}

@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import * as previewApi from "../api/preview";
 import * as runApi from "../api/run";
+import { getWatchHealth } from "../api/pairs";
 import type { ConflictAction } from "../lib/conflictPolicy";
 import {
   clearPairPreview,
@@ -21,6 +22,7 @@ import type {
   RunPairOptions,
   SyncProgress,
   WatchSkippedNotice,
+  WatchPairHealth,
 } from "../types";
 import { getAppSettings } from "./settingsStore";
 
@@ -86,6 +88,7 @@ export interface RunStoreState {
   pendingConflicts: PendingConflicts | null;
   conflictResolutions: Record<string, ConflictChoice>;
   watchSkipped: WatchSkippedNotice | null;
+  watchHealth: Record<string, WatchPairHealth>;
 }
 
 type Listener = () => void;
@@ -100,6 +103,7 @@ function emptyState(): RunStoreState {
     pendingConflicts: null,
     conflictResolutions: {},
     watchSkipped: null,
+    watchHealth: {},
   };
 }
 
@@ -108,6 +112,8 @@ let state: RunStoreState = emptyState();
 const listeners = new Set<Listener>();
 let unlistenProgress: (() => void) | null = null;
 let unlistenWatchSkipped: (() => void) | null = null;
+let watchHealthSubscription: Promise<void> | null = null;
+let unlistenWatchHealth: (() => void) | null = null;
 
 /** Full pair snapshots for queued ids — the run uses the config as queued. */
 const queuedPairs = new Map<string, FolderPair>();
@@ -270,6 +276,39 @@ export async function ensureWatchSkippedListener(): Promise<void> {
 export function dismissWatchSkipped(): void {
   state = { ...state, watchSkipped: null };
   emit();
+}
+
+function applyWatchHealth(health: WatchPairHealth[]): void {
+  state = {
+    ...state,
+    watchHealth: Object.fromEntries(
+      health.map((entry) => [entry.pairId, entry]),
+    ),
+  };
+  emit();
+}
+
+export function ensureWatchHealthListener(): Promise<void> {
+  if (watchHealthSubscription) return watchHealthSubscription;
+  watchHealthSubscription = (async () => {
+    try {
+      let receivedChange = false;
+      unlistenWatchHealth = await listen<WatchPairHealth[]>(
+        "watch://health",
+        (event) => {
+          receivedChange = true;
+          applyWatchHealth(event.payload);
+        },
+      );
+      const initial = await getWatchHealth().catch(() => undefined);
+      if (initial && !receivedChange) applyWatchHealth(initial);
+    } catch {
+      unlistenWatchHealth?.();
+      unlistenWatchHealth = null;
+      watchHealthSubscription = null;
+    }
+  })();
+  return watchHealthSubscription;
 }
 
 function finishRun(
@@ -1038,6 +1077,9 @@ export async function confirmConflictResolutionAndRun(): Promise<RunReport | nul
 export function resetRunStoreForTests(): void {
   unlistenProgress = null;
   unlistenWatchSkipped = null;
+  unlistenWatchHealth?.();
+  unlistenWatchHealth = null;
+  watchHealthSubscription = null;
   queuedPairs.clear();
   queuedSyncs.clear();
   activeRunIds.clear();

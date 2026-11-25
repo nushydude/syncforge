@@ -77,11 +77,12 @@ export function PairDetails({ pair, onViewReport }: PairDetailsProps) {
       [pair.id],
     ),
   );
-  const { busy, scanPosition } = useRunStore(
+  const { busy, scanPosition, watchStatus } = useRunStore(
     useCallback(
       (s: RunStoreState) => ({
         busy: isPairBusy(s, pair.id),
         scanPosition: queuePosition(s, pair.id, "preview"),
+        watchStatus: s.watchHealth[pair.id]?.status,
       }),
       [pair.id],
     ),
@@ -252,7 +253,15 @@ export function PairDetails({ pair, onViewReport }: PairDetailsProps) {
             </div>
             <div>
               <dt>Watch for changes</dt>
-              <dd>{pair.watchEnabled ? "Enabled" : "Disabled"}</dd>
+              <dd>
+                {!pair.watchEnabled || !pair.enabled
+                  ? "Disabled"
+                  : watchStatus === "watching"
+                    ? "Watching"
+                    : watchStatus === "degraded"
+                      ? "Paused"
+                      : "Enabled"}
+              </dd>
             </div>
             <div>
               <dt>Scheduled sync</dt>

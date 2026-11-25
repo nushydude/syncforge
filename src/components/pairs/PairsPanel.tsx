@@ -15,6 +15,7 @@ import {
   cancelConflictResolution,
   confirmConflictResolutionAndRun,
   ensureWatchSkippedListener,
+  ensureWatchHealthListener,
   ensureProgressListener,
   loadConflictPage,
   refreshStaleConflictPreview,
@@ -36,6 +37,7 @@ const selectPairsPanel = (s: PairsStoreState) => ({
 });
 
 const selectWatchSkipped = (s: RunStoreState) => s.watchSkipped;
+const selectWatchHealth = (s: RunStoreState) => s.watchHealth;
 const selectStalePairId = (s: PairsStoreState) =>
   s.pairs.find((pair) => isPreviewRefreshRequired(s.previews[pair.id]?.error))
     ?.id;
@@ -54,6 +56,7 @@ export function PairsPanel({ active = true }: { active?: boolean }) {
     usePairsStore(selectPairsPanel);
   const stalePairId = usePairsStore(selectStalePairId);
   const watchSkipped = useRunStore(selectWatchSkipped);
+  const watchHealth = useRunStore(selectWatchHealth);
   const pendingConflicts = useRunStore((state) => state.pendingConflicts);
   const conflictResolutions = useRunStore((state) => state.conflictResolutions);
   const showConflict =
@@ -80,6 +83,7 @@ export function PairsPanel({ active = true }: { active?: boolean }) {
   useEffect(() => {
     void loadPairs();
     void ensureWatchSkippedListener();
+    void ensureWatchHealthListener();
     void ensureProgressListener();
   }, []);
 
@@ -88,6 +92,12 @@ export function PairsPanel({ active = true }: { active?: boolean }) {
   const skippedPairName =
     watchSkipped && pairs.find((p) => p.id === watchSkipped.pairId)?.name;
   const selectedPair = pairs.find((pair) => pair.id === selectedId);
+  const pausedPairs = pairs.filter(
+    (pair) =>
+      pair.enabled &&
+      pair.watchEnabled &&
+      watchHealth[pair.id]?.status === "degraded",
+  );
 
   return (
     <>
@@ -137,6 +147,21 @@ export function PairsPanel({ active = true }: { active?: boolean }) {
         <HistoryView active initialRunId={reportRunId} />
       ) : (
         <>
+          {pausedPairs.length > 0 && (
+            <aside aria-label="Watch status" role="status">
+              {pausedPairs.map((pair) => (
+                <div className="watch-skipped-banner" key={pair.id}>
+                  <div>
+                    <p>
+                      <strong>Watch paused for {pair.name}</strong>
+                    </p>
+                    <p>{watchHealth[pair.id].issues.join(" ")}</p>
+                    <p>Watching will resume when both folders are available.</p>
+                  </div>
+                </div>
+              ))}
+            </aside>
+          )}
           {watchSkipped && (
             <div className="watch-skipped-banner" role="alert">
               <p>
