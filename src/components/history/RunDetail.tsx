@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useHistoryStore } from "../../hooks/useHistoryStore";
 import {
   loadMoreRunItems,
@@ -58,6 +58,7 @@ export function RunDetail() {
     message: string;
   } | null>(null);
   const [exporting, setExporting] = useState(false);
+  const itemsHeadingRef = useRef<HTMLHeadingElement>(null);
   const pairs = usePairsStore(selectPairsList);
   const pairNames = useMemo(
     () => pairs.map((p) => ({ id: p.id, name: p.name })),
@@ -91,6 +92,11 @@ export function RunDetail() {
     report.status === "running"
       ? "Export is available after the run finishes"
       : undefined;
+  const changePage = (requestPage: () => Promise<void>) => {
+    // The current navigation button can disappear while the new page loads.
+    itemsHeadingRef.current?.focus();
+    void requestPage();
+  };
   const handleExport = async (format: "json" | "csv") => {
     setExportError(null);
     setExporting(true);
@@ -185,7 +191,7 @@ export function RunDetail() {
 
       <section className="run-detail-items">
         <div className="run-detail-items-header">
-          <h4>
+          <h4 ref={itemsHeadingRef} tabIndex={-1}>
             Items
             {!detailLoading && !error && ` (${items.length} on this page)`}
           </h4>
@@ -262,7 +268,7 @@ export function RunDetail() {
                 <button
                   type="button"
                   disabled={detailPageLoading}
-                  onClick={() => void retryRunItemsPage()}
+                  onClick={() => changePage(retryRunItemsPage)}
                 >
                   Retry page
                 </button>
@@ -272,7 +278,7 @@ export function RunDetail() {
               <button
                 type="button"
                 disabled={detailPageLoading}
-                onClick={() => void loadPreviousRunItems()}
+                onClick={() => changePage(loadPreviousRunItems)}
               >
                 Previous page
               </button>
@@ -282,7 +288,7 @@ export function RunDetail() {
                 type="button"
                 className="run-detail-load-more"
                 disabled={detailPageLoading}
-                onClick={() => void loadMoreRunItems()}
+                onClick={() => changePage(loadMoreRunItems)}
               >
                 {detailPageLoading ? "Loading…" : "Next page"}
               </button>
