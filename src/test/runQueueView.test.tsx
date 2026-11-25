@@ -74,6 +74,29 @@ describe("sync queue view", () => {
     vi.mocked(runApi.runPair).mockImplementation(() => new Promise(() => {}));
   });
 
+  it("associates a rejected draft's root error with both folder fields", async () => {
+    vi.mocked(runApi.runPair).mockRejectedValueOnce(
+      "Invalid folder pair: one folder is inside the other.",
+    );
+
+    render(<PairsPanel />);
+    fireEvent.click(await screen.findByRole("button", { name: /^Docs/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit pair" }));
+    const leftFolder = screen.getByPlaceholderText("C:\\Users\\you\\Documents");
+    const rightFolder = screen.getByPlaceholderText("D:\\Backup\\Documents");
+    fireEvent.change(rightFolder, { target: { value: "C:\\left\\Backup" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run sync" }));
+
+    const message = await screen.findByText(
+      "Invalid folder pair: one folder is inside the other.",
+    );
+    expect(message).toHaveAttribute("role", "alert");
+    expect(leftFolder).toHaveAccessibleDescription(message.textContent!);
+    expect(rightFolder).toHaveAccessibleDescription(message.textContent!);
+    fireEvent.change(rightFolder, { target: { value: "D:\\Separate" } });
+    expect(rightFolder).not.toHaveAttribute("aria-describedby");
+  });
+
   it("shows a run that continues past a file error as completed with errors", async () => {
     const report = {
       runId: "run-with-errors",

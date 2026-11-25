@@ -2,7 +2,7 @@ import { ConflictDialog } from "../conflicts/ConflictDialog";
 import { PreviewResults } from "../preview/PreviewResults";
 import { PreviewScanProgress } from "../preview/PreviewScanProgress";
 import { RunProgress } from "../run/RunProgress";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { usePairsStore } from "../../hooks/usePairsStore";
 import { useRunStore } from "../../hooks/useRunStore";
 import {
@@ -20,6 +20,7 @@ import {
   enqueuePairRun,
   cancelPairPreview,
   enqueuePairPreview,
+  getPairRun,
   isPairBusy,
   queuePosition,
   loadConflictPage,
@@ -73,6 +74,7 @@ export function PairEditor({
   const {
     busy: runInProgress,
     scanPosition,
+    runError,
     pendingConflicts,
     conflictResolutions,
   } = useRunStore(
@@ -80,6 +82,7 @@ export function PairEditor({
       (s: RunStoreState) => ({
         busy: isPairBusy(s, editingId),
         scanPosition: queuePosition(s, editingId, "preview"),
+        runError: getPairRun(s, editingId)?.error,
         pendingConflicts: s.pendingConflicts,
         conflictResolutions: s.conflictResolutions,
       }),
@@ -87,6 +90,11 @@ export function PairEditor({
     ),
   );
   const [showResults, setShowResults] = useState(false);
+  const [rootAttempt, setRootAttempt] = useState<{
+    roots: string;
+    action: "save" | "preview" | "run";
+  }>();
+  const rootErrorId = useId();
   const resultsTitleRef = useRef<HTMLHeadingElement>(null);
   const resultsTriggerRef = useRef<HTMLButtonElement>(null);
 
@@ -105,6 +113,22 @@ export function PairEditor({
   }
 
   const isNew = !editing.id;
+  const roots = JSON.stringify([
+    editing.id,
+    editing.leftPath,
+    editing.rightPath,
+  ]);
+  const rootAttemptError =
+    rootAttempt?.action === "save"
+      ? error
+      : rootAttempt?.action === "preview"
+        ? previewError
+        : runError;
+  const rootError =
+    rootAttempt?.roots === roots &&
+    rootAttemptError?.startsWith("Invalid folder pair:")
+      ? rootAttemptError
+      : undefined;
   // Warnings still deserve a look, so only a warning-free empty plan is "clean".
   const previewIsClean =
     previewPlan !== null &&
@@ -117,6 +141,7 @@ export function PairEditor({
       onSubmit={(e) => {
         e.preventDefault();
         if (runInProgress) return;
+        setRootAttempt({ roots, action: "save" });
         void saveEditing();
       }}
     >
@@ -139,10 +164,14 @@ export function PairEditor({
         />
       )}
       {!isNew && (
-        <RunProgress pairId={editing.id} onViewReport={onViewReport} />
+        <RunProgress
+          pairId={editing.id}
+          onViewReport={onViewReport}
+          inlineError={rootError}
+        />
       )}
 
-      {error && (
+      {error && error !== rootError && (
         <p className="form-error" role="alert">
           {error}
         </p>
@@ -176,6 +205,8 @@ export function PairEditor({
             onChange={(e) => updateEditing({ leftPath: e.target.value })}
             placeholder="C:\Users\you\Documents"
             disabled={saving}
+            aria-invalid={!!rootError}
+            aria-describedby={rootError ? rootErrorId : undefined}
           />
           <button
             type="button"
@@ -196,6 +227,8 @@ export function PairEditor({
             onChange={(e) => updateEditing({ rightPath: e.target.value })}
             placeholder="D:\Backup\Documents"
             disabled={saving}
+            aria-invalid={!!rootError}
+            aria-describedby={rootError ? rootErrorId : undefined}
           />
           <button
             type="button"
@@ -206,6 +239,12 @@ export function PairEditor({
           </button>
         </div>
       </label>
+
+      {rootError && (
+        <p id={rootErrorId} className="form-error" role="alert">
+          {rootError}
+        </p>
+      )}
 
       <ModeSelector
         value={editing.mode}
@@ -363,7 +402,7 @@ export function PairEditor({
         </>
       )}
 
-      {!isNew && previewError && (
+      {!isNew && previewError && previewError !== rootError && (
         <p className="preview-error" role="alert">
           {previewError}
         </p>
@@ -376,7 +415,11 @@ export function PairEditor({
               type="button"
               className="btn-primary"
               disabled={saving || previewLoading || previewQueued}
-              onClick={() => editing && enqueuePairPreview(editing)}
+              onClick={() => {
+                if (enqueuePairPreview(editing)) {
+                  setRootAttempt({ roots, action: "preview" });
+                }
+              }}
             >
               {previewQueued
                 ? "Queued to scan…"
@@ -388,7 +431,11 @@ export function PairEditor({
               type="button"
               className="btn-primary"
               disabled={saving || runInProgress}
-              onClick={() => editing && enqueuePairRun(editing)}
+              onClick={() => {
+                if (enqueuePairRun(editing)) {
+                  setRootAttempt({ roots, action: "run" });
+                }
+              }}
             >
               {runInProgress ? "Queued…" : "Run sync"}
             </button>

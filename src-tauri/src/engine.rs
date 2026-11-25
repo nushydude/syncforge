@@ -16,7 +16,9 @@ use crate::models::{
 };
 use crate::path_normalization;
 use crate::persistence::DatabaseHandle;
-use crate::scanner::{assert_destructive_scan_allowed, scan_directory, ScanIntegrity};
+use crate::scanner::{
+    assert_destructive_scan_allowed, scan_directory, validate_name_mapping, ScanIntegrity,
+};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -42,6 +44,7 @@ pub fn max_run_item_buffer() -> usize {
     MAX_RUN_ITEM_BUFFER.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
 const TEMP_SUFFIX: &str = ".syncforge.tmp";
 /// Bounds run-item memory and SQLite transaction duration during large runs.
 pub const RUN_ITEM_BATCH_SIZE: usize = 1_000;
@@ -120,7 +123,8 @@ pub fn join_relative(base: &Path, relative: &str) -> PathBuf {
     base.join(rel)
 }
 
-pub fn temp_copy_path(dest: &Path) -> PathBuf {
+#[cfg(test)]
+fn temp_copy_path(dest: &Path) -> PathBuf {
     let name =
         dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
     dest.with_file_name(format!("{name}{TEMP_SUFFIX}"))
@@ -152,15 +156,17 @@ fn ensure_parent(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Move or copy a verified temp file onto `dest` without deleting `dest` first.
-///
-/// `fs::rename` is preferred (atomic replace on Unix; fast on same volume). It fails
-/// when `dest` already exists on Windows, or when `temp` and `dest` are on different
-/// volumes. In those cases we `fs::copy` over `dest` so a failed commit leaves the
-/// original file intact.
+/// Commit a verified sibling stage without truncating the current destination.
+/// A failed rename leaves the destination in place; Windows uses its replace API.
 pub(crate) fn commit_temp_file(temp: &Path, dest: &Path) -> io::Result<()> {
-    if fs::rename(temp, dest).is_ok() {
-        return Ok(());
+    match fs::rename(temp, dest) {
+        Ok(()) => return Ok(()),
+        Err(error) => {
+            #[cfg(not(windows))]
+            return Err(error);
+            #[cfg(windows)]
+            let _ = error;
+        }
     }
     #[cfg(windows)]
     {
@@ -176,24 +182,25 @@ pub(crate) fn commit_temp_file(temp: &Path, dest: &Path) -> io::Result<()> {
             )
         };
         if replaced != 0 {
-            return Ok(());
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
-        Err(io::Error::last_os_error())
     }
-    #[cfg(not(windows))]
-    fs::copy(temp, dest)?;
-    #[cfg(not(windows))]
-    fs::remove_file(temp)?;
-    #[cfg(not(windows))]
-    Ok(())
 }
 
 pub fn safe_copy_file(src: &Path, dest: &Path, verify: bool) -> io::Result<u64> {
     ensure_parent(dest)?;
-    let temp = temp_copy_path(dest);
-    if temp.exists() {
-        fs::remove_file(&temp)?;
-    }
+    let stage_dir = loop {
+        let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+        let candidate = parent.join(format!(".syncforge-{}.stage", Uuid::new_v4()));
+        match fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let temp = stage_dir.join("payload");
     let result = (|| {
         let bytes = fs::copy(src, &temp)?;
         if verify {
@@ -210,8 +217,18 @@ pub fn safe_copy_file(src: &Path, dest: &Path, verify: bool) -> io::Result<u64> 
         Ok(bytes)
     })();
     if result.is_err() {
+        #[cfg(windows)]
+        if let Ok(metadata) = fs::metadata(&temp) {
+            let mut permissions = metadata.permissions();
+            // Windows readonly is an attribute, not Unix permission bits.
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            let _ = fs::set_permissions(&temp, permissions);
+        }
         let _ = fs::remove_file(&temp);
     }
+    // Never recursively remove a stage: anything unexpected is left untouched.
+    let _ = fs::remove_dir(&stage_dir);
     result
 }
 
@@ -222,11 +239,11 @@ pub fn delete_path(path: &Path, use_recycle_bin: bool) -> io::Result<()> {
         Err(error) => return Err(error),
     };
     if metadata.is_dir() {
-        if use_recycle_bin {
-            trash::delete(path).map_err(|e| io::Error::other(e.to_string()))?;
-        } else {
-            fs::remove_dir_all(path)?;
-        }
+        // A plan never proves membership of an entire physical subtree. In particular,
+        // filters and files added after scanning must not be removed recursively.
+        return Err(io::Error::other(
+            "directory removal blocked: contents may include protected or unplanned files",
+        ));
     } else if use_recycle_bin {
         trash::delete(path).map_err(|e| io::Error::other(e.to_string()))?;
     } else {
@@ -333,17 +350,19 @@ where
         emit(progress);
     };
 
-    let result = run_pair_impl_inner(
-        db,
-        pair,
-        options,
-        cancel,
-        &mut report,
-        &mut counted_emit,
-        &run_id,
-        &left_root,
-        &right_root,
-    );
+    let result = path_normalization::validate_pair_roots(&left_root, &right_root).and_then(|()| {
+        run_pair_impl_inner(
+            db,
+            pair,
+            options,
+            cancel,
+            &mut report,
+            &mut counted_emit,
+            &run_id,
+            &left_root,
+            &right_root,
+        )
+    });
 
     if let Err(ref error) = result {
         if report.finished_at.is_none() {
@@ -403,6 +422,16 @@ where
         return finish_cancelled(db, pair, left_root, right_root, report, emit, 0, 0, None);
     }
 
+    // Recheck name mappings even for cached plans: filesystem case rules and
+    // the entries visible to the scan may have changed since preview.
+    if provided_plan.is_some() {
+        let left = scan_directory(left_root, &pair.filters)
+            .map_err(|e| format!("scan left failed: {e}"))?;
+        let right = scan_directory(right_root, &pair.filters)
+            .map_err(|e| format!("scan right failed: {e}"))?;
+        assert_destructive_scan_allowed(pair.mode, &left, &right)?;
+        validate_name_mapping(left_root, right_root, &left.entries, &right.entries)?;
+    }
     let mut plan = if let Some(plan) = provided_plan {
         if plan.pair_id != pair.id {
             return Err("plan pair id does not match run pair".into());
@@ -415,6 +444,7 @@ where
             .map_err(|e| format!("scan right failed: {e}"))?;
 
         assert_destructive_scan_allowed(pair.mode, &left_scan, &right_scan)?;
+        validate_name_mapping(left_root, right_root, &left_scan.entries, &right_scan.entries)?;
 
         let snapshot = with_db(db, |db| db.latest_snapshot(&pair.id).map_err(|e| e.to_string()))?;
         let snapshot_entries = snapshot.as_ref().map(|s| s.entries.as_slice());
@@ -439,6 +469,26 @@ where
             },
         )
     };
+
+    // Old cached plans may still contain recursive directory deletions.
+    for action in &mut plan.actions {
+        let candidate = match action {
+            SyncAction::DeleteLeft { path } => Some((left_root, path.clone())),
+            SyncAction::DeleteRight { path } => Some((right_root, path.clone())),
+            _ => None,
+        };
+        if let Some((root, path)) = candidate {
+            match fs::symlink_metadata(join_relative(root, &path)) {
+                Ok(metadata) if metadata.is_dir() || metadata.file_type().is_symlink() => {
+                    *action = SyncAction::Skip { path, reason: "directory or link retained because it may contain excluded or unplanned files".into() };
+                }
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    return Err(format!("Cannot inspect planned deletion: {error}"))
+                }
+                _ => {}
+            }
+        }
+    }
 
     if plan.requires_attention
         && matches!(pair.mode, crate::models::SyncMode::Echo | crate::models::SyncMode::Synchronize)
@@ -483,6 +533,23 @@ where
         plan.actions.iter().filter(|a| !matches!(a, SyncAction::Skip { .. })).count() as u32;
 
     progress("running", 0, total, None, Some("Applying sync actions"));
+
+    for action in &plan.actions {
+        if let SyncAction::Skip { path, reason } = action {
+            run_items.push(RunItem {
+                id: Uuid::new_v4().to_string(),
+                run_id: run_id.to_string(),
+                path: path.clone(),
+                action: "skip".into(),
+                status: "skipped".into(),
+                message: Some(reason.clone()),
+                bytes: None,
+            });
+            if run_items.len() >= RUN_ITEM_BATCH_SIZE {
+                flush_run_items(db, &mut run_items)?;
+            }
+        }
+    }
 
     let mut stopped_on_error = false;
     let mut last_executed_path = None;
@@ -1059,6 +1126,47 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn staging_preserves_existing_sibling_and_cleans_failed_stage() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        let dest = dir.path().join("destination");
+        let sentinel = temp_copy_path(&dest);
+        fs::write(&source, b"new").unwrap();
+        fs::write(&dest, b"old").unwrap();
+        fs::write(&sentinel, b"sentinel").unwrap();
+        safe_copy_file(&source, &dest, true).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
+        assert!(safe_copy_file(&dir.path().join("missing"), &dest, true).is_err());
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn failed_commit_preserves_existing_destination_and_cleans_stage() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("existing-directory");
+        fs::write(&source, b"new").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("sentinel"), b"old").unwrap();
+        assert!(safe_copy_file(&source, &destination, true).is_err());
+        assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"old");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn planned_directory_removal_never_removes_new_contents() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("tree");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("protected"), b"keep").unwrap();
+        assert!(delete_path(&target, false).is_err());
+        assert_eq!(fs::read(target.join("protected")).unwrap(), b"keep");
+    }
+
+    #[test]
     fn temp_copy_path_appends_suffix() {
         let dest = PathBuf::from(r"C:\data\file.txt");
         assert_eq!(temp_copy_path(&dest), PathBuf::from(r"C:\data\file.txt.syncforge.tmp"));
@@ -1134,9 +1242,7 @@ mod tests {
         assert!(!right.join("file.txt").exists());
     }
 
-    /// On Windows, `rename(temp, dest)` fails when `dest` exists or paths are on
-    /// different volumes (e.g. `C:\` → `D:\`); we `fs::copy` over `dest` without
-    /// unlinking it first so a failed copy leaves the original bytes intact.
+    /// Windows replacement preserves the old destination until commit succeeds.
     #[test]
     #[cfg(windows)]
     fn commit_temp_file_replaces_existing_via_copy_fallback() {
@@ -1205,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    fn run_pair_impl_skips_initial_scan_when_plan_provided() {
+    fn run_pair_impl_rechecks_names_when_plan_provided() {
         use crate::commands::preview::preview_pair_impl;
         use crate::scanner::with_scan_counting;
 
@@ -1254,7 +1360,7 @@ mod tests {
             )
             .expect("run with plan")
         });
-        assert_eq!(run_scans, 2, "run with provided plan should only post-run scan left and right");
+        assert_eq!(run_scans, 4, "cached runs recheck names and capture the post-run snapshot");
 
         let (_, full_run_scans) = with_scan_counting(|| {
             run_pair_impl(
@@ -1370,7 +1476,7 @@ mod tests {
         )
         .expect_err("scan should fail");
 
-        assert!(err.contains("scan left failed"));
+        assert!(err.contains("Invalid folder pair: cannot resolve left folder"));
         let report = failed_report.expect("failed progress event");
         assert_eq!(report.status, RunStatus::Failed);
         assert!(report.finished_at.is_some());

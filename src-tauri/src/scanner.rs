@@ -86,6 +86,142 @@ pub fn assert_destructive_scan_allowed(
     ))
 }
 
+/// A spelling absent from a scan must also be absent on the opposite volume.
+/// This asks the destination filesystem about its own case rules, including
+/// per-directory case sensitivity, without rewriting names or snapshot keys.
+pub fn validate_name_mapping(
+    left_root: &Path,
+    right_root: &Path,
+    left: &[FileEntry],
+    right: &[FileEntry],
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        validate_prospective_windows_names(left, right_root)?;
+        validate_prospective_windows_names(right, left_root)?;
+    }
+    for (entries, other, other_root) in [(left, right, right_root), (right, left, left_root)] {
+        for entry in entries {
+            if other
+                .binary_search_by(|candidate| candidate.relative_path.cmp(&entry.relative_path))
+                .is_ok()
+            {
+                continue;
+            }
+            let path =
+                other_root.join(entry.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Ok(_) => return Err(format!("Cannot plan sync: '{}' maps to an existing unscanned or differently spelled entry. Review the names and filters.", entry.relative_path)),
+                Err(error) => return Err(format!("Cannot plan sync: cannot safely check name '{}': {error}", entry.relative_path)),
+            }
+        }
+    }
+    Ok(())
+}
+
+// Windows ordinal comparison reflects the platform's case mapping. A pair of
+// distinct incoming spellings may collide even while both targets are absent.
+// Until destination directory semantics are known, reject that ambiguity.
+#[cfg(windows)]
+fn validate_prospective_windows_names(
+    entries: &[FileEntry],
+    target_root: &Path,
+) -> Result<(), String> {
+    use std::cmp::Ordering;
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CompareStringOrdinal(
+            a: *const u16,
+            a_len: i32,
+            b: *const u16,
+            b_len: i32,
+            ignore_case: i32,
+        ) -> i32;
+    }
+    let mut names: Vec<(&str, Vec<u16>)> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.relative_path.as_str(),
+                std::ffi::OsStr::new(&entry.relative_path).encode_wide().collect(),
+            )
+        })
+        .collect();
+    let compare = |a: &[u16], b: &[u16]| -> Result<Ordering, String> {
+        let a_len = i32::try_from(a.len())
+            .map_err(|_| "Cannot safely compare a long file name".to_string())?;
+        let b_len = i32::try_from(b.len())
+            .map_err(|_| "Cannot safely compare a long file name".to_string())?;
+        match unsafe { CompareStringOrdinal(a.as_ptr(), a_len, b.as_ptr(), b_len, 1) } {
+            1 => Ok(Ordering::Less),
+            2 => Ok(Ordering::Equal),
+            3 => Ok(Ordering::Greater),
+            _ => Err("Cannot safely compare file names on this Windows filesystem".into()),
+        }
+    };
+    let mut comparison_failed = false;
+    names.sort_by(|a, b| {
+        compare(&a.1, &b.1).unwrap_or_else(|_| {
+            comparison_failed = true;
+            Ordering::Equal
+        })
+    });
+    if comparison_failed {
+        return Err("Cannot safely compare file names on this Windows filesystem".into());
+    }
+    for pair in names.windows(2) {
+        if pair[0].0 != pair[1].0 && compare(&pair[0].1, &pair[1].1)? == Ordering::Equal {
+            let mut parent = target_root.to_path_buf();
+            for (a, b) in pair[0].0.split('/').zip(pair[1].0.split('/')) {
+                if a != b {
+                    break;
+                }
+                parent.push(a);
+            }
+            if !windows_directory_case_sensitive(&parent)? {
+                return Err(format!("Cannot plan sync: names '{}' and '{}' may map to the same destination. Review the names.", pair[0].0, pair[1].0));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_directory_case_sensitive(path: &Path) -> Result<bool, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileCaseSensitiveInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS,
+    };
+    let dir = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(7)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|e| {
+            format!("Cannot establish destination case sensitivity for '{}': {e}", path.display())
+        })?;
+    let mut flags: u32 = 0;
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            dir.as_raw_handle() as _,
+            FileCaseSensitiveInfo,
+            (&mut flags as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "Cannot establish destination case sensitivity for '{}': {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(flags & 1 != 0)
+}
+
 /// Prefixes per-side scan warnings for inclusion in a sync plan.
 pub fn plan_scan_warnings(left: &ScanOutput, right: &ScanOutput) -> Vec<String> {
     let mut warnings = Vec::new();
@@ -356,6 +492,64 @@ mod tests {
         assert!(matches_filter_rules("sub/notes.txt", &filters));
         assert!(!matches_filter_rules("notes.tmp", &filters));
         assert!(!matches_filter_rules("image.png", &filters));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prospective_case_aliases_follow_destination_parent_semantics() {
+        let root = tempfile::TempDir::new().unwrap();
+        let seed = root.path().join("seed");
+        std::fs::write(&seed, b"a").unwrap();
+        let mut entry = scan_directory(root.path(), &Filters::default()).unwrap().entries.remove(0);
+        entry.relative_path = "Name".into();
+        let mut other = entry.clone();
+        other.relative_path = "name".into();
+        let sensitive = windows_directory_case_sensitive(root.path()).unwrap();
+        assert_eq!(
+            validate_prospective_windows_names(&[entry.clone(), other.clone()], root.path())
+                .is_ok(),
+            sensitive
+        );
+        assert_eq!(
+            validate_prospective_windows_names(&[other, entry], root.path()).is_ok(),
+            sensitive
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn name_mapping_rejects_dangling_symlink_without_modifying_it() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::TempDir::new().unwrap();
+        let left = root.path().join("left");
+        let right = root.path().join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("name"), b"source").unwrap();
+        let link = right.join("name");
+        symlink("missing-target", &link).unwrap();
+        let entries = scan_directory(&left, &Filters::default()).unwrap().entries;
+        assert!(validate_name_mapping(&left, &right, &entries, &[]).is_err());
+        assert_eq!(std::fs::read_link(&link).unwrap(), std::path::PathBuf::from("missing-target"));
+    }
+
+    #[test]
+    fn name_mapping_uses_destination_filesystem_rules() {
+        let root = tempfile::TempDir::new().unwrap();
+        let left = root.path().join("left");
+        let right = root.path().join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("Name"), b"a").unwrap();
+        std::fs::write(right.join("name"), b"b").unwrap();
+        let l = scan_directory(&left, &Filters::default()).unwrap();
+        let r = scan_directory(&right, &Filters::default()).unwrap();
+        let result = validate_name_mapping(&left, &right, &l.entries, &r.entries);
+        if right.join("Name").exists() {
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok());
+        }
     }
 
     #[test]

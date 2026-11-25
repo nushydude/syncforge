@@ -90,6 +90,19 @@ pub fn paths_equal(a: &str, b: &str) -> bool {
     }
 }
 
+/// Resolve both execution roots before scanning or writing. Canonicalization rejects
+/// unresolved paths and resolves ordinary aliases and dot components.
+pub fn validate_pair_roots(left: &std::path::Path, right: &std::path::Path) -> Result<(), String> {
+    let left = std::fs::canonicalize(left)
+        .map_err(|e| format!("Invalid folder pair: cannot resolve left folder: {e}"))?;
+    let right = std::fs::canonicalize(right)
+        .map_err(|e| format!("Invalid folder pair: cannot resolve right folder: {e}"))?;
+    if pair_roots_nested(&left.to_string_lossy(), &right.to_string_lossy()) {
+        return Err("Invalid folder pair: choose separate folders; the sync roots must not be the same or nested.".into());
+    }
+    Ok(())
+}
+
 /// Converts a path to an extended-length Windows path when beneficial.
 pub fn to_long_path(path: &str) -> String {
     let normalized = normalize_path(path);
@@ -144,6 +157,20 @@ fn normalize_windows_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_roots_reject_equal_and_nested_but_accept_siblings() {
+        let root = tempfile::TempDir::new().unwrap();
+        let left = root.path().join("left");
+        let nested = left.join("nested");
+        let right = root.path().join("right");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        assert!(validate_pair_roots(&left, &left).is_err());
+        assert!(validate_pair_roots(&left, &nested).is_err());
+        assert!(validate_pair_roots(&nested, &left).is_err());
+        assert!(validate_pair_roots(&left, &right).is_ok());
+    }
 
     #[test]
     fn empty_path_normalizes_to_empty() {

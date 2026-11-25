@@ -12,7 +12,9 @@ use crate::models::{
 };
 use crate::path_normalization;
 use crate::persistence::DatabaseHandle;
-use crate::scanner::{assert_destructive_scan_allowed, scan_directory_observed, ScanIntegrity};
+use crate::scanner::{
+    assert_destructive_scan_allowed, scan_directory_observed, validate_name_mapping, ScanIntegrity,
+};
 use crate::state::{
     canonical_job_roots, AppState, HeavyJobKind, HeavyJobPermit, WorkCoordinator, WorkRequest,
     PREVIEW_PAGE_MAX,
@@ -113,6 +115,7 @@ pub(crate) fn build_preview_observed(
 
     let left_path = path_normalization::to_long_path(&pair.left_path);
     let right_path = path_normalization::to_long_path(&pair.right_path);
+    path_normalization::validate_pair_roots(Path::new(&left_path), Path::new(&right_path))?;
 
     let mut left_scan = scan_directory_observed(
         Path::new(&left_path),
@@ -130,6 +133,12 @@ pub(crate) fn build_preview_observed(
     .map_err(|e| format!("scan right failed: {e}"))?;
 
     assert_destructive_scan_allowed(pair.mode, &left_scan, &right_scan)?;
+    validate_name_mapping(
+        Path::new(&left_path),
+        Path::new(&right_path),
+        &left_scan.entries,
+        &right_scan.entries,
+    )?;
 
     let scan = ScanIntegrity::from_sides(&left_scan, &right_scan);
 

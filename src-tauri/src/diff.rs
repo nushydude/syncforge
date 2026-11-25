@@ -129,7 +129,22 @@ pub fn build_sync_plan(
     }
 
     ensure_parent_dirs(&mut actions, mode, left, right);
-    collapse_redundant_directory_deletes(&mut actions, left, right);
+    // A filtered scan cannot establish complete membership of a physical tree.
+    // Retain directories explicitly while allowing eligible file deletions.
+    for action in &mut actions {
+        let blocked = match action {
+            SyncAction::DeleteLeft { path } => contains_directory(left, path),
+            SyncAction::DeleteRight { path } => contains_directory(right, path),
+            _ => false,
+        };
+        if blocked {
+            *action = SyncAction::Skip {
+                path: action_path(action).to_string(),
+                reason: "directory retained because it may contain excluded or unplanned files"
+                    .into(),
+            };
+        }
+    }
     sort_actions(&mut actions);
 
     let hash_warnings = ctx.hash_warnings.borrow().clone();
@@ -484,32 +499,6 @@ fn sort_actions(actions: &mut [SyncAction]) {
     actions.sort_by(|a, b| action_path(a).cmp(action_path(b)));
 }
 
-fn collapse_redundant_directory_deletes(
-    actions: &mut Vec<SyncAction>,
-    left: &[FileEntry],
-    right: &[FileEntry],
-) {
-    let mut deleted_dirs = HashSet::new();
-    actions.retain(|action| {
-        let (path, side, is_dir) = match action {
-            SyncAction::DeleteLeft { path } => {
-                (path, EntrySide::Left, contains_directory(left, path))
-            }
-            SyncAction::DeleteRight { path } => {
-                (path, EntrySide::Right, contains_directory(right, path))
-            }
-            _ => return true,
-        };
-        if parent_paths(path).into_iter().any(|parent| deleted_dirs.contains(&(side, parent))) {
-            return false;
-        }
-        if is_dir {
-            deleted_dirs.insert((side, path.clone()));
-        }
-        true
-    });
-}
-
 fn action_path(action: &SyncAction) -> &str {
     match action {
         SyncAction::CopyLeftToRight { path }
@@ -719,6 +708,56 @@ pub fn apply_conflict_resolutions(
 mod tests {
     use super::*;
     use crate::models::ConflictPolicy;
+
+    #[test]
+    fn synchronize_one_sided_directories_are_created_on_the_other_side() {
+        for (left, right, create_right) in
+            [(vec![dir("folder")], vec![], true), (vec![], vec![dir("folder")], false)]
+        {
+            let plan = build_sync_plan(
+                "pair",
+                SyncMode::Synchronize,
+                ConflictPolicy::NewerWins,
+                &left,
+                &right,
+                Some(&[dir("folder")]),
+                ScanIntegrity::default(),
+                DiffOptions::default(),
+            );
+            assert_eq!(plan.actions.len(), 1);
+            if create_right {
+                assert!(
+                    matches!(&plan.actions[0], SyncAction::CreateDirRight { path } if path == "folder")
+                );
+            } else {
+                assert!(
+                    matches!(&plan.actions[0], SyncAction::CreateDirLeft { path } if path == "folder")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn echo_retains_directory_but_plans_visible_leaf_deletion() {
+        let right = vec![dir("folder"), file("folder/eligible.txt", 1, 1)];
+        let plan = build_sync_plan(
+            "pair",
+            SyncMode::Echo,
+            ConflictPolicy::NewerWins,
+            &[],
+            &right,
+            None,
+            ScanIntegrity::default(),
+            DiffOptions::default(),
+        );
+        assert!(plan
+            .actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::Skip { path, .. } if path == "folder")));
+        assert!(plan.actions.iter().any(
+            |a| matches!(a, SyncAction::DeleteRight { path } if path == "folder/eligible.txt")
+        ));
+    }
 
     fn file(path: &str, size: u64, modified: i64) -> FileEntry {
         file_with_nanos(path, size, modified, 0)

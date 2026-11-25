@@ -17,11 +17,11 @@ fn validate_pair_paths(left: &str, right: &str) -> Result<(), String> {
         return Ok(());
     }
     if path_normalization::paths_equal(left, right) {
-        return Err("left and right folders must be different".into());
+        return Err("Invalid folder pair: left and right folders must be different".into());
     }
     if path_normalization::pair_roots_nested(left, right) {
         return Err(
-            "folder pair roots cannot be nested: one path must not be inside the other".into()
+            "Invalid folder pair: folder pair roots cannot be nested: one path must not be inside the other".into()
         );
     }
     Ok(())
