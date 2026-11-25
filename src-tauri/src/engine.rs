@@ -162,17 +162,13 @@ fn ensure_parent(path: &Path) -> io::Result<()> {
 /// Commit a verified sibling stage without truncating the current destination.
 /// A failed rename leaves the destination in place; Windows uses its replace API.
 pub(crate) fn commit_temp_file(temp: &Path, dest: &Path) -> io::Result<()> {
-    match fs::rename(temp, dest) {
-        Ok(()) => return Ok(()),
-        Err(error) => {
-            #[cfg(not(windows))]
-            return Err(error);
-            #[cfg(windows)]
-            let _ = error;
-        }
+    let renamed = fs::rename(temp, dest);
+    #[cfg(not(windows))]
+    {
+        renamed
     }
     #[cfg(windows)]
-    {
+    renamed.or_else(|_| {
         use std::os::windows::ffi::OsStrExt;
         let temp_wide: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
         let dest_wide: Vec<u16> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -189,7 +185,7 @@ pub(crate) fn commit_temp_file(temp: &Path, dest: &Path) -> io::Result<()> {
         } else {
             Err(io::Error::last_os_error())
         }
-    }
+    })
 }
 
 #[cfg(test)]

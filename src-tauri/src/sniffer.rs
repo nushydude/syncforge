@@ -298,7 +298,7 @@ fn os_bytes(value: &OsStr) -> Vec<u8> {
 fn bytes_os(value: &[u8]) -> OsString {
     use std::os::windows::ffi::OsStringExt;
     OsString::from_wide(
-        &value.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>(),
+        &value.as_chunks::<2>().0.iter().copied().map(u16::from_le_bytes).collect::<Vec<_>>(),
     )
 }
 #[cfg(unix)]
