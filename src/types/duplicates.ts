@@ -10,30 +10,49 @@ export type DuplicateScanStatus =
 export type DuplicateScanPhase = "collecting" | "hashing" | "finalizing";
 
 export interface DuplicateFile {
+  id?: string;
+  fingerprint?: string;
   relativePath: string;
   name: string;
   size: number;
   hash?: string;
 }
 
-export interface DuplicateGroup {
-  key: string;
-  files: DuplicateFile[];
-  potentialSavingsBytes: number;
-}
-
-export interface DuplicateScanResult {
+export interface DuplicateResultSummary {
+  revision: string;
+  cleanupAvailable: boolean;
   root: string;
   mode: DuplicateMatchMode;
   scannedFiles: number;
   hashedFiles: number;
   skippedFiles: number;
   potentialSavingsBytes: number;
-  groups: DuplicateGroup[];
+  groupCount: number;
   warnings: string[];
+}
+export interface DuplicateGroupSummary {
+  id: string;
+  key: string;
+  fileCount: number;
+  potentialSavingsBytes: number;
+  firstSize: number;
+}
+export interface DuplicateGroupsPage {
+  revision: string;
+  groups: DuplicateGroupSummary[];
+  nextCursor: number | null;
+}
+export interface DuplicateMembersPage {
+  revision: string;
+  groupId: string;
+  files: DuplicateFile[];
+  nextCursor: number | null;
 }
 
 export interface DuplicateScanJob {
+  attempt: number;
+  sequence: number;
+  summary: DuplicateResultSummary | null;
   id: string;
   root: string;
   mode: DuplicateMatchMode;
@@ -47,13 +66,7 @@ export interface DuplicateScanJob {
   bytesTotal: number | null;
   currentPath: string | null;
   cancelRequested: boolean;
-  result: DuplicateScanResult | null;
   error: string | null;
   startedAt: number;
   updatedAt: number;
-}
-
-export interface DuplicateCleanupResult {
-  removed: string[];
-  errors: string[];
 }

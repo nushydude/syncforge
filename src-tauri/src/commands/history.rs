@@ -82,7 +82,7 @@ pub async fn export_history_run(
             .dialog()
             .file()
             .set_file_name(&filename)
-            .add_filter(&format.to_uppercase(), &[&format])
+            .add_filter(format.to_uppercase(), &[&format])
             .blocking_save_file()
         else {
             return Ok(false);

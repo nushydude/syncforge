@@ -11,7 +11,7 @@ A modern desktop folder-sync tool (SyncToy replacement) built with **Tauri 2**, 
 - **Conflict policies** — Newer-wins, left/right, keep-both, or prompt
 - **Real-time watch** — Auto-sync on file changes with debouncing
 - **Scheduling** — Cron-based runs with desktop notifications
-- **History** — Past runs with detail view and CSV/JSON export
+- **History** — Paged run details and complete CSV/JSON exports
 
 Echo removes eligible files from the right folder and records retained directories as skipped. This preserves excluded or unreviewed contents. SyncForge stops a preview or run when the roots overlap or a filename could refer to two different entries on the destination filesystem.
 
@@ -21,7 +21,7 @@ Preview and Sync verify file contents in chunks and can cancel during verificati
 
 If Watch loses access to one folder, that pair pauses while other pairs keep watching. SyncForge retries the registration and checks for changes once both folders are available again.
 
-The Duplicates workspace can find candidate copies by exact content hash, file size, or filename, then move reviewed files to the Recycle Bin. Hash scanning streams file contents and only hashes files that share a size, so large files are not loaded into memory.
+The Duplicates workspace finds candidate copies by exact content hash, file size, or filename. Use **Open in Explorer** to review one candidate before deciding whether to remove it there. Hash scanning streams file contents and only hashes files that share a size, so large files are not loaded into memory.
 
 ## Installation
 

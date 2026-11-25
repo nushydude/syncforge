@@ -1,18 +1,21 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { pickFolder } from "../../api/pairs";
 import {
   cancelDuplicateScan,
   getDuplicateScan,
-  removeDuplicates,
+  getDuplicateGroupsPage,
+  getDuplicateMembersPage,
+  revealDuplicate,
   resumeDuplicateScan,
   startDuplicateScan,
 } from "../../api/duplicates";
 import type {
-  DuplicateGroup,
+  DuplicateGroupSummary,
+  DuplicateGroupsPage,
+  DuplicateMembersPage,
   DuplicateMatchMode,
   DuplicateScanJob,
-  DuplicateScanResult,
 } from "../../types";
 
 const DUPLICATE_PROGRESS_EVENT = "syncforge://duplicates-progress";
@@ -50,10 +53,12 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
 }
 
-function groupTitle(group: DuplicateGroup, mode: DuplicateMatchMode): string {
-  const first = group.files[0];
+function groupTitle(
+  group: DuplicateGroupSummary,
+  mode: DuplicateMatchMode,
+): string {
   if (mode === "filename") return `Filename: ${group.key}`;
-  if (mode === "size") return `Size: ${formatBytes(first?.size ?? 0)}`;
+  if (mode === "size") return `Size: ${formatBytes(group.firstSize)}`;
   return `Hash: ${group.key.slice(0, 16)}...`;
 }
 
@@ -121,21 +126,101 @@ export function DuplicatesView() {
   const [mode, setMode] = useState<DuplicateMatchMode>("hash");
   const [job, setJob] = useState<DuplicateScanJob | null>(null);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+  const [selectedScope, setSelectedScope] = useState("");
   const [cleaning, setCleaning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
+  const [handoffMessage, setHandoffMessage] = useState<string | null>(null);
+  const handoffStatusRef = useRef<HTMLParagraphElement>(null);
   const [loadingJob, setLoadingJob] = useState(true);
+  const lastSequence = useRef(-1);
+  const latestJob = useRef<DuplicateScanJob | null>(null);
+  const pendingFailure = useRef<{
+    jobId: string;
+    attempt: number;
+    message: string;
+  } | null>(null);
+  const [groupCursor, setGroupCursor] = useState(0);
+  const [memberCursor, setMemberCursor] = useState(0);
+  const [groupPage, setGroupPage] = useState<DuplicateGroupsPage | null>(null);
+  const [memberPage, setMemberPage] = useState<DuplicateMembersPage | null>(
+    null,
+  );
+  const [activeGroup, setActiveGroup] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [retryPage, setRetryPage] = useState(0);
+  useEffect(() => {
+    if (handoffMessage) handoffStatusRef.current?.focus();
+  }, [handoffMessage]);
+
+  const acceptJob = useCallback((next: DuplicateScanJob) => {
+    if (next.sequence <= lastSequence.current) return;
+    lastSequence.current = next.sequence;
+    const failure = pendingFailure.current;
+    if (
+      failure &&
+      next.id === failure.jobId &&
+      next.attempt === failure.attempt &&
+      next.status === "running"
+    ) {
+      next = { ...next, status: "interrupted", error: failure.message };
+    } else if (
+      failure &&
+      (next.id !== failure.jobId ||
+        next.attempt !== failure.attempt ||
+        next.status !== "running")
+    ) {
+      pendingFailure.current = null;
+    }
+    latestJob.current = next;
+    setJob(next);
+    setRoot(next.root);
+    setMode(next.mode);
+  }, []);
 
   useEffect(() => {
     let active = true;
     let unlisten: (() => void) | undefined;
+    let stopFailure: (() => void) | undefined;
+    const failureListener = listen<{
+      jobId: string;
+      attempt: number;
+      message: string;
+    }>("syncforge://duplicates-persistence-error", (event) => {
+      if (!active) return;
+      const failure = event.payload;
+      const current = latestJob.current;
+      if (
+        current &&
+        (current.id !== failure.jobId ||
+          current.attempt !== failure.attempt ||
+          current.status !== "running")
+      )
+        return;
+      pendingFailure.current = failure;
+      if (current) {
+        const overlay: DuplicateScanJob = {
+          ...current,
+          status: "interrupted",
+          error: failure.message,
+        };
+        latestJob.current = overlay;
+        setJob(overlay);
+      }
+    });
+    void failureListener
+      .then((stop) => {
+        if (active) stopFailure = stop;
+        else stop();
+      })
+      .catch((reason) => {
+        if (active)
+          setError(`Could not listen for scan errors: ${String(reason)}`);
+      });
     const unlistenPromise = listen<DuplicateScanJob>(
       DUPLICATE_PROGRESS_EVENT,
       (event) => {
         if (!active) return;
-        setJob(event.payload);
-        setRoot(event.payload.root);
-        setMode(event.payload.mode);
+        acceptJob(event.payload);
       },
     );
 
@@ -149,9 +234,7 @@ export function DuplicatesView() {
         ) {
           return;
         }
-        setJob(savedJob);
-        setRoot(savedJob.root);
-        setMode(savedJob.mode);
+        acceptJob(savedJob);
       })
       .catch((loadError) => {
         if (active) setError(String(loadError));
@@ -160,37 +243,125 @@ export function DuplicatesView() {
         if (active) setLoadingJob(false);
       });
 
-    void unlistenPromise.then((stop) => {
-      if (active) unlisten = stop;
-      else stop();
-    });
+    void unlistenPromise
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      })
+      .catch((reason) => {
+        if (active)
+          setError(`Could not listen for scan updates: ${String(reason)}`);
+      });
 
     return () => {
       active = false;
       unlisten?.();
-      void unlistenPromise.then((stop) => stop());
+      stopFailure?.();
     };
-  }, []);
+  }, [acceptJob]);
 
-  const result: DuplicateScanResult | null = job?.result ?? null;
+  useEffect(() => {
+    if (job?.status !== "running") return;
+    let active = true;
+    let inFlight = false;
+    const refresh = () => {
+      if (inFlight) return;
+      inFlight = true;
+      void getDuplicateScan()
+        .then((snapshot) => {
+          if (active && snapshot) acceptJob(snapshot);
+        })
+        .catch((reason) => {
+          if (active)
+            setError(`Could not refresh scan status: ${String(reason)}`);
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 2000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [job?.id, job?.attempt, job?.status, acceptJob]);
+
+  const result = job?.summary ?? null;
   const scanning = job?.status === "running";
+  const cleanupAvailable =
+    !!result?.cleanupAvailable && job?.status === "completed";
+
+  useEffect(() => {
+    setSelectedPaths(new Set());
+    setHandoffMessage(null);
+    setGroupCursor(0);
+    setMemberCursor(0);
+    setGroupPage(null);
+    setMemberPage(null);
+    setActiveGroup(null);
+  }, [job?.id, result?.revision]);
+
+  useEffect(() => {
+    if (!job?.id || !result?.revision) return;
+    let active = true;
+    setPageError(null);
+    void getDuplicateGroupsPage(job.id, result.revision, groupCursor)
+      .then((page) => {
+        if (!active) return;
+        setGroupPage(page);
+        setActiveGroup(page.groups[0]?.id ?? null);
+        setMemberCursor(0);
+        setSelectedPaths(new Set());
+      })
+      .catch((e) => {
+        if (active) setPageError(String(e));
+      });
+    return () => {
+      active = false;
+    };
+  }, [job?.id, result?.revision, groupCursor, retryPage]);
+
+  useEffect(() => {
+    if (!job?.id || !result?.revision || !activeGroup) return;
+    let active = true;
+    setPageError(null);
+    void getDuplicateMembersPage(
+      job.id,
+      result.revision,
+      activeGroup,
+      memberCursor,
+    )
+      .then((page) => {
+        if (active) {
+          setMemberPage(page);
+          setSelectedPaths(new Set());
+        }
+      })
+      .catch((e) => {
+        if (active) setPageError(String(e));
+      });
+    return () => {
+      active = false;
+    };
+  }, [job?.id, result?.revision, activeGroup, memberCursor, retryPage]);
+
   const cancelling = scanning && job.cancelRequested;
-  const selectedCount = selectedPaths.size;
-  const selectedBytes = useMemo(() => {
-    if (!result) return 0;
-    return result.groups.reduce(
-      (total, group) =>
-        total +
-        group.files.reduce(
-          (groupTotal, file) =>
-            selectedPaths.has(file.relativePath)
-              ? groupTotal + file.size
-              : groupTotal,
-          0,
-        ),
-      0,
-    );
-  }, [result, selectedPaths]);
+  const selectionScope = `${job?.id ?? ""}:${result?.revision ?? ""}:${activeGroup ?? ""}:${memberCursor}`;
+  const selectionValid = selectedScope === selectionScope;
+  const selectedCount = selectionValid ? selectedPaths.size : 0;
+  const selectedBytes = useMemo(
+    () =>
+      memberPage?.files.reduce(
+        (total, file) =>
+          total +
+          (selectionValid && file.id && selectedPaths.has(file.id)
+            ? file.size
+            : 0),
+        0,
+      ) ?? 0,
+    [memberPage, selectedPaths, selectionValid],
+  );
 
   async function scan() {
     const trimmedRoot = root.trim();
@@ -199,12 +370,11 @@ export function DuplicatesView() {
       return;
     }
     setError(null);
-    setCleanupMessage(null);
+    setHandoffMessage(null);
     setSelectedPaths(new Set());
     try {
       const nextJob = await startDuplicateScan(trimmedRoot, mode);
-      setJob(nextJob);
-      setRoot(nextJob.root);
+      acceptJob(nextJob);
     } catch (scanError) {
       setError(String(scanError));
     }
@@ -216,9 +386,7 @@ export function DuplicatesView() {
     setSelectedPaths(new Set());
     try {
       const nextJob = await resumeDuplicateScan(job.id);
-      setJob(nextJob);
-      setRoot(nextJob.root);
-      setMode(nextJob.mode);
+      acceptJob(nextJob);
     } catch (resumeError) {
       setError(String(resumeError));
     }
@@ -227,8 +395,8 @@ export function DuplicatesView() {
   async function cancelScan() {
     if (!job || !scanning || cancelling) return;
     try {
-      const nextJob = await cancelDuplicateScan(job.id);
-      if (nextJob) setJob(nextJob);
+      const nextJob = await cancelDuplicateScan(job.id, job.attempt);
+      if (nextJob) acceptJob(nextJob);
     } catch (cancelError) {
       setError(String(cancelError));
     }
@@ -240,45 +408,28 @@ export function DuplicatesView() {
   }
 
   function togglePath(path: string) {
+    setSelectedScope(selectionScope);
     setSelectedPaths((current) => {
-      const next = new Set(current);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
+      if (selectionValid && current.has(path)) return new Set<string>();
+      return new Set([path]);
     });
   }
 
-  function selectAllCopies() {
-    if (!result) return;
-    const paths = new Set<string>();
-    for (const group of result.groups) {
-      for (const file of group.files.slice(1)) paths.add(file.relativePath);
-    }
-    setSelectedPaths(paths);
-  }
-
-  async function moveSelectedToRecycleBin() {
-    if (!result || selectedCount === 0) return;
-    const confirmed = window.confirm(
-      `Move ${selectedCount} selected file${selectedCount === 1 ? "" : "s"} to the Recycle Bin?`,
-    );
-    if (!confirmed) return;
-
+  async function openSelectedInExplorer() {
+    if (!result?.revision || !job || !cleanupAvailable || selectedCount !== 1)
+      return;
+    const [itemId] = selectedPaths;
     setCleaning(true);
     setError(null);
-    setCleanupMessage(null);
+    setHandoffMessage(null);
     try {
-      const cleanup = await removeDuplicates(result.root, [...selectedPaths]);
-      if (cleanup.errors.length > 0) setError(cleanup.errors.join(" "));
-      if (cleanup.removed.length > 0) {
-        setCleanupMessage(
-          `Moved ${cleanup.removed.length} file${cleanup.removed.length === 1 ? "" : "s"} to the Recycle Bin.`,
-        );
-        setSelectedPaths(new Set());
-        await scan();
-      }
-    } catch (cleanupError) {
-      setError(String(cleanupError));
+      await revealDuplicate(job.id, result.revision, itemId);
+      setHandoffMessage(
+        "Explorer request sent. Find and review the file there before removing it.",
+      );
+      setSelectedPaths(new Set());
+    } catch (handoffError) {
+      setError(String(handoffError));
     } finally {
       setCleaning(false);
     }
@@ -294,7 +445,7 @@ export function DuplicatesView() {
           <h2>Find duplicate files</h2>
           <p>
             Scan one folder, review duplicate candidates, and move unwanted
-            copies to the Recycle Bin.
+            copies in Explorer.
           </p>
         </div>
       </header>
@@ -362,15 +513,6 @@ export function DuplicatesView() {
                 Resume scan
               </button>
             )}
-          {result && result.groups.length > 0 && result.mode === "hash" && (
-            <button
-              type="button"
-              onClick={selectAllCopies}
-              disabled={scanning || cleaning}
-            >
-              Select all but first
-            </button>
-          )}
         </div>
       </div>
 
@@ -418,9 +560,15 @@ export function DuplicatesView() {
           {error}
         </p>
       )}
-      {cleanupMessage && (
-        <p className="form-success" role="status">
-          {cleanupMessage}
+      {handoffMessage && (
+        <p ref={handoffStatusRef} role="status" tabIndex={-1}>
+          {handoffMessage}
+        </p>
+      )}
+      {result && !cleanupAvailable && (
+        <p className="form-warning">
+          You can browse these results. Opening a reviewed file in Explorer
+          requires a fresh Windows scan.
         </p>
       )}
 
@@ -432,7 +580,7 @@ export function DuplicatesView() {
               <span>files scanned</span>
             </div>
             <div>
-              <strong>{result.groups.length.toLocaleString()}</strong>
+              <strong>{result.groupCount.toLocaleString()}</strong>
               <span>duplicate groups</span>
             </div>
             <div>
@@ -464,49 +612,125 @@ export function DuplicatesView() {
             </details>
           )}
 
-          {result.groups.length === 0 ? (
+          {result.groupCount === 0 ? (
             <p className="duplicates-empty">
               No duplicate candidates found with this matching method.
             </p>
           ) : (
             <div className="duplicate-groups">
-              {result.groups.map((group) => (
-                <article
-                  className="duplicate-group"
-                  key={`${group.key}-${group.files[0]?.relativePath}`}
+              {pageError && (
+                <p role="alert">
+                  Could not load results: {pageError}{" "}
+                  <button
+                    type="button"
+                    onClick={() => setRetryPage((n) => n + 1)}
+                  >
+                    Retry
+                  </button>
+                </p>
+              )}
+              <nav aria-label="Duplicate groups">
+                {groupPage?.revision === result.revision &&
+                  groupPage.groups.map((group) => (
+                    <button
+                      type="button"
+                      key={group.id}
+                      aria-pressed={activeGroup === group.id}
+                      onClick={() => {
+                        setActiveGroup(group.id);
+                        setMemberCursor(0);
+                        setMemberPage(null);
+                        setSelectedPaths(new Set());
+                      }}
+                    >
+                      {groupTitle(group, result.mode)} ({group.fileCount})
+                    </button>
+                  ))}
+                <button
+                  type="button"
+                  disabled={cleaning || groupCursor === 0}
+                  onClick={() => {
+                    setGroupPage(null);
+                    setMemberPage(null);
+                    setGroupCursor(Math.max(0, groupCursor - 50));
+                  }}
                 >
-                  <header className="duplicate-group-header">
-                    <div>
-                      <h3>{groupTitle(group, result.mode)}</h3>
-                      <p>
-                        {group.files.length} files -{" "}
-                        {formatBytes(group.potentialSavingsBytes)} potential
-                        savings
-                      </p>
-                    </div>
-                  </header>
-                  <ul className="duplicate-file-list">
-                    {group.files.map((file) => (
-                      <li key={file.relativePath}>
-                        <label className="duplicate-file-row">
-                          <input
-                            type="checkbox"
-                            checked={selectedPaths.has(file.relativePath)}
-                            onChange={() => togglePath(file.relativePath)}
-                            disabled={cleaning}
-                          />
-                          <span className="duplicate-file-path">
-                            {file.relativePath}
-                          </span>
-                          <span className="duplicate-file-size">
-                            {formatBytes(file.size)}
-                          </span>
-                        </label>
-                      </li>
-                    ))}
-                  </ul>
-                </article>
-              ))}
+                  Previous groups
+                </button>
+                <button
+                  type="button"
+                  disabled={cleaning || groupPage?.nextCursor == null}
+                  onClick={() => {
+                    if (groupPage?.nextCursor != null) {
+                      setGroupPage(null);
+                      setMemberPage(null);
+                      setGroupCursor(groupPage.nextCursor);
+                    }
+                  }}
+                >
+                  Next groups
+                </button>
+              </nav>
+              {memberPage?.revision === result.revision &&
+                memberPage.groupId === activeGroup && (
+                  <article className="duplicate-group">
+                    <ul className="duplicate-file-list">
+                      {memberPage.files.map((file) => (
+                        <li key={file.id ?? file.relativePath}>
+                          <label className="duplicate-file-row">
+                            <input
+                              type="radio"
+                              name="duplicate-file-selection"
+                              checked={
+                                selectionValid &&
+                                !!file.id &&
+                                selectedPaths.has(file.id)
+                              }
+                              onChange={() => file.id && togglePath(file.id)}
+                              disabled={
+                                cleaning ||
+                                !cleanupAvailable ||
+                                !file.id ||
+                                !file.fingerprint
+                              }
+                            />
+                            <span className="duplicate-file-path">
+                              {file.relativePath}
+                            </span>
+                            <span className="duplicate-file-size">
+                              {formatBytes(file.size)}
+                            </span>
+                          </label>
+                        </li>
+                      ))}
+                    </ul>
+                    <button
+                      type="button"
+                      disabled={cleaning || memberCursor === 0}
+                      onClick={() => {
+                        setMemberPage(null);
+                        setSelectedPaths(new Set());
+                        setMemberCursor(Math.max(0, memberCursor - 50));
+                      }}
+                    >
+                      Previous files
+                    </button>
+                    <button
+                      type="button"
+                      disabled={cleaning || memberPage.nextCursor == null}
+                      onClick={() => {
+                        if (memberPage.nextCursor != null) {
+                          const next = memberPage.nextCursor;
+                          setMemberPage(null);
+                          setSelectedPaths(new Set());
+                          setMemberCursor(next);
+                        }
+                      }}
+                    >
+                      Next files
+                    </button>
+                  </article>
+                )}
             </div>
           )}
 
@@ -517,11 +741,11 @@ export function DuplicatesView() {
               </span>
               <button
                 type="button"
-                className="btn-danger"
-                onClick={() => void moveSelectedToRecycleBin()}
+                className="btn-primary"
+                onClick={() => void openSelectedInExplorer()}
                 disabled={cleaning}
               >
-                {cleaning ? "Moving..." : "Move selected to Recycle Bin"}
+                {cleaning ? "Opening..." : "Open in Explorer"}
               </button>
             </div>
           )}
