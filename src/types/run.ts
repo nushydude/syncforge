@@ -21,13 +21,17 @@ export interface SyncProgress {
 }
 
 export interface RunPairOptions {
+  intent: RunIntent;
   verifyHashes?: boolean;
   useRecycleBin?: boolean;
   conflictResolutions?: Record<string, ConflictChoice>;
   /** Overrides the folder pair's error handling for this run. */
   stopOnError?: boolean;
-  planId?: string;
 }
+
+export type RunIntent =
+  | { kind: "fresh" }
+  | { kind: "reviewed"; planId: string };
 
 /** Emitted when a debounced watch run is skipped (conflicts, errors). */
 export interface WatchSkippedNotice {

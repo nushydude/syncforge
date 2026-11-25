@@ -8,7 +8,7 @@ use tauri::State;
 
 use crate::diff::{build_sync_plan, DiffOptions};
 use crate::models::{
-    FileEntry, FolderPair, PreviewActionPage, PreviewSummary, SyncAction, SyncPlan,
+    FileEntry, FolderPair, PreviewActionPage, PreviewSummary, SyncAction, SyncBaseline, SyncPlan,
 };
 use crate::path_normalization;
 use crate::persistence::DatabaseHandle;
@@ -78,9 +78,10 @@ pub(crate) fn admit_preview(
 ///
 /// Uses `pair` for scan paths, filters, mode, and conflict policy (editor draft).
 /// `snapshot_entries` must be loaded under a short DB lock before calling this function.
+#[cfg(test)]
 pub(crate) fn preview_pair_impl(
     pair: &FolderPair,
-    snapshot_entries: Option<&[FileEntry]>,
+    snapshot_entries: Option<&SyncBaseline>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<SyncPlan, String> {
     build_preview(pair, snapshot_entries, cancel).map(|(plan, _, _)| plan)
@@ -95,19 +96,45 @@ fn silent_reporter() -> ScanReporter {
 
 pub(crate) fn build_preview(
     pair: &FolderPair,
-    snapshot_entries: Option<&[FileEntry]>,
+    snapshot_entries: Option<&SyncBaseline>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(SyncPlan, Vec<FileEntry>, Vec<FileEntry>), String> {
-    build_preview_observed(pair, snapshot_entries, cancel, &silent_reporter())
+    build_preview_inner(
+        pair,
+        snapshot_entries,
+        cancel,
+        Some(Arc::clone(cancel)),
+        &silent_reporter(),
+        true,
+    )
 }
 
 /// `on_scan` receives `(phase, count, latest path)` through every phase of the
 /// preview — walking, comparing, and hashing — so a long pass never looks frozen.
 pub(crate) fn build_preview_observed(
     pair: &FolderPair,
-    snapshot_entries: Option<&[FileEntry]>,
+    snapshot_entries: Option<&SyncBaseline>,
     cancel: &Arc<AtomicBool>,
     on_scan: &ScanReporter,
+) -> Result<(SyncPlan, Vec<FileEntry>, Vec<FileEntry>), String> {
+    build_preview_inner(pair, snapshot_entries, cancel, Some(Arc::clone(cancel)), on_scan, true)
+}
+
+pub(crate) fn build_fresh_plan(
+    pair: &FolderPair,
+    baseline: Option<&SyncBaseline>,
+    cancel: &AtomicBool,
+) -> Result<(SyncPlan, Vec<FileEntry>, Vec<FileEntry>), String> {
+    build_preview_inner(pair, baseline, cancel, None, &silent_reporter(), false)
+}
+
+fn build_preview_inner(
+    pair: &FolderPair,
+    snapshot_entries: Option<&SyncBaseline>,
+    cancel: &AtomicBool,
+    owned_cancel: Option<Arc<AtomicBool>>,
+    on_scan: &ScanReporter,
+    bounded: bool,
 ) -> Result<(SyncPlan, Vec<FileEntry>, Vec<FileEntry>), String> {
     if pair.id.is_empty() {
         return Err("pair id required for preview".into());
@@ -153,7 +180,7 @@ pub(crate) fn build_preview_observed(
         DiffOptions {
             left_root: Some(Path::new(&left_path).to_path_buf()),
             right_root: Some(Path::new(&right_path).to_path_buf()),
-            cancel: Some(Arc::clone(cancel)),
+            cancel: owned_cancel,
             hash_progress: Some({
                 let reporter = Arc::clone(on_scan);
                 Arc::new(move |files, path: &str| reporter("comparing", files, path))
@@ -178,6 +205,7 @@ pub(crate) fn build_preview_observed(
         &plan.actions,
         &mut preview_hash_bytes,
         &mut preview_hash_files,
+        bounded,
         cancel,
         pair.continue_on_error.then_some(&mut plan.preview_file_errors),
         &mut |files, path| on_scan("hashing left", files, path),
@@ -189,6 +217,7 @@ pub(crate) fn build_preview_observed(
         &plan.actions,
         &mut preview_hash_bytes,
         &mut preview_hash_files,
+        bounded,
         cancel,
         pair.continue_on_error.then_some(&mut plan.preview_file_errors),
         &mut |files, path| on_scan("hashing right", files, path),
@@ -209,7 +238,8 @@ fn populate_preview_hashes_for_actions(
     actions: &[SyncAction],
     hashed_bytes: &mut u64,
     hashed_files: &mut usize,
-    cancel: &Arc<AtomicBool>,
+    bounded: bool,
+    cancel: &AtomicBool,
     mut file_errors: Option<&mut BTreeMap<String, String>>,
     on_hash: &mut dyn FnMut(u64, &str),
 ) -> Result<(), String> {
@@ -254,7 +284,7 @@ fn populate_preview_hashes_for_actions(
         if !is_selected || entry.is_dir || entry.size == 0 {
             continue;
         }
-        if entry.size > PREVIEW_HASH_MAX_BYTES {
+        if bounded && entry.size > PREVIEW_HASH_MAX_BYTES {
             return Err(format!(
                 "preview cannot safely validate large file at {}; reduce the workload or preview again",
                 entry.relative_path
@@ -262,8 +292,9 @@ fn populate_preview_hashes_for_actions(
         }
         *hashed_bytes = (*hashed_bytes).saturating_add(entry.size);
         *hashed_files += 1;
-        if *hashed_bytes > PREVIEW_SUBTREE_HASH_MAX_BYTES
-            || *hashed_files > PREVIEW_SUBTREE_HASH_MAX_FILES
+        if bounded
+            && (*hashed_bytes > PREVIEW_SUBTREE_HASH_MAX_BYTES
+                || *hashed_files > PREVIEW_SUBTREE_HASH_MAX_FILES)
         {
             return Err("preview content exceeds the bounded validation budget".into());
         }
@@ -288,15 +319,6 @@ fn populate_preview_hashes_for_actions(
         }
     }
     Ok(())
-}
-
-fn load_preview_snapshot(
-    db: &dyn DatabaseHandle,
-    pair_id: &str,
-) -> Result<Option<Vec<FileEntry>>, String> {
-    db.latest_snapshot(pair_id)
-        .map_err(|e| e.to_string())
-        .map(|snapshot| snapshot.map(|s| s.entries))
 }
 
 /// Scan heartbeat so the UI can show a long walk is alive.
@@ -331,7 +353,11 @@ pub async fn preview_pair(
     let cancel_state = Arc::clone(&state);
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _permit = admit_preview(&work_coordinator, roots)?;
-        let snapshot_entries = load_preview_snapshot(db.as_ref(), &pair.id)?;
+        let root_keys = path_normalization::pair_root_keys(
+            Path::new(&pair.left_path),
+            Path::new(&pair.right_path),
+        )?;
+        let baseline = db.load_sync_baseline(&pair, &root_keys).map_err(|e| e.to_string())?;
         let progress_pair_id = pair.id.clone();
         let last_event = std::sync::Mutex::new(None::<std::time::Instant>);
         let reporter: ScanReporter = Arc::new(move |side: &str, entries, path: &str| {
@@ -360,7 +386,7 @@ pub async fn preview_pair(
             );
         });
         let (plan, left_preconditions, right_preconditions) =
-            build_preview_observed(&pair, snapshot_entries.as_deref(), &cancel, &reporter)?;
+            build_preview_observed(&pair, baseline.baseline.as_ref(), &cancel, &reporter)?;
         let created_at = now_millis();
         let fingerprint = config_fingerprint(&pair);
         let mut summary = preview_summary(&plan, String::new(), fingerprint.clone(), created_at);
@@ -368,9 +394,17 @@ pub async fn preview_pair(
         let plan_id = previews.insert(
             pair.id.clone(),
             fingerprint.clone(),
-            plan,
-            left_preconditions,
-            right_preconditions,
+            crate::engine::PreparedPlan {
+                plan,
+                preconditions: crate::engine::PlanPreconditions {
+                    left: left_preconditions,
+                    right: right_preconditions,
+                },
+                root_keys,
+                baseline_generation: baseline.generation,
+                baseline_revision: baseline.baseline.map(|b| b.revision),
+                bounded: true,
+            },
             created_at,
         )?;
         summary.plan_id = plan_id;
@@ -489,10 +523,15 @@ mod tests {
         db: &Database,
         pair: &FolderPair,
     ) -> Result<crate::models::SyncPlan, String> {
-        let snapshot_entries = super::load_preview_snapshot(db, &pair.id)?;
+        let keys = crate::path_normalization::pair_root_keys(
+            std::path::Path::new(&pair.left_path),
+            std::path::Path::new(&pair.right_path),
+        )?;
+        let baseline = crate::persistence::DatabaseHandle::load_sync_baseline(db, pair, &keys)
+            .map_err(|e| e.to_string())?;
         super::preview_pair_impl(
             pair,
-            snapshot_entries.as_deref(),
+            baseline.baseline.as_ref(),
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
     }
@@ -602,14 +641,30 @@ mod tests {
         drop(lock);
         let lock = (!lock_before_preview).then(lock_file);
 
+        let root_keys = crate::path_normalization::pair_root_keys(&left, &right).unwrap();
+        let baseline =
+            crate::persistence::DatabaseHandle::load_sync_baseline(&db, &pair, &root_keys).unwrap();
         let options = RunOptions {
-            plan: Some(plan),
-            plan_preconditions: Some(PlanPreconditions {
-                left: left_preconditions,
-                right: right_preconditions,
+            prepared: Some(crate::engine::PreparedPlan {
+                plan,
+                preconditions: PlanPreconditions {
+                    left: left_preconditions,
+                    right: right_preconditions,
+                },
+                root_keys,
+                baseline_generation: baseline.generation,
+                baseline_revision: baseline.baseline.map(|b| b.revision),
+                bounded: true,
             }),
             ..RunOptions::default()
         };
+        if !lock_before_preview {
+            let error = run_pair_impl(&db, &pair, options, &cancel, |_| {})
+                .expect_err("lost evidence must reject the preview");
+            assert!(error.starts_with("Preview needs refreshing:"));
+            assert!(!right.join("ok.txt").exists());
+            return;
+        }
         let report = run_pair_impl(&db, &pair, options, &cancel, |_| {}).expect("run preview");
         assert_eq!(report.status, RunStatus::CompletedWithErrors);
         assert_eq!(report.files_copied, 1);

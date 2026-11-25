@@ -103,6 +103,50 @@ pub fn validate_pair_roots(left: &std::path::Path, right: &std::path::Path) -> R
     Ok(())
 }
 
+/// Ordered canonical root identities used to bind planning and execution.
+pub fn pair_root_keys(
+    left: &std::path::Path,
+    right: &std::path::Path,
+) -> Result<[String; 2], String> {
+    validate_pair_roots(left, right)?;
+    let key = |path: &std::path::Path| -> Result<String, String> {
+        let value =
+            std::fs::canonicalize(path).map_err(|e| e.to_string())?.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let value = value.to_lowercase();
+        let identity =
+            root_identity(path).map_err(|e| format!("Cannot identify sync root: {e}"))?;
+        Ok(format!("{value}|{identity}"))
+    };
+    Ok([key(left)?, key(right)?])
+}
+
+#[cfg(unix)]
+fn root_identity(path: &std::path::Path) -> std::io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    Ok(format!("{}:{}", meta.dev(), meta.ino()))
+}
+
+#[cfg(windows)]
+fn root_identity(path: &std::path::Path) -> std::io::Result<String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0x80)
+        .share_mode(7)
+        .custom_flags(0x0200_0000)
+        .open(path)?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(format!("{}:{}:{}", info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow))
+}
+
 /// Converts a path to an extended-length Windows path when beneficial.
 pub fn to_long_path(path: &str) -> String {
     let normalized = normalize_path(path);

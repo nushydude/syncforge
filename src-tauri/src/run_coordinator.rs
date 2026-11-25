@@ -1,10 +1,11 @@
+use crate::persistence::DatabaseHandle;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter};
 
-use crate::commands::preview::preview_pair_impl;
+use crate::commands::preview::build_preview;
 use crate::engine::{run_pair_impl, RunOptions};
 use crate::models::{ConflictPolicy, RunStatus, SyncAction};
 use crate::notifications::{notify_sync_error, notify_sync_report};
@@ -190,15 +191,30 @@ pub(crate) fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: Stri
         let run_result = (|| -> Result<(), String> {
             let _permit = permit;
 
-            let snapshot_entries =
-                db.latest_snapshot(&pair.id).map_err(|e| e.to_string())?.map(|s| s.entries);
-            let plan = preview_pair_impl(&pair, snapshot_entries.as_deref(), &cancel)?;
+            let root_keys = crate::path_normalization::pair_root_keys(
+                std::path::Path::new(&pair.left_path),
+                std::path::Path::new(&pair.right_path),
+            )?;
+            let baseline = db.load_sync_baseline(&pair, &root_keys).map_err(|e| e.to_string())?;
+            let (plan, left, right) = build_preview(&pair, baseline.baseline.as_ref(), &cancel)?;
+            let prepared = crate::engine::PreparedPlan {
+                plan,
+                preconditions: crate::engine::PlanPreconditions { left, right },
+                root_keys,
+                baseline_generation: baseline.generation,
+                baseline_revision: baseline.baseline.map(|b| b.revision),
+                bounded: true,
+            };
 
-            if watch_plan_is_empty(&plan.actions) {
+            if watch_plan_is_empty(&prepared.plan.actions)
+                && pair.mode != crate::models::SyncMode::Synchronize
+            {
                 return Ok(());
             }
 
-            if pair.conflict_policy == ConflictPolicy::Ask && plan_has_conflicts(&plan.actions) {
+            if pair.conflict_policy == ConflictPolicy::Ask
+                && plan_has_conflicts(&prepared.plan.actions)
+            {
                 let _ = emit_event(
                     &app_emit,
                     "sync://watch-skipped",
@@ -214,7 +230,7 @@ pub(crate) fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: Stri
                 verify_hashes: false,
                 use_recycle_bin: true,
                 conflict_resolutions: Default::default(),
-                plan: Some(plan),
+                prepared: Some(prepared),
                 ..Default::default()
             };
 
@@ -303,11 +319,24 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
             let _permit = permit;
             let pair_name = pair.name.clone();
 
-            let snapshot_entries =
-                db.latest_snapshot(&pair.id).map_err(|e| e.to_string())?.map(|s| s.entries);
-            let plan = preview_pair_impl(&pair, snapshot_entries.as_deref(), &cancel)?;
+            let root_keys = crate::path_normalization::pair_root_keys(
+                std::path::Path::new(&pair.left_path),
+                std::path::Path::new(&pair.right_path),
+            )?;
+            let baseline = db.load_sync_baseline(&pair, &root_keys).map_err(|e| e.to_string())?;
+            let (plan, left, right) = build_preview(&pair, baseline.baseline.as_ref(), &cancel)?;
+            let prepared = crate::engine::PreparedPlan {
+                plan,
+                preconditions: crate::engine::PlanPreconditions { left, right },
+                root_keys,
+                baseline_generation: baseline.generation,
+                baseline_revision: baseline.baseline.map(|b| b.revision),
+                bounded: true,
+            };
 
-            if pair.conflict_policy == ConflictPolicy::Ask && plan_has_conflicts(&plan.actions) {
+            if pair.conflict_policy == ConflictPolicy::Ask
+                && plan_has_conflicts(&prepared.plan.actions)
+            {
                 notify_sync_error(
                     &app_emit,
                     &pair_name,
@@ -320,7 +349,7 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
                 verify_hashes: false,
                 use_recycle_bin: true,
                 conflict_resolutions: Default::default(),
-                plan: Some(plan),
+                prepared: Some(prepared),
                 ..Default::default()
             };
 

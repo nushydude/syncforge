@@ -83,7 +83,7 @@ function App() {
         </div>
       </header>
       <div className="app-view" hidden={view !== "pairs"}>
-        <PairsPanel />
+        <PairsPanel active={view === "pairs"} />
       </div>
       <div className="app-view" hidden={view !== "sniffer"}>
         <FolderSnifferView />

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-use crate::models::{PreviewActionPage, SyncPlan};
+use crate::models::PreviewActionPage;
 use crate::persistence::{DatabaseManager, PersistenceError};
 use crate::scheduler::ScheduleService;
 use crate::sniffer::SnifferService;
@@ -26,9 +26,7 @@ struct StoredPreviewPlan {
     pair_id: String,
     config_fingerprint: String,
     created_at: i64,
-    plan: SyncPlan,
-    left_preconditions: Vec<crate::models::FileEntry>,
-    right_preconditions: Vec<crate::models::FileEntry>,
+    prepared: crate::engine::PreparedPlan,
     conflict_indexes: Vec<usize>,
     estimated_bytes: usize,
 }
@@ -47,13 +45,14 @@ impl PreviewPlanStore {
         &mut self,
         pair_id: String,
         config_fingerprint: String,
-        plan: SyncPlan,
-        left_preconditions: Vec<crate::models::FileEntry>,
-        right_preconditions: Vec<crate::models::FileEntry>,
+        prepared: crate::engine::PreparedPlan,
         now: i64,
     ) -> Result<String, String> {
         self.remove_expired(now);
         let id = uuid::Uuid::new_v4().to_string();
+        let plan = &prepared.plan;
+        let left_preconditions = &prepared.preconditions.left;
+        let right_preconditions = &prepared.preconditions.right;
         let estimated_bytes = serde_json::to_vec(&plan).map(|bytes| bytes.len()).unwrap_or(0)
             + serde_json::to_vec(&left_preconditions).map(|bytes| bytes.len()).unwrap_or(0)
             + serde_json::to_vec(&right_preconditions).map(|bytes| bytes.len()).unwrap_or(0)
@@ -79,9 +78,7 @@ impl PreviewPlanStore {
             pair_id,
             config_fingerprint,
             created_at: now,
-            plan,
-            left_preconditions,
-            right_preconditions,
+            prepared,
             conflict_indexes,
             estimated_bytes,
         });
@@ -106,17 +103,21 @@ impl PreviewPlanStore {
             .plans
             .iter()
             .find(|plan| plan.id == id)
-            .ok_or_else(|| "preview plan expired or not found".to_string())?;
+            .ok_or_else(|| "Preview needs refreshing: plan expired or not found".to_string())?;
         if stored.pair_id != pair_id || stored.config_fingerprint != config_fingerprint {
-            return Err("preview plan no longer matches this pair configuration".into());
+            return Err(
+                "Preview needs refreshing: plan no longer matches this pair configuration".into()
+            );
         }
-        let cursor = cursor.min(stored.plan.actions.len());
-        let end = cursor.saturating_add(limit.min(PREVIEW_PAGE_MAX)).min(stored.plan.actions.len());
+        let cursor = cursor.min(stored.prepared.plan.actions.len());
+        let end = cursor
+            .saturating_add(limit.min(PREVIEW_PAGE_MAX))
+            .min(stored.prepared.plan.actions.len());
         Ok(PreviewActionPage {
             plan_id: stored.id.clone(),
             cursor,
-            next_cursor: (end < stored.plan.actions.len()).then_some(end),
-            actions: stored.plan.actions[cursor..end].to_vec(),
+            next_cursor: (end < stored.prepared.plan.actions.len()).then_some(end),
+            actions: stored.prepared.plan.actions[cursor..end].to_vec(),
         })
     }
 
@@ -137,16 +138,18 @@ impl PreviewPlanStore {
             .plans
             .iter()
             .find(|plan| plan.id == id)
-            .ok_or_else(|| "preview plan expired or not found".to_string())?;
+            .ok_or_else(|| "Preview needs refreshing: plan expired or not found".to_string())?;
         if stored.pair_id != pair_id || stored.config_fingerprint != config_fingerprint {
-            return Err("preview plan no longer matches this pair configuration".into());
+            return Err(
+                "Preview needs refreshing: plan no longer matches this pair configuration".into()
+            );
         }
         let page_limit = limit.min(PREVIEW_PAGE_MAX);
         let cursor = cursor.min(stored.conflict_indexes.len());
         let end = cursor.saturating_add(page_limit).min(stored.conflict_indexes.len());
         let actions = stored.conflict_indexes[cursor..end]
             .iter()
-            .map(|index| stored.plan.actions[*index].clone())
+            .map(|index| stored.prepared.plan.actions[*index].clone())
             .collect();
         Ok(PreviewActionPage {
             plan_id: stored.id.clone(),
@@ -162,21 +165,22 @@ impl PreviewPlanStore {
         pair_id: &str,
         config_fingerprint: &str,
         now: i64,
-    ) -> Result<(SyncPlan, Vec<crate::models::FileEntry>, Vec<crate::models::FileEntry>), String>
-    {
+    ) -> Result<crate::engine::PreparedPlan, String> {
         self.remove_expired(now);
         let index = self
             .plans
             .iter()
             .position(|plan| plan.id == id)
-            .ok_or_else(|| "preview plan expired or not found".to_string())?;
+            .ok_or_else(|| "Preview needs refreshing: plan expired or not found".to_string())?;
         let stored = self.plans.get(index).expect("preview index exists");
         if stored.pair_id != pair_id || stored.config_fingerprint != config_fingerprint {
-            return Err("preview plan no longer matches this pair configuration".into());
+            return Err(
+                "Preview needs refreshing: plan no longer matches this pair configuration".into()
+            );
         }
         let stored = self.plans.remove(index).expect("preview index exists");
         self.bytes = self.bytes.saturating_sub(stored.estimated_bytes);
-        Ok((stored.plan, stored.left_preconditions, stored.right_preconditions))
+        Ok(stored.prepared)
     }
 
     fn remove_expired(&mut self, now: i64) {
@@ -691,7 +695,7 @@ mod tests {
     #[test]
     fn preview_plan_store_pages_bounds_and_validates_handles() {
         let mut store = PreviewPlanStore::new();
-        let plan = SyncPlan {
+        let plan = crate::models::SyncPlan {
             pair_id: "pair-a".into(),
             actions: (0..=PREVIEW_PAGE_MAX)
                 .map(|index| crate::models::SyncAction::Skip {
@@ -708,7 +712,19 @@ mod tests {
             preview_file_errors: Default::default(),
         };
         let id = store
-            .insert("pair-a".into(), "fingerprint-a".into(), plan, vec![], vec![], 100)
+            .insert(
+                "pair-a".into(),
+                "fingerprint-a".into(),
+                crate::engine::PreparedPlan {
+                    plan,
+                    preconditions: crate::engine::PlanPreconditions { left: vec![], right: vec![] },
+                    root_keys: [String::new(), String::new()],
+                    baseline_generation: None,
+                    baseline_revision: None,
+                    bounded: true,
+                },
+                100,
+            )
             .expect("store plan");
         let first = store
             .get_page(&id, "pair-a", "fingerprint-a", 0, PREVIEW_PAGE_MAX + 50, 101)

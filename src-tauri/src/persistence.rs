@@ -31,7 +31,8 @@ pub fn fail_next_run_item_batch() {
 
 use crate::duplicates::{self, DuplicateScanJob};
 use crate::models::{
-    ConflictPolicy, FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot, SyncMode,
+    ConflictPolicy, FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot, SyncBaseline,
+    SyncBaselineView, SyncMode,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +69,30 @@ pub struct DatabaseManager {
 /// Implementations must keep filesystem work and JSON processing outside their
 /// own database critical section where possible.
 pub trait DatabaseHandle {
+    fn load_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+    ) -> Result<SyncBaselineView>;
+    #[allow(dead_code)] // Retained for legacy baseline callers and tests.
+    fn save_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+    ) -> Result<bool>;
+    fn save_sync_baseline_and_run(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+        report: &RunReport,
+    ) -> Result<bool>;
+    #[allow(dead_code)] // Retained for legacy history consumers.
     fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>>;
     fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()>;
     fn save_run(&self, report: &RunReport) -> Result<()>;
@@ -181,6 +206,12 @@ impl Database {
                  ON run_items(run_id, action, path COLLATE NOCASE, id);",
         )?;
 
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sync_baselines (
+            pair_id TEXT PRIMARY KEY NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+            generation TEXT NOT NULL, root_keys_json TEXT, revision TEXT, entries_json TEXT
+        );",
+        )?;
         self.migrate_watch_enabled()?;
         self.migrate_schedule_fields()?;
         self.migrate_continue_on_error()?;
@@ -497,7 +528,13 @@ impl Database {
         let mode = sync_mode_to_str(pair.mode);
         let conflict_policy = conflict_policy_to_str(pair.conflict_policy);
 
-        self.conn.execute(
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let previous = self.get_pair(&pair.id)?;
+        let scope_changed = previous.as_ref().is_none_or(|old| !same_sync_scope(old, pair));
+        tx.execute(
             "INSERT INTO pairs (
                 id, name, left_path, right_path, mode, filters_json, conflict_policy,
                 enabled, watch_enabled, schedule_enabled, schedule_cron, created_at, updated_at,
@@ -534,7 +571,132 @@ impl Database {
             ],
         )?;
 
+        if scope_changed {
+            tx.execute(
+                "INSERT INTO sync_baselines (pair_id, generation) VALUES (?1, ?2)
+                ON CONFLICT(pair_id) DO UPDATE SET generation = excluded.generation,
+                root_keys_json = NULL, revision = NULL, entries_json = NULL",
+                params![pair.id, Uuid::new_v4().to_string()],
+            )?;
+        }
+        tx.commit()?;
         self.get_pair(&pair.id)?.ok_or_else(|| PersistenceError::PairNotFound(pair.id.clone()))
+    }
+
+    pub fn load_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+    ) -> Result<SyncBaselineView> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !self.get_pair(&pair.id)?.as_ref().is_some_and(|saved| same_sync_scope(saved, pair)) {
+            tx.commit()?;
+            return Ok(SyncBaselineView { generation: None, baseline: None });
+        }
+        let roots = serde_json::to_string(root_keys)?;
+        type BaselineRow = (String, Option<String>, Option<String>, Option<String>);
+        let row: Option<BaselineRow> = tx.query_row(
+            "SELECT generation, root_keys_json, revision, entries_json FROM sync_baselines WHERE pair_id = ?1",
+            params![pair.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+        let (generation, revision, entries) = match row {
+            Some((generation, Some(old_roots), revision, entries)) if old_roots == roots => {
+                (generation, revision, entries)
+            }
+            other => {
+                let generation = match other {
+                    Some((generation, None, _, _)) => generation,
+                    _ => Uuid::new_v4().to_string(),
+                };
+                tx.execute("INSERT INTO sync_baselines (pair_id, generation, root_keys_json) VALUES (?1, ?2, ?3)
+                    ON CONFLICT(pair_id) DO UPDATE SET generation=excluded.generation, root_keys_json=excluded.root_keys_json, revision=NULL, entries_json=NULL",
+                    params![pair.id, generation, roots])?;
+                (generation, None, None)
+            }
+        };
+        tx.commit()?;
+        let baseline = match (revision, entries) {
+            (Some(revision), Some(entries)) => {
+                Some(SyncBaseline { revision, entries: serde_json::from_str(&entries)? })
+            }
+            _ => None,
+        };
+        Ok(SyncBaselineView { generation: Some(generation), baseline })
+    }
+
+    pub fn save_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+    ) -> Result<bool> {
+        let roots = serde_json::to_string(root_keys)?;
+        let json = serde_json::to_string(entries)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !self.get_pair(&pair.id)?.as_ref().is_some_and(|saved| same_sync_scope(saved, pair)) {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE sync_baselines SET revision=CASE WHEN entries_json=?2 THEN revision ELSE ?1 END, entries_json=?2
+            WHERE pair_id=?3 AND generation=?4 AND root_keys_json=?5 AND revision IS ?6",
+            params![
+                Uuid::new_v4().to_string(),
+                json,
+                pair.id,
+                expected_generation,
+                roots,
+                expected_revision
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_sync_baseline_and_run(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+        report: &RunReport,
+    ) -> Result<bool> {
+        if report.pair_id != pair.id
+            || report.status != RunStatus::Completed
+            || report.finished_at.is_none()
+        {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
+        let roots = serde_json::to_string(root_keys)?;
+        let json = serde_json::to_string(entries)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !self.get_pair(&pair.id)?.as_ref().is_some_and(|saved| same_sync_scope(saved, pair)) {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE sync_baselines SET revision=CASE WHEN entries_json=?2 THEN revision ELSE ?1 END, entries_json=?2 WHERE pair_id=?3 AND generation=?4 AND root_keys_json=?5 AND revision IS ?6",
+            params![Uuid::new_v4().to_string(), json, pair.id, expected_generation, roots, expected_revision],
+        )?;
+        if changed != 1 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        self.save_run(report)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn delete_pair(&self, id: &str) -> Result<()> {
@@ -629,6 +791,7 @@ impl Database {
         Ok(None)
     }
 
+    #[allow(dead_code)] // Supports the retained legacy history facade.
     fn latest_snapshot_json(&self, pair_id: &str) -> Result<Option<(String, String, i64, String)>> {
         self.conn
             .query_row(
@@ -917,6 +1080,7 @@ impl DatabaseManager {
     pub fn get_pair(&self, id: &str) -> Result<Option<FolderPair>> {
         self.read(|db| db.get_pair(id))
     }
+    #[allow(dead_code)] // Retained for legacy history consumers.
     pub fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
         let raw = self.read(|db| db.latest_snapshot_json(pair_id))?;
         raw.map(|(id, pair_id, captured_at, entries_json)| {
@@ -968,7 +1132,57 @@ impl DatabaseManager {
     }
 }
 
+fn same_sync_scope(a: &FolderPair, b: &FolderPair) -> bool {
+    a.left_path == b.left_path
+        && a.right_path == b.right_path
+        && a.mode == b.mode
+        && a.filters == b.filters
+}
+
 impl DatabaseHandle for Database {
+    fn load_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+    ) -> Result<SyncBaselineView> {
+        Database::load_sync_baseline(self, pair, root_keys)
+    }
+    fn save_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+    ) -> Result<bool> {
+        Database::save_sync_baseline(
+            self,
+            pair,
+            root_keys,
+            expected_generation,
+            expected_revision,
+            entries,
+        )
+    }
+    fn save_sync_baseline_and_run(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+        report: &RunReport,
+    ) -> Result<bool> {
+        Database::save_sync_baseline_and_run(
+            self,
+            pair,
+            root_keys,
+            expected_generation,
+            expected_revision,
+            entries,
+            report,
+        )
+    }
     fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
         Database::latest_snapshot(self, pair_id)
     }
@@ -984,6 +1198,45 @@ impl DatabaseHandle for Database {
 }
 
 impl DatabaseHandle for DatabaseManager {
+    fn load_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+    ) -> Result<SyncBaselineView> {
+        self.write(|db| db.load_sync_baseline(pair, root_keys))
+    }
+    fn save_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+    ) -> Result<bool> {
+        self.write(|db| {
+            db.save_sync_baseline(pair, root_keys, expected_generation, expected_revision, entries)
+        })
+    }
+    fn save_sync_baseline_and_run(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+        report: &RunReport,
+    ) -> Result<bool> {
+        self.write(|db| {
+            db.save_sync_baseline_and_run(
+                pair,
+                root_keys,
+                expected_generation,
+                expected_revision,
+                entries,
+                report,
+            )
+        })
+    }
     fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
         self.latest_snapshot(pair_id)
     }
@@ -1002,6 +1255,47 @@ impl DatabaseHandle for DatabaseManager {
 
 #[cfg(test)]
 impl DatabaseHandle for Mutex<Database> {
+    fn load_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+    ) -> Result<SyncBaselineView> {
+        self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.load_sync_baseline(pair, root_keys)
+    }
+    fn save_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+    ) -> Result<bool> {
+        self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.save_sync_baseline(
+            pair,
+            root_keys,
+            expected_generation,
+            expected_revision,
+            entries,
+        )
+    }
+    fn save_sync_baseline_and_run(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+        report: &RunReport,
+    ) -> Result<bool> {
+        self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.save_sync_baseline_and_run(
+            pair,
+            root_keys,
+            expected_generation,
+            expected_revision,
+            entries,
+            report,
+        )
+    }
     fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
         self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.latest_snapshot(pair_id)
     }
@@ -1156,6 +1450,126 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = Database::open(&path).expect("open db");
         (dir, db)
+    }
+
+    #[test]
+    fn trusted_baseline_is_scoped_cas_and_preserves_legacy_history() {
+        let (_dir, db) = temp_db();
+        let mut pair = FolderPair {
+            id: new_pair_id(),
+            name: "test".into(),
+            left_path: "/a".into(),
+            right_path: "/b".into(),
+            mode: SyncMode::Synchronize,
+            filters: Filters::default(),
+            conflict_policy: ConflictPolicy::Ask,
+            enabled: true,
+            continue_on_error: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        db.save_pair(&pair).unwrap();
+        let entry = FileEntry {
+            relative_path: "f".into(),
+            size: 1,
+            modified_secs: 1,
+            modified_nanos: 0,
+            is_dir: false,
+            hash: Some("hash".into()),
+            deleted: false,
+        };
+        let snapshot = Snapshot {
+            id: "legacy".into(),
+            pair_id: pair.id.clone(),
+            captured_at: 1,
+            entries: vec![entry.clone()],
+        };
+        db.save_snapshot(&snapshot).unwrap();
+        // Simulate an existing installation upgraded without a trusted row.
+        db.conn.execute("DELETE FROM sync_baselines WHERE pair_id=?1", params![pair.id]).unwrap();
+        let roots = ["root-a".into(), "root-b".into()];
+        let view = db.load_sync_baseline(&pair, &roots).unwrap();
+        assert!(view.baseline.is_none());
+        let generation = view.generation.unwrap();
+        let entries = vec![(entry.clone(), entry)];
+        assert!(db.save_sync_baseline(&pair, &roots, &generation, None, &entries).unwrap());
+        assert!(!db.save_sync_baseline(&pair, &roots, &generation, None, &entries).unwrap());
+        let revision = db.load_sync_baseline(&pair, &roots).unwrap().baseline.unwrap().revision;
+        let mut report = RunReport {
+            run_id: "atomic-run".into(),
+            pair_id: pair.id.clone(),
+            started_at: 1,
+            finished_at: None,
+            status: RunStatus::Running,
+            files_copied: 0,
+            files_deleted: 0,
+            bytes_transferred: 0,
+            errors: vec![],
+        };
+        db.save_run(&report).unwrap();
+        report.status = RunStatus::Completed;
+        report.finished_at = Some(2);
+        assert!(!db
+            .save_sync_baseline_and_run(&pair, &roots, &generation, None, &entries, &report)
+            .unwrap());
+        assert_eq!(db.get_run("atomic-run").unwrap().unwrap().status, RunStatus::Running);
+        assert!(db
+            .save_sync_baseline_and_run(
+                &pair,
+                &roots,
+                &generation,
+                Some(&revision),
+                &entries,
+                &report
+            )
+            .unwrap());
+        assert_eq!(
+            db.load_sync_baseline(&pair, &roots).unwrap().baseline.unwrap().revision,
+            revision
+        );
+        assert_eq!(db.get_run("atomic-run").unwrap().unwrap().status, RunStatus::Completed);
+        db.conn.execute_batch("CREATE TRIGGER reject_terminal BEFORE UPDATE ON runs BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        let mut changed_entries = entries.clone();
+        changed_entries[0].0.modified_secs += 1;
+        assert!(db
+            .save_sync_baseline_and_run(
+                &pair,
+                &roots,
+                &generation,
+                Some(&revision),
+                &changed_entries,
+                &report
+            )
+            .is_err());
+        assert_eq!(
+            db.load_sync_baseline(&pair, &roots).unwrap().baseline.unwrap().revision,
+            revision
+        );
+        db.conn.execute_batch("DROP TRIGGER reject_terminal;").unwrap();
+        let mut draft = pair.clone();
+        draft.filters.exclude.push("*.tmp".into());
+        assert!(db.load_sync_baseline(&draft, &roots).unwrap().generation.is_none());
+        assert!(!db
+            .save_sync_baseline(&draft, &roots, &generation, Some(&revision), &entries)
+            .unwrap());
+        pair.filters.exclude.push("*.tmp".into());
+        db.save_pair(&pair).unwrap();
+        pair.filters.exclude.clear();
+        db.save_pair(&pair).unwrap();
+        let after = db.load_sync_baseline(&pair, &roots).unwrap();
+        assert_ne!(after.generation.as_deref(), Some(generation.as_str()));
+        assert!(after.baseline.is_none());
+        assert!(!db
+            .save_sync_baseline(&pair, &roots, &generation, Some(&revision), &entries)
+            .unwrap());
+        assert_eq!(db.latest_snapshot(&pair.id).unwrap().unwrap(), snapshot);
+        let changed_roots = ["other".into(), "root-b".into()];
+        let changed = db.load_sync_baseline(&pair, &changed_roots).unwrap();
+        let returned = db.load_sync_baseline(&pair, &roots).unwrap();
+        assert_ne!(changed.generation, returned.generation);
     }
 
     #[test]

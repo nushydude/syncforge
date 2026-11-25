@@ -64,7 +64,11 @@ function activeLabel(
  * The shared work queue. Scans and syncs both walk the disk, so they run one at
  * a time in the order they were requested.
  */
-export function RunQueuePanel() {
+export function RunQueuePanel({
+  onResolveConflict,
+}: {
+  onResolveConflict: (planId: string) => void;
+}) {
   const runState = useRunStore(selectQueue);
   const activePreview = usePairsStore(
     useCallback(
@@ -119,12 +123,15 @@ export function RunQueuePanel() {
             <span className="run-queue-status">
               {activeLabel(runState, activePreview)}
             </span>
-            {getPairRun(runState, runState.activePairId)?.status ===
-              "awaitingInput" && (
+            {runState.pendingConflicts && (
               <button
                 type="button"
                 className="btn-primary"
-                onClick={() => selectPair(runState.activePairId!)}
+                onClick={() => {
+                  if (runState.pendingConflicts) {
+                    onResolveConflict(runState.pendingConflicts.planId);
+                  }
+                }}
               >
                 Resolve
               </button>

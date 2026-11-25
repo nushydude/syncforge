@@ -1,16 +1,16 @@
 import { listen } from "@tauri-apps/api/event";
 import * as previewApi from "../api/preview";
 import * as runApi from "../api/run";
-import {
-  listConflictActions,
-  type ConflictAction,
-} from "../lib/conflictPolicy";
+import type { ConflictAction } from "../lib/conflictPolicy";
 import {
   clearPairPreview,
+  getPairEditRevision,
   getPairPreview,
   isPreviewLoadingForPair,
+  isPreviewRefreshRequired,
   markPreviewQueued,
   previewPairById,
+  requireFreshPreview,
   setPreviewError,
   setLastSyncedAt,
 } from "./pairsStore";
@@ -18,6 +18,7 @@ import type {
   ConflictChoice,
   FolderPair,
   RunReport,
+  RunPairOptions,
   SyncProgress,
   WatchSkippedNotice,
 } from "../types";
@@ -26,11 +27,12 @@ import { getAppSettings } from "./settingsStore";
 export interface PendingConflicts {
   pair: FolderPair;
   conflicts: ConflictAction[];
-  planId?: string;
+  planId: string;
   cursor: number;
   nextCursor?: number;
   total: number;
   loading: boolean;
+  pageError?: { cursor: number; message: string; stale: boolean };
 }
 
 /**
@@ -109,6 +111,13 @@ let unlistenWatchSkipped: (() => void) | null = null;
 
 /** Full pair snapshots for queued ids — the run uses the config as queued. */
 const queuedPairs = new Map<string, FolderPair>();
+interface QueuedSync {
+  options: RunPairOptions;
+  pairEditRevision: number;
+  conflictCount?: number;
+  choicesReady?: boolean;
+}
+const queuedSyncs = new Map<string, QueuedSync>();
 /** UI-initiated run ownership — progress events must match to update state. */
 const activeRunIds = new Map<string, string | null>();
 /** Active pairs whose backend run has not started yet — cancels abort locally. */
@@ -270,6 +279,7 @@ function finishRun(
 ): void {
   activeRunIds.delete(pairId);
   queuedPairs.delete(queueKey({ pairId, kind: "sync" }));
+  queuedSyncs.delete(pairId);
   pendingStarts.delete(pairId);
   abortRequested.delete(pairId);
   patchRun(pairId, { status, finishedAt: Date.now(), ...patch });
@@ -292,14 +302,6 @@ function statusFromReport(report: RunReport): SettledRunStatus {
   }
 }
 
-/** Backend errors that mean "the cached plan is gone" — a fresh scan fixes them. */
-function isStalePlanError(message: string): boolean {
-  return (
-    message.includes("preview plan expired or not found") ||
-    message.includes("preview plan no longer matches")
-  );
-}
-
 /** Backend error raised when watch/schedule already holds the pair's run slot. */
 function isPairAlreadyRunningError(message: string): boolean {
   return message.includes("sync run already in progress");
@@ -310,13 +312,20 @@ const MAX_BUSY_REQUEUES = 3;
 const BUSY_RETRY_DELAY_MS = 1500;
 const busyRequeues = new Map<string, number>();
 
+function verifyQueuedPairRevision(pairId: string, expected: number): void {
+  if (getPairEditRevision(pairId) !== expected) {
+    throw new Error(
+      "Preview needs refreshing: the pair changed after this run was queued.",
+    );
+  }
+}
+
 async function executeRun(
   pair: FolderPair,
-  conflictResolutions: Record<string, ConflictChoice>,
-  planId?: string,
+  options: RunPairOptions,
+  pairEditRevision: number,
 ): Promise<RunReport | null> {
-  const settings = getAppSettings();
-  if (consumeAbort(pair.id)) {
+  if (abortRequested.has(pair.id)) {
     finishRun(pair.id, "cancelled");
     emit();
     return null;
@@ -329,30 +338,19 @@ async function executeRun(
     report: null,
     error: null,
   });
-  // From here the backend owns the run; cancels go through cancel_run.
-  pendingStarts.delete(pair.id);
   emit();
-
-  const options = {
-    verifyHashes: settings.verifyHashesAfterCopy,
-    useRecycleBin: settings.moveDeletesToRecycleBin,
-    conflictResolutions,
-  };
 
   try {
     await ensureProgressListener();
-    let report: RunReport;
-    try {
-      report = await runApi.runPair(pair, { ...options, planId });
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      // A consumed/expired/mismatched plan handle is recoverable: scan again.
-      if (!planId || !isStalePlanError(message)) {
-        throw e;
-      }
-      clearPairPreview(pair.id);
-      report = await runApi.runPair(pair, options);
+    if (consumeAbort(pair.id)) {
+      finishRun(pair.id, "cancelled");
+      emit();
+      return null;
     }
+    if (options.intent.kind === "reviewed") {
+      verifyQueuedPairRevision(pair.id, pairEditRevision);
+    }
+    const report = await runApi.runPair(pair, options);
     busyRequeues.delete(pair.id);
     const progress = state.runsByPair[pair.id]?.progress ?? null;
     finishRun(pair.id, statusFromReport(report), {
@@ -366,7 +364,10 @@ async function executeRun(
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     // Watch or schedule beat us to this pair; wait our turn instead of failing.
-    if (isPairAlreadyRunningError(message) && requeueBusyPair(pair)) {
+    if (
+      isPairAlreadyRunningError(message) &&
+      requeueBusyPair(pair, options, pairEditRevision)
+    ) {
       return null;
     }
     busyRequeues.delete(pair.id);
@@ -375,14 +376,28 @@ async function executeRun(
       // Never keep progress adopted from another run in the failed record.
       progress: null,
     });
-    clearPairPreview(pair.id);
+    if (
+      isPreviewRefreshRequired(message) ||
+      options.intent.kind === "reviewed"
+    ) {
+      requireFreshPreview(
+        pair.id,
+        "Preview needs refreshing: review a new preview before syncing.",
+      );
+    } else {
+      clearPairPreview(pair.id);
+    }
     emit();
     return null;
   }
 }
 
 /** Sends a pair that lost its slot to a background run back to the queue. */
-function requeueBusyPair(pair: FolderPair): boolean {
+function requeueBusyPair(
+  pair: FolderPair,
+  options: RunPairOptions,
+  pairEditRevision: number,
+): boolean {
   const attempts = (busyRequeues.get(pair.id) ?? 0) + 1;
   if (attempts > MAX_BUSY_REQUEUES) {
     return false;
@@ -390,6 +405,7 @@ function requeueBusyPair(pair: FolderPair): boolean {
   busyRequeues.set(pair.id, attempts);
   activeRunIds.delete(pair.id);
   queuedPairs.set(queueKey({ pairId: pair.id, kind: "sync" }), pair);
+  queuedSyncs.set(pair.id, { options, pairEditRevision, choicesReady: true });
   patchRun(pair.id, {
     status: "queued",
     progress: null,
@@ -410,8 +426,9 @@ function requeueBusyPair(pair: FolderPair): boolean {
 /** Scans first for `ask` pairs so conflicts can be resolved before executing. */
 async function resolveConflictsThenRun(
   pair: FolderPair,
+  queued: QueuedSync,
 ): Promise<RunReport | null> {
-  let discoveredPlanId: string | undefined;
+  const { options, pairEditRevision } = queued;
   // The pre-run scan is real work — show it, and let the user cancel out of it.
   patchRun(pair.id, {
     status: "running",
@@ -427,21 +444,38 @@ async function resolveConflictsThenRun(
       emit();
       return null;
     }
-    const plan = await previewApi.previewPair(pair);
+    verifyQueuedPairRevision(pair.id, pairEditRevision);
+    const plan =
+      options.intent.kind === "fresh"
+        ? await previewApi.previewPair(pair)
+        : null;
     if (abortRequested.has(pair.id)) {
       consumeAbort(pair.id);
       finishRun(pair.id, "cancelled");
       emit();
       return null;
     }
-    discoveredPlanId = plan.planId;
-    const firstPage = plan.conflictCount
-      ? await previewApi.getPreviewConflicts(pair, plan.planId ?? "", 0)
-      : { actions: plan.actions, nextCursor: undefined };
-    const conflicts = listConflictActions({
-      ...plan,
-      actions: firstPage.actions,
-    });
+    const planId =
+      options.intent.kind === "reviewed" ? options.intent.planId : plan?.planId;
+    if (!planId)
+      throw new Error("Preview needs refreshing: missing reviewed plan.");
+    const total = plan?.conflictCount ?? queued.conflictCount;
+    const firstPage =
+      total === 0
+        ? { actions: [], nextCursor: undefined }
+        : plan && total === undefined
+          ? { actions: plan.actions, nextCursor: undefined }
+          : await previewApi.getPreviewConflicts(pair, planId, 0);
+    if (abortRequested.has(pair.id)) {
+      consumeAbort(pair.id);
+      finishRun(pair.id, "cancelled");
+      emit();
+      return null;
+    }
+    verifyQueuedPairRevision(pair.id, pairEditRevision);
+    const conflicts = firstPage.actions.filter(
+      (action): action is ConflictAction => action.kind === "conflict",
+    );
     if (conflicts.length > 0) {
       patchRun(pair.id, { status: "awaitingInput" });
       state = {
@@ -449,10 +483,10 @@ async function resolveConflictsThenRun(
         pendingConflicts: {
           pair,
           conflicts,
-          planId: plan.planId,
+          planId,
           cursor: 0,
           nextCursor: firstPage.nextCursor,
-          total: plan.conflictCount ?? conflicts.length,
+          total: total ?? conflicts.length,
           loading: false,
         },
         conflictResolutions: {},
@@ -461,21 +495,25 @@ async function resolveConflictsThenRun(
       emit();
       return null;
     }
+    return await executeRun(
+      pair,
+      { ...options, intent: { kind: "reviewed", planId } },
+      pairEditRevision,
+    );
   } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
     finishRun(pair.id, "failed", {
-      error: e instanceof Error ? e.message : String(e),
+      error: message,
     });
+    if (isPreviewRefreshRequired(message)) {
+      requireFreshPreview(
+        pair.id,
+        "Preview needs refreshing: review a new preview before syncing.",
+      );
+    }
     emit();
     return null;
   }
-
-  const cachedPlan = getPairPreview(pair.id).plan;
-  return await executeRun(
-    pair,
-    {},
-    discoveredPlanId ??
-      (cachedPlan?.pairId === pair.id ? cachedPlan.planId : undefined),
-  );
 }
 
 /**
@@ -521,6 +559,7 @@ function pumpQueue(): void {
   }
 
   pendingStarts.add(nextId);
+  const queued = queuedSyncs.get(nextId);
   emit();
 
   // A pair bounced by a background sync gets a breather before trying again.
@@ -529,9 +568,16 @@ function pumpQueue(): void {
     if (retryDelay > 0) {
       await new Promise((resolve) => setTimeout(resolve, retryDelay));
     }
-    return pair.conflictPolicy === "ask"
-      ? await resolveConflictsThenRun(pair)
-      : await executeRun(pair, {}, getReusablePlanId(pair));
+    if (!queued) {
+      finishRun(pair.id, "failed", {
+        error: "queued sync settings are missing",
+      });
+      emit();
+      return null;
+    }
+    return pair.conflictPolicy === "ask" && !queued.choicesReady
+      ? await resolveConflictsThenRun(pair, queued)
+      : await executeRun(pair, queued.options, queued.pairEditRevision);
   })();
   void started.finally(() => {
     pumpQueue();
@@ -541,6 +587,17 @@ function pumpQueue(): void {
 /** Queue entries are keyed by kind so a pair can hold a scan and a sync. */
 function queueKey(job: QueuedJob | { pairId: string; kind: QueueJobKind }) {
   return `${job.kind}:${job.pairId}`;
+}
+
+function clearWaitingPreview(pairId: string): void {
+  if (getPairPreview(pairId).reviewRequired) {
+    requireFreshPreview(
+      pairId,
+      "Preview needs refreshing: review a new preview before syncing.",
+    );
+  } else {
+    clearPairPreview(pairId);
+  }
 }
 
 function clearActiveJob(pairId: string): void {
@@ -557,28 +614,30 @@ function clearActiveJob(pairId: string): void {
 async function runQueuedPreview(pair: FolderPair): Promise<void> {
   queuedPairs.delete(queueKey({ pairId: pair.id, kind: "preview" }));
   try {
-    await previewPairById(pair);
+    if (getPairPreview(pair.id).queued) await previewPairById(pair);
   } finally {
     clearActiveJob(pair.id);
     emit();
   }
 }
 
-function getReusablePlanId(pair: FolderPair): string | undefined {
-  const cached = getPairPreview(pair.id).plan;
-  return cached?.pairId === pair.id ? cached.planId : undefined;
-}
-
 /**
  * Queues a pair for syncing. Returns false when the pair is already queued or
  * running, has no id, or the user declined the confirmation prompt.
  */
-export function enqueuePairRun(pair: FolderPair, skipConfirm = false): boolean {
-  // A pending scan for the same pair is fine — the sync simply queues behind it.
-  if (!pair.id || isPairBusy(state, pair.id)) {
-    return false;
-  }
+function canQueuePairRun(pair: FolderPair): boolean {
+  const preview = getPairPreview(pair.id);
+  return (
+    !!pair.id &&
+    !isPairBusy(state, pair.id) &&
+    !isPreviewRefreshRequired(preview.error) &&
+    !preview.reviewRequired
+  );
+}
 
+export function enqueuePairRun(pair: FolderPair, skipConfirm = false): boolean {
+  if (!canQueuePairRun(pair)) return false;
+  const preview = getPairPreview(pair.id);
   const settings = getAppSettings();
   if (
     !skipConfirm &&
@@ -597,6 +656,19 @@ export function enqueuePairRun(pair: FolderPair, skipConfirm = false): boolean {
     }
   }
 
+  const plan = preview.plan?.pairId === pair.id ? preview.plan : null;
+  queuedSyncs.set(pair.id, {
+    options: {
+      intent: plan?.planId
+        ? { kind: "reviewed", planId: plan.planId }
+        : { kind: "fresh" },
+      verifyHashes: settings.verifyHashesAfterCopy,
+      useRecycleBin: settings.moveDeletesToRecycleBin,
+      conflictResolutions: {},
+    },
+    pairEditRevision: getPairEditRevision(pair.id),
+    conflictCount: plan?.conflictCount,
+  });
   queuedPairs.set(queueKey({ pairId: pair.id, kind: "sync" }), pair);
   const now = Date.now();
   state = {
@@ -630,9 +702,7 @@ export function enqueuePairRun(pair: FolderPair, skipConfirm = false): boolean {
  * asked once for the batch rather than once per pair.
  */
 export function enqueuePairRuns(pairs: FolderPair[]): number {
-  const startable = pairs.filter(
-    (pair) => pair.id && !isPairBusy(state, pair.id),
-  );
+  const startable = pairs.filter(canQueuePairRun);
   if (startable.length === 0) {
     return 0;
   }
@@ -693,7 +763,7 @@ export async function cancelPairPreview(pairId: string): Promise<void> {
         (job) => !(job.pairId === pairId && job.kind === "preview"),
       ),
     };
-    clearPairPreview(pairId);
+    clearWaitingPreview(pairId);
     emit();
     return;
   }
@@ -762,6 +832,8 @@ export async function cancelPairRun(pairId: string): Promise<void> {
 
   if (state.activePairId !== pairId || state.activeKind !== "sync") {
     queuedPairs.delete(queueKey({ pairId, kind: "sync" }));
+    queuedSyncs.delete(pairId);
+    busyRequeues.delete(pairId);
     const runsByPair = { ...state.runsByPair };
     delete runsByPair[pairId];
     state = {
@@ -807,6 +879,8 @@ export function clearRunQueue(): void {
   for (const job of state.queue) {
     queuedPairs.delete(queueKey(job));
     if (job.kind === "sync") {
+      queuedSyncs.delete(job.pairId);
+      busyRequeues.delete(job.pairId);
       delete runsByPair[job.pairId];
     } else {
       waitingPreviews.push(job.pairId);
@@ -814,7 +888,7 @@ export function clearRunQueue(): void {
   }
   state = { ...state, queue: [], runsByPair };
   emit();
-  waitingPreviews.forEach(clearPairPreview);
+  waitingPreviews.forEach(clearWaitingPreview);
 }
 
 /** Clears a settled run record so the pair view returns to its idle state. */
@@ -831,9 +905,12 @@ export function dismissPairRun(pairId: string): void {
 
 export async function loadConflictPage(cursor: number): Promise<void> {
   const pending = state.pendingConflicts;
-  if (!pending || pending.loading || !pending.planId) return;
+  if (!pending || pending.loading || pending.pageError?.stale) return;
   const requestId = ++conflictPageRequestId;
-  state = { ...state, pendingConflicts: { ...pending, loading: true } };
+  state = {
+    ...state,
+    pendingConflicts: { ...pending, loading: true, pageError: undefined },
+  };
   emit();
   try {
     const page = await previewApi.getPreviewConflicts(
@@ -857,6 +934,7 @@ export async function loadConflictPage(cursor: number): Promise<void> {
         cursor,
         nextCursor: page.nextCursor,
         loading: false,
+        pageError: undefined,
       },
     };
   } catch (e) {
@@ -866,13 +944,17 @@ export async function loadConflictPage(cursor: number): Promise<void> {
     ) {
       return;
     }
+    const message = e instanceof Error ? e.message : String(e);
+    const stale = isPreviewRefreshRequired(message);
     state = {
       ...state,
-      pendingConflicts: { ...pending, loading: false },
+      pendingConflicts: {
+        ...pending,
+        loading: false,
+        pageError: { cursor, message, stale },
+      },
+      conflictResolutions: stale ? {} : state.conflictResolutions,
     };
-    patchRun(pending.pair.id, {
-      error: e instanceof Error ? e.message : String(e),
-    });
   }
   emit();
 }
@@ -881,6 +963,13 @@ export function setConflictResolution(
   path: string,
   choice: ConflictChoice,
 ): void {
+  if (
+    state.pendingConflicts?.pageError?.stale ||
+    !state.pendingConflicts?.conflicts.some(
+      (conflict) => conflict.path === path,
+    )
+  )
+    return;
   state = {
     ...state,
     conflictResolutions: { ...state.conflictResolutions, [path]: choice },
@@ -903,16 +992,43 @@ export function cancelConflictResolution(): void {
   pumpQueue();
 }
 
+export function refreshStaleConflictPreview(): string | null {
+  const pending = state.pendingConflicts;
+  if (!pending?.pageError?.stale) return null;
+  requireFreshPreview(
+    pending.pair.id,
+    "Preview needs refreshing: review a new preview before syncing.",
+  );
+  cancelConflictResolution();
+  return pending.pair.id;
+}
+
 export async function confirmConflictResolutionAndRun(): Promise<RunReport | null> {
   const pending = state.pendingConflicts;
-  if (!pending || state.runsByPair[pending.pair.id]?.status === "running") {
+  const queued = pending && queuedSyncs.get(pending.pair.id);
+  if (
+    !pending ||
+    !queued ||
+    pending.loading ||
+    pending.pageError?.stale ||
+    Object.keys(state.conflictResolutions).length !== pending.total ||
+    state.runsByPair[pending.pair.id]?.status === "running"
+  ) {
     return null;
   }
   const resolutions = state.conflictResolutions;
   state = { ...state, pendingConflicts: null, conflictResolutions: {} };
   emit();
   try {
-    return await executeRun(pending.pair, resolutions, pending.planId);
+    return await executeRun(
+      pending.pair,
+      {
+        ...queued.options,
+        conflictResolutions: resolutions,
+        intent: { kind: "reviewed", planId: pending.planId },
+      },
+      queued.pairEditRevision,
+    );
   } finally {
     pumpQueue();
   }
@@ -923,6 +1039,7 @@ export function resetRunStoreForTests(): void {
   unlistenProgress = null;
   unlistenWatchSkipped = null;
   queuedPairs.clear();
+  queuedSyncs.clear();
   activeRunIds.clear();
   pendingStarts.clear();
   abortRequested.clear();

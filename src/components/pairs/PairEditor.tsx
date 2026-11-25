@@ -1,4 +1,3 @@
-import { ConflictDialog } from "../conflicts/ConflictDialog";
 import { PreviewResults } from "../preview/PreviewResults";
 import { PreviewScanProgress } from "../preview/PreviewScanProgress";
 import { RunProgress } from "../run/RunProgress";
@@ -9,22 +8,20 @@ import {
   cancelEdit,
   deleteSelected,
   emptyPairPreview,
+  isPreviewRefreshRequired,
+  markPreviewReviewed,
   pickFolderForSide,
   saveEditing,
   updateEditing,
 } from "../../store/pairsStore";
 import type { PairsStoreState } from "../../store/pairsStore";
 import {
-  cancelConflictResolution,
-  confirmConflictResolutionAndRun,
   enqueuePairRun,
   cancelPairPreview,
   enqueuePairPreview,
   getPairRun,
   isPairBusy,
   queuePosition,
-  loadConflictPage,
-  setConflictResolution,
 } from "../../store/runStore";
 import type { RunStoreState } from "../../store/runStore";
 import { ConflictPolicySelector } from "./ConflictPolicySelector";
@@ -58,6 +55,7 @@ export function PairEditor({
   const editingId = editing?.id ?? "";
   const {
     plan: previewPlan,
+    reviewRequired: previewReviewRequired,
     queued: previewQueued,
     loading: previewLoading,
     error: previewError,
@@ -75,16 +73,12 @@ export function PairEditor({
     busy: runInProgress,
     scanPosition,
     runError,
-    pendingConflicts,
-    conflictResolutions,
   } = useRunStore(
     useCallback(
       (s: RunStoreState) => ({
         busy: isPairBusy(s, editingId),
         scanPosition: queuePosition(s, editingId, "preview"),
         runError: getPairRun(s, editingId)?.error,
-        pendingConflicts: s.pendingConflicts,
-        conflictResolutions: s.conflictResolutions,
       }),
       [editingId],
     ),
@@ -112,6 +106,7 @@ export function PairEditor({
     return null;
   }
 
+  const previewNeedsRefresh = isPreviewRefreshRequired(previewError);
   const isNew = !editing.id;
   const roots = JSON.stringify([
     editing.id,
@@ -370,10 +365,16 @@ export function PairEditor({
             <button
               ref={resultsTriggerRef}
               type="button"
-              onClick={() => setShowResults(true)}
+              onClick={() => {
+                if (previewPlan?.planId)
+                  markPreviewReviewed(editing.id, previewPlan.planId);
+                setShowResults(true);
+              }}
               disabled={runInProgress}
             >
-              View results
+              {previewReviewRequired
+                ? "Review refreshed preview"
+                : "View results"}
             </button>
           )}
         </section>
@@ -425,12 +426,19 @@ export function PairEditor({
                 ? "Queued to scan…"
                 : previewLoading
                   ? "Scanning…"
-                  : "Preview sync"}
+                  : previewNeedsRefresh
+                    ? "Refresh preview"
+                    : "Preview sync"}
             </button>
             <button
               type="button"
               className="btn-primary"
-              disabled={saving || runInProgress}
+              disabled={
+                saving ||
+                runInProgress ||
+                previewNeedsRefresh ||
+                previewReviewRequired
+              }
               onClick={() => {
                 if (enqueuePairRun(editing)) {
                   setRootAttempt({ roots, action: "run" });
@@ -476,27 +484,6 @@ export function PairEditor({
       </div>
       {!isNew && selectedId && (
         <p className="pair-id-hint">Pair ID: {selectedId}</p>
-      )}
-
-      {pendingConflicts && pendingConflicts.pair.id === editing.id && (
-        <ConflictDialog
-          conflicts={pendingConflicts.conflicts}
-          resolutions={conflictResolutions}
-          onChoose={setConflictResolution}
-          onConfirm={() => void confirmConflictResolutionAndRun()}
-          onCancel={cancelConflictResolution}
-          page={Math.floor(pendingConflicts.cursor / 200) + 1}
-          total={pendingConflicts.total}
-          hasNextPage={pendingConflicts.nextCursor != null}
-          hasPreviousPage={pendingConflicts.cursor > 0}
-          loading={pendingConflicts.loading}
-          onNextPage={() =>
-            void loadConflictPage(pendingConflicts.nextCursor ?? 0)
-          }
-          onPreviousPage={() =>
-            void loadConflictPage(Math.max(0, pendingConflicts.cursor - 200))
-          }
-        />
       )}
     </form>
   );
