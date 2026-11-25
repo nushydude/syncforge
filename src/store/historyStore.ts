@@ -10,6 +10,9 @@ export interface HistoryStoreState {
   loading: boolean;
   detailLoading: boolean;
   detailPageLoading: boolean;
+  pageCursor: number;
+  pageError: string | null;
+  failedPageCursor: number | null;
   error: string | null;
 }
 
@@ -24,6 +27,9 @@ let state: HistoryStoreState = {
   loading: false,
   detailLoading: false,
   detailPageLoading: false,
+  pageCursor: 0,
+  pageError: null,
+  failedPageCursor: null,
   error: null,
 };
 
@@ -60,6 +66,9 @@ export async function loadHistory(pairFilter?: string | null): Promise<void> {
     detail: null,
     detailLoading: false,
     detailPageLoading: false,
+    pageCursor: 0,
+    pageError: null,
+    failedPageCursor: null,
   };
   emit();
 
@@ -103,6 +112,9 @@ export async function selectRun(
     detailLoading: true,
     detailPageLoading: false,
     detail: previous ? { report: previous.report, items: [] } : null,
+    pageCursor: 0,
+    pageError: null,
+    failedPageCursor: null,
     error: null,
   };
   emit();
@@ -133,51 +145,60 @@ export async function selectRun(
   emit();
 }
 
-export async function loadMoreRunItems(): Promise<void> {
+const PAGE_SIZE = 200;
+
+async function loadRunItemsPage(cursor: number): Promise<void> {
   const detail = state.detail;
   const runId = state.selectedRunId;
-  if (!detail || !runId || detail.nextCursor == null || state.detailPageLoading)
-    return;
+  if (!detail || !runId || state.detailPageLoading) return;
   const requestId = historyDetailRequestId;
-  state = { ...state, detailPageLoading: true };
+  const filter = state.actionFilter;
+  state = {
+    ...state,
+    detailPageLoading: true,
+    pageError: null,
+    failedPageCursor: null,
+  };
   emit();
   try {
-    const next = state.actionFilter
-      ? await historyApi.getRunDetail(
-          runId,
-          detail.nextCursor,
-          undefined,
-          state.actionFilter,
-        )
-      : await historyApi.getRunDetail(runId, detail.nextCursor);
-    if (requestId !== historyDetailRequestId || !next) {
-      if (requestId === historyDetailRequestId) {
-        state = { ...state, detailPageLoading: false };
-        emit();
-      }
-      return;
-    }
+    const next = filter
+      ? await historyApi.getRunDetail(runId, cursor, PAGE_SIZE, filter)
+      : await historyApi.getRunDetail(runId, cursor, PAGE_SIZE);
+    if (requestId !== historyDetailRequestId) return;
+    if (!next) throw new Error("Run not found");
     state = {
       ...state,
       detailPageLoading: false,
-      detail: {
-        ...detail,
-        items: [...detail.items, ...next.items],
-        nextCursor: next.nextCursor,
-      },
+      detail: next,
+      pageCursor: cursor,
     };
-    emit();
   } catch (e) {
-    if (requestId !== historyDetailRequestId) {
-      return;
-    }
+    if (requestId !== historyDetailRequestId) return;
     state = {
       ...state,
       detailPageLoading: false,
-      error: e instanceof Error ? e.message : String(e),
+      failedPageCursor: cursor,
+      pageError: e instanceof Error ? e.message : String(e),
     };
-    emit();
   }
+  emit();
+}
+
+export function loadMoreRunItems(): Promise<void> {
+  const cursor = state.detail?.nextCursor;
+  return cursor == null ? Promise.resolve() : loadRunItemsPage(cursor);
+}
+
+export function retryRunItemsPage(): Promise<void> {
+  return state.failedPageCursor == null
+    ? Promise.resolve()
+    : loadRunItemsPage(state.failedPageCursor);
+}
+
+export function loadPreviousRunItems(): Promise<void> {
+  return state.pageCursor === 0
+    ? Promise.resolve()
+    : loadRunItemsPage(Math.max(0, state.pageCursor - PAGE_SIZE));
 }
 
 export function clearRunSelection(): void {
@@ -189,6 +210,9 @@ export function clearRunSelection(): void {
     detail: null,
     detailLoading: false,
     detailPageLoading: false,
+    pageCursor: 0,
+    pageError: null,
+    failedPageCursor: null,
   };
   emit();
 }
@@ -206,6 +230,9 @@ export function resetHistoryStoreForTests(): void {
     loading: false,
     detailLoading: false,
     detailPageLoading: false,
+    pageCursor: 0,
+    pageError: null,
+    failedPageCursor: null,
     error: null,
   };
   emit();

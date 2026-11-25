@@ -3,6 +3,7 @@ mod diff;
 mod duplicates;
 mod engine;
 mod hashing;
+mod history_export;
 mod models;
 mod notifications;
 mod path_normalization;
@@ -140,6 +141,7 @@ pub fn run() {
             commands::history::get_history,
             watcher::get_watch_health,
             commands::history::get_run_detail,
+            commands::history::export_history_run,
             commands::schedule::set_schedule,
             commands::sniffer::start_sniffer_scan,
             commands::sniffer::get_sniffer_scan,

@@ -1,8 +1,13 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useHistoryStore } from "../../hooks/useHistoryStore";
-import { loadMoreRunItems, selectRun } from "../../store/historyStore";
+import {
+  loadMoreRunItems,
+  loadPreviousRunItems,
+  retryRunItemsPage,
+  selectRun,
+} from "../../store/historyStore";
 import { selectPairsList, usePairsStore } from "../../hooks/usePairsStore";
-import { exportRunAsCsv, exportRunAsJson } from "../../lib/exportRun";
+import { exportHistoryRun } from "../../api/history";
 import {
   formatBytes,
   formatDuration,
@@ -34,11 +39,25 @@ const selectRunDetailHistory = (s: HistoryStoreState) => ({
   detailLoading: s.detailLoading,
   detailPageLoading: s.detailPageLoading,
   error: s.error,
+  pageError: s.pageError,
+  pageCursor: s.pageCursor,
 });
 
 export function RunDetail() {
-  const { detail, actionFilter, detailLoading, detailPageLoading, error } =
-    useHistoryStore(selectRunDetailHistory);
+  const {
+    detail,
+    actionFilter,
+    detailLoading,
+    detailPageLoading,
+    error,
+    pageError,
+    pageCursor,
+  } = useHistoryStore(selectRunDetailHistory);
+  const [exportError, setExportError] = useState<{
+    runId: string;
+    message: string;
+  } | null>(null);
+  const [exporting, setExporting] = useState(false);
   const pairs = usePairsStore(selectPairsList);
   const pairNames = useMemo(
     () => pairs.map((p) => ({ id: p.id, name: p.name })),
@@ -67,15 +86,25 @@ export function RunDetail() {
     pairNames.find((p) => p.id === report.pairId)?.name ?? report.pairId;
 
   const hasMore = detail.nextCursor != null;
-  const canExport = !actionFilter && !detailLoading && !error && !hasMore;
-  const exportHint = actionFilter
-    ? "Select All actions to export the full report"
-    : hasMore
-      ? "Load all items before exporting"
+  const canExport = report.status !== "running" && !exporting;
+  const exportHint =
+    report.status === "running"
+      ? "Export is available after the run finishes"
       : undefined;
-
-  const handleExportJson = () => exportRunAsJson(detail);
-  const handleExportCsv = () => exportRunAsCsv(detail);
+  const handleExport = async (format: "json" | "csv") => {
+    setExportError(null);
+    setExporting(true);
+    try {
+      await exportHistoryRun(report.runId, format);
+    } catch (e) {
+      setExportError({
+        runId: report.runId,
+        message: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setExporting(false);
+    }
+  };
 
   return (
     <article className="run-detail">
@@ -91,7 +120,7 @@ export function RunDetail() {
         <div className="run-detail-actions">
           <button
             type="button"
-            onClick={handleExportJson}
+            onClick={() => void handleExport("json")}
             disabled={!canExport}
             title={exportHint}
           >
@@ -99,7 +128,7 @@ export function RunDetail() {
           </button>
           <button
             type="button"
-            onClick={handleExportCsv}
+            onClick={() => void handleExport("csv")}
             disabled={!canExport}
             title={exportHint}
           >
@@ -108,6 +137,11 @@ export function RunDetail() {
         </div>
       </header>
 
+      {exportError?.runId === report.runId && (
+        <p className="form-error" role="alert">
+          {exportError.message}
+        </p>
+      )}
       <dl className="run-detail-stats">
         <div>
           <dt>Status</dt>
@@ -153,9 +187,7 @@ export function RunDetail() {
         <div className="run-detail-items-header">
           <h4>
             Items
-            {!detailLoading &&
-              !error &&
-              ` (${items.length}${hasMore ? "+" : ""})`}
+            {!detailLoading && !error && ` (${items.length} on this page)`}
           </h4>
           <label className="history-filter">
             <span>Action</span>
@@ -222,6 +254,29 @@ export function RunDetail() {
                 </tbody>
               </table>
             </div>
+            {pageError && (
+              <div>
+                <p className="form-error" role="alert">
+                  {pageError}
+                </p>
+                <button
+                  type="button"
+                  disabled={detailPageLoading}
+                  onClick={() => void retryRunItemsPage()}
+                >
+                  Retry page
+                </button>
+              </div>
+            )}
+            {pageCursor > 0 && (
+              <button
+                type="button"
+                disabled={detailPageLoading}
+                onClick={() => void loadPreviousRunItems()}
+              >
+                Previous page
+              </button>
+            )}
             {hasMore && (
               <button
                 type="button"
@@ -229,7 +284,7 @@ export function RunDetail() {
                 disabled={detailPageLoading}
                 onClick={() => void loadMoreRunItems()}
               >
-                {detailPageLoading ? "Loading…" : "Load more"}
+                {detailPageLoading ? "Loading…" : "Next page"}
               </button>
             )}
           </>

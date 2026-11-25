@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,8 @@ use crate::state::{AppState, HeavyJobKind, WorkCoordinator, WorkRequest};
 pub const PROGRESS_EVENT: &str = "syncforge://sniffer-progress";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 const PAGE_MAX: u32 = 200;
+const AGGREGATE_CACHE_CAPACITY: usize = 16;
+const MAX_AGGREGATE_KEY_BYTES: usize = 16 * 1024;
 const ISSUE_DETAIL_LIMIT: i64 = 10_000;
 const ACTION_TTL_MS: i64 = 2 * 60 * 1000;
 const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
@@ -249,6 +251,21 @@ struct PreparedAction {
     root: PathBuf,
 }
 
+#[derive(Clone, Copy)]
+struct QueryAggregate {
+    count: i64,
+    bytes: i64,
+    empty: i64,
+}
+
+struct CachedAggregate {
+    generation: String,
+    revision: u64,
+    filters: String,
+    values: Vec<Value>,
+    aggregate: QueryAggregate,
+}
+
 pub struct SnifferService {
     db_path: PathBuf,
     db: Mutex<Connection>,
@@ -258,6 +275,9 @@ pub struct SnifferService {
     // Serializes publication and reads across the small SQLite transactions.
     publication: Mutex<()>,
     displayed: Mutex<Option<String>>,
+    aggregates: Mutex<VecDeque<CachedAggregate>>,
+    #[cfg(test)]
+    aggregate_reads: std::sync::atomic::AtomicUsize,
     #[cfg(not(test))]
     event_app: Mutex<Option<AppHandle>>,
 }
@@ -453,6 +473,9 @@ impl SnifferService {
             actions: Mutex::new(HashMap::new()),
             publication: Mutex::new(()),
             displayed: Mutex::new(None),
+            aggregates: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            aggregate_reads: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(not(test))]
             event_app: Mutex::new(None),
         })
@@ -1431,9 +1454,65 @@ impl SnifferService {
 
     pub fn query(&self, q: QueryRequest) -> Result<EntryPage, SnifferError> {
         let _publication = self.publication.lock().map_err(|e| sql_error("query", e))?;
-        self.query_published(q)
+        self.query_published(q).map(|(page, _)| page)
     }
-    fn query_published(&self, q: QueryRequest) -> Result<EntryPage, SnifferError> {
+
+    fn query_aggregate(
+        &self,
+        db: &Connection,
+        snapshot: &ScanSnapshot,
+        filters: &str,
+        values: &[Value],
+    ) -> Result<QueryAggregate, SnifferError> {
+        // Active scans can commit rows between published progress revisions.
+        let cacheable = matches!(
+            snapshot.status,
+            ScanStatus::Completed | ScanStatus::Cancelled | ScanStatus::Failed
+        ) && values.iter().fold(filters.len(), |bytes, value| {
+            bytes.saturating_add(match value {
+                Value::Text(text) => text.len(),
+                _ => std::mem::size_of::<Value>(),
+            })
+        }) <= MAX_AGGREGATE_KEY_BYTES;
+        let mut cache = self.aggregates.lock().map_err(|e| sql_error("query", e))?;
+        if cacheable {
+            if let Some(index) = cache.iter().position(|item| {
+                item.generation == snapshot.generation_id
+                    && item.revision == snapshot.revision
+                    && item.filters == filters
+                    && item.values == values
+            }) {
+                let entry = cache.remove(index).expect("located aggregate");
+                let aggregate = entry.aggregate;
+                cache.push_back(entry);
+                return Ok(aggregate);
+            }
+        }
+        #[cfg(test)]
+        self.aggregate_reads.fetch_add(1, Ordering::Relaxed);
+        let aggregate = db
+            .query_row(
+                &format!("SELECT COUNT(*),COALESCE(SUM(size),0),COUNT(CASE WHEN size=0 THEN 1 END) FROM nodes WHERE {filters}"),
+                params_from_iter(values.iter()),
+                |row| Ok(QueryAggregate { count: row.get(0)?, bytes: row.get(1)?, empty: row.get(2)? }),
+            )
+            .map_err(|e| sql_error("query", e))?;
+        if cacheable {
+            if cache.len() == AGGREGATE_CACHE_CAPACITY {
+                cache.pop_front();
+            }
+            cache.push_back(CachedAggregate {
+                generation: snapshot.generation_id.clone(),
+                revision: snapshot.revision,
+                filters: filters.to_owned(),
+                values: values.to_vec(),
+                aggregate,
+            });
+        }
+        Ok(aggregate)
+    }
+
+    fn query_published(&self, q: QueryRequest) -> Result<(EntryPage, i64), SnifferError> {
         let snapshot = self.validate_generation(&q.scan_id, &q.generation_id)?;
         let limit = q.limit.clamp(1, PAGE_MAX) as usize;
         let signature = serde_json::to_string(&(
@@ -1517,13 +1596,8 @@ impl SnifferService {
             values.push(Value::Text(kind.into()));
         }
         let where_sql = conditions.join(" AND ");
-        let (count, bytes): (i64, i64) = db
-            .query_row(
-                &format!("SELECT COUNT(*),COALESCE(SUM(size),0) FROM nodes WHERE {where_sql}"),
-                params_from_iter(values.iter()),
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|e| sql_error("query", e))?;
+        let QueryAggregate { count, bytes, empty } =
+            self.query_aggregate(&db, &snapshot, &where_sql, &values)?;
         let direction = if q.sort_direction == "asc" { "ASC" } else { "DESC" };
         let primary = match q.sort_by.as_str() {
             "name" => format!("name_display COLLATE NOCASE {direction}"),
@@ -1567,16 +1641,19 @@ impl SnifferService {
             .unwrap_or(0)
             .max(0)
             .to_string();
-        Ok(EntryPage {
-            rows: page,
-            next_cursor: next,
-            match_count: count.max(0).to_string(),
-            matched_bytes: bytes.to_string(),
-            directory_bytes,
-            revision: snapshot.revision,
-            coverage_complete: snapshot.coverage_complete,
-            stale: snapshot.stale,
-        })
+        Ok((
+            EntryPage {
+                rows: page,
+                next_cursor: next,
+                match_count: count.max(0).to_string(),
+                matched_bytes: bytes.to_string(),
+                directory_bytes,
+                revision: snapshot.revision,
+                coverage_complete: snapshot.coverage_complete,
+                stale: snapshot.stale,
+            },
+            empty,
+        ))
     }
 
     pub fn node(
@@ -1627,15 +1704,7 @@ impl SnifferService {
             query.limit = 40;
             query.sort_by = "size".into();
             query.sort_direction = "desc".into();
-            let all = self.query_published(query.clone())?;
-            let zero =
-                if query.min_size.as_deref().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) > 0 {
-                    "0".to_string()
-                } else {
-                    let mut zero_query = query.clone();
-                    zero_query.max_size = Some("0".into());
-                    self.query_published(zero_query)?.match_count
-                };
+            let (all, zero) = self.query_published(query)?;
             let mut tiles: Vec<MapTile> = all
                 .rows
                 .iter()
@@ -1661,7 +1730,7 @@ impl SnifferService {
                         .match_count
                         .parse::<u64>()
                         .unwrap_or(0)
-                        .saturating_sub(zero.parse::<u64>().unwrap_or(0))
+                        .saturating_sub(zero.max(0) as u64)
                         .saturating_sub(tiles.len() as u64)
                         .to_string(),
                 });
@@ -1671,7 +1740,7 @@ impl SnifferService {
                 files: dir.files.clone().unwrap_or_default(),
                 folders: dir.folders.clone().unwrap_or_default(),
                 directory: dir,
-                zero_size_count: zero,
+                zero_size_count: zero.max(0).to_string(),
                 tiles,
                 revision: all.revision,
                 coverage_complete: all.coverage_complete,
@@ -2272,6 +2341,75 @@ mod tests {
             summary.tiles.iter().map(|tile| tile.logical_size.parse::<u64>().unwrap()).sum();
         assert_eq!(bytes.to_string(), page.matched_bytes);
         assert_eq!(summary.zero_size_count, "0");
+    }
+
+    #[test]
+    fn large_filtered_pages_and_tiles_share_aggregates_for_one_generation_revision() {
+        let (_dir, service, snapshot) = fixture();
+        {
+            let db = service.db.lock().unwrap();
+            db.execute_batch(
+                "WITH RECURSIVE sequence(n) AS (
+                    VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 100000
+                )
+                INSERT INTO nodes (
+                    scan_id,parent_id,name_display,path_display,path_native,path_key,depth,kind,size
+                )
+                SELECT 'scan',1,'bulk-' || n,'root/bulk-' || n,X'','bulk-' || n,1,'file',n % 3
+                FROM sequence;",
+            )
+            .unwrap();
+        }
+        let query = QueryRequest {
+            scan_id: snapshot.id.clone(),
+            generation_id: snapshot.generation_id.clone(),
+            directory_id: "1".into(),
+            sort_by: "name".into(),
+            search: "bulk-".into(),
+            limit: 100,
+            ..Default::default()
+        };
+        let first = service.query(query.clone()).unwrap();
+        let second = service
+            .query(QueryRequest { cursor: first.next_cursor.clone(), ..query.clone() })
+            .unwrap();
+        let summary = service
+            .summary(&snapshot.id, &snapshot.generation_id, "1", Some(query.clone()))
+            .unwrap();
+        assert_eq!(first.match_count, "100000");
+        assert_eq!(first.matched_bytes, "100000");
+        assert_eq!(first.rows.len(), 100);
+        assert_eq!(second.rows.len(), 100);
+        assert_eq!(summary.zero_size_count, "33333");
+        assert_eq!(summary.tiles.len(), 41);
+        assert_eq!(service.aggregate_reads.load(Ordering::Relaxed), 1);
+
+        service.update_job_quiet(&snapshot.id, |scan| scan.revision += 1);
+        assert_eq!(service.query(query).unwrap().match_count, "100000");
+        assert_eq!(service.aggregate_reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn active_scan_observes_new_rows_at_the_same_revision() {
+        let (_dir, service, snapshot) = fixture();
+        let query = QueryRequest {
+            scan_id: snapshot.id.clone(),
+            generation_id: snapshot.generation_id.clone(),
+            directory_id: "1".into(),
+            search: "live-entry".into(),
+            ..Default::default()
+        };
+        assert_eq!(service.query(query.clone()).unwrap().match_count, "0");
+        service.update_job_quiet(&snapshot.id, |scan| scan.status = ScanStatus::Scanning);
+        service.db.lock().unwrap().execute(
+            "INSERT INTO nodes (scan_id,parent_id,name_display,path_display,path_native,path_key,depth,kind,size)
+            VALUES ('scan',1,'live-entry','root/live-entry',X'','live-entry',1,'file',3)",
+            [],
+        ).unwrap();
+        let changed = service.query(query).unwrap();
+        assert_eq!(changed.revision, snapshot.revision);
+        assert_eq!(changed.match_count, "1");
+        assert_eq!(service.aggregate_reads.load(Ordering::Relaxed), 2);
     }
 
     #[test]

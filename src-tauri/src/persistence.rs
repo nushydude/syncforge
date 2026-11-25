@@ -1113,6 +1113,53 @@ impl DatabaseManager {
             .map(|value| serde_json::from_str(&value).map_err(Into::into))
             .transpose()
     }
+    /// Visit one immutable report in browse order without materializing its rows.
+    /// The dedicated read connection keeps a single SQLite snapshot and index cursor.
+    pub fn visit_run_items(
+        &self,
+        expected: &RunReport,
+        mut visit: impl FnMut(RunItem) -> std::result::Result<(), String>,
+    ) -> std::result::Result<(), String> {
+        let conn = Database::open_connection(&self.path).map_err(|e| e.to_string())?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let summary: Option<String> = conn
+            .query_row(
+                "SELECT summary_json FROM runs WHERE id = ?1",
+                params![expected.run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let actual: RunReport =
+            serde_json::from_str(summary.as_deref().ok_or("Run no longer exists")?)
+                .map_err(|e| e.to_string())?;
+        if actual != *expected || actual.status == RunStatus::Running {
+            return Err("Run changed while preparing export; try again after it finishes".into());
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, run_id, path, action, status, message, bytes
+             FROM run_items INDEXED BY idx_run_items_run_path WHERE run_id = ?1
+             ORDER BY path COLLATE NOCASE, id",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query(params![expected.run_id]).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let bytes: Option<i64> = row.get(6).map_err(|e| e.to_string())?;
+            let item = RunItem {
+                id: row.get(0).map_err(|e| e.to_string())?,
+                run_id: row.get(1).map_err(|e| e.to_string())?,
+                path: row.get(2).map_err(|e| e.to_string())?,
+                action: row.get(3).map_err(|e| e.to_string())?,
+                status: row.get(4).map_err(|e| e.to_string())?,
+                message: row.get(5).map_err(|e| e.to_string())?,
+                bytes: bytes.map(|b| b as u64),
+            };
+            visit(item)?;
+        }
+        Ok(())
+    }
+
     pub fn list_run_items_page(
         &self,
         run_id: &str,
