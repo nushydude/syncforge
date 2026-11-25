@@ -29,6 +29,9 @@ pub fn hash_file_with_progress(
 ) -> io::Result<String> {
     #[cfg(test)]
     HASH_INVOCATIONS.with(|count| count.set(count.get() + 1));
+    if !on_progress(0, 0) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -75,5 +78,22 @@ mod tests {
         file.flush().expect("flush");
         let path = file.path();
         assert_eq!(hash_file(path).expect("hash file"), hash_bytes(b"syncforge"));
+    }
+    #[test]
+    fn hash_cancels_before_open_and_between_chunks() {
+        let missing = Path::new("missing-cancellation-test-file");
+        assert_eq!(
+            hash_file_with_progress(missing, |_, _| false).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&vec![7; 128 * 1024]).unwrap();
+        let mut calls = 0;
+        let result = hash_file_with_progress(file.path(), |_, _| {
+            calls += 1;
+            calls < 2
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(calls, 2);
     }
 }

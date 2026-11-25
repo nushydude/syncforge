@@ -33,6 +33,71 @@ pub struct PreviewPlanStore {
     bytes: usize,
 }
 
+// Account for allocated capacities, not serialized lengths. Saturation makes overflow
+// fail closed. The fixed node allowance conservatively covers BTreeMap allocation.
+fn retained_preview_bytes(
+    pair_id_capacity: usize,
+    fingerprint_capacity: usize,
+    prepared: &crate::engine::PreparedPlan,
+) -> usize {
+    use crate::models::{FileEntry, SyncAction};
+    fn string(s: &String) -> usize {
+        s.capacity().saturating_add(32)
+    }
+    fn entry(e: &FileEntry) -> usize {
+        string(&e.relative_path).saturating_add(e.hash.as_ref().map_or(0, string))
+    }
+    fn action(a: &SyncAction) -> usize {
+        match a {
+            SyncAction::CopyLeftToRight { path }
+            | SyncAction::CopyRightToLeft { path }
+            | SyncAction::DeleteLeft { path }
+            | SyncAction::DeleteRight { path }
+            | SyncAction::CreateDirLeft { path }
+            | SyncAction::CreateDirRight { path } => string(path),
+            SyncAction::Conflict { path, left, right } => {
+                string(path).saturating_add(entry(left)).saturating_add(entry(right))
+            }
+            SyncAction::Skip { path, reason } => string(path).saturating_add(string(reason)),
+        }
+    }
+    let plan = &prepared.plan;
+    let mut size = std::mem::size_of::<StoredPreviewPlan>()
+        .saturating_add(128) // UUID, deque allocation and allocator overhead
+        .saturating_add(pair_id_capacity.saturating_add(32))
+        .saturating_add(fingerprint_capacity.saturating_add(32))
+        .saturating_add(string(&plan.pair_id))
+        .saturating_add(plan.actions.capacity().saturating_mul(std::mem::size_of::<SyncAction>()))
+        // Conflict-index vector is allocated after this estimate; reserve an upper bound.
+        .saturating_add(
+            plan.actions.len().saturating_mul(std::mem::size_of::<usize>()).saturating_mul(2),
+        )
+        .saturating_add(
+            plan.scan_warnings.capacity().saturating_mul(std::mem::size_of::<String>()),
+        );
+    for a in &plan.actions {
+        size = size.saturating_add(action(a));
+    }
+    for warning in &plan.scan_warnings {
+        size = size.saturating_add(string(warning));
+    }
+    for (path, error) in &plan.preview_file_errors {
+        size = size.saturating_add(256).saturating_add(string(path)).saturating_add(string(error));
+    }
+    for entries in [&prepared.preconditions.left, &prepared.preconditions.right] {
+        size = size
+            .saturating_add(entries.capacity().saturating_mul(std::mem::size_of::<FileEntry>()));
+        for e in entries {
+            size = size.saturating_add(entry(e));
+        }
+    }
+    for key in &prepared.root_keys {
+        size = size.saturating_add(string(key));
+    }
+    size = size.saturating_add(prepared.baseline_generation.as_ref().map_or(0, string));
+    size.saturating_add(prepared.baseline_revision.as_ref().map_or(0, string))
+}
+
 impl PreviewPlanStore {
     pub fn new() -> Self {
         Self { plans: VecDeque::new(), bytes: 0 }
@@ -48,16 +113,8 @@ impl PreviewPlanStore {
         self.remove_expired(now);
         let id = uuid::Uuid::new_v4().to_string();
         let plan = &prepared.plan;
-        let left_preconditions = &prepared.preconditions.left;
-        let right_preconditions = &prepared.preconditions.right;
-        let estimated_bytes = serde_json::to_vec(&plan).map(|bytes| bytes.len()).unwrap_or(0)
-            + serde_json::to_vec(&left_preconditions).map(|bytes| bytes.len()).unwrap_or(0)
-            + serde_json::to_vec(&right_preconditions).map(|bytes| bytes.len()).unwrap_or(0)
-            + plan
-                .preview_file_errors
-                .iter()
-                .map(|(path, error)| path.len() + error.len())
-                .sum::<usize>();
+        let estimated_bytes =
+            retained_preview_bytes(pair_id.capacity(), config_fingerprint.capacity(), &prepared);
         if estimated_bytes > PREVIEW_PLAN_MAX_BYTES {
             return Err("preview plan exceeds the bounded storage limit".into());
         }
@@ -822,6 +879,34 @@ mod tests {
     }
 
     #[test]
+    fn preview_accounting_uses_reserved_capacity_and_releases_it() {
+        let mut reason = String::with_capacity(1024 * 1024);
+        reason.push('x');
+        let prepared = crate::engine::PreparedPlan {
+            plan: crate::models::SyncPlan {
+                pair_id: "pair".into(),
+                actions: vec![crate::models::SyncAction::Skip { path: "file".into(), reason }],
+                scanned_left: 0,
+                scanned_right: 0,
+                scan_skipped_left: 0,
+                scan_skipped_right: 0,
+                scan_warnings: vec![],
+                requires_attention: false,
+                preview_file_errors: Default::default(),
+            },
+            preconditions: crate::engine::PlanPreconditions { left: vec![], right: vec![] },
+            root_keys: [String::new(), String::new()],
+            baseline_generation: None,
+            baseline_revision: None,
+        };
+        let mut store = PreviewPlanStore::new();
+        let id = store.insert("pair".into(), "config".into(), prepared, 100).unwrap();
+        assert!(store.bytes >= 1024 * 1024);
+        store.take(&id, "pair", "config", 101).unwrap();
+        assert_eq!(store.bytes, 0);
+    }
+
+    #[test]
     fn preview_plan_store_pages_bounds_and_validates_handles() {
         let mut store = PreviewPlanStore::new();
         let plan = crate::models::SyncPlan {
@@ -850,11 +935,14 @@ mod tests {
                     root_keys: [String::new(), String::new()],
                     baseline_generation: None,
                     baseline_revision: None,
-                    bounded: true,
                 },
                 100,
             )
             .expect("store plan");
+        assert!(
+            store.bytes
+                >= (PREVIEW_PAGE_MAX + 1) * std::mem::size_of::<crate::models::SyncAction>()
+        );
         let first = store
             .get_page(&id, "pair-a", "fingerprint-a", 0, PREVIEW_PAGE_MAX + 50, 101)
             .expect("first page");
@@ -864,6 +952,7 @@ mod tests {
         assert!(store
             .get_page(&id, "pair-a", "fingerprint-a", 0, 1, 100 + PREVIEW_PLAN_TTL_MS)
             .is_err());
+        assert_eq!(store.bytes, 0);
     }
 
     #[test]

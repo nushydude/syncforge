@@ -1,20 +1,20 @@
 # SyncForge performance baseline
 
-The PERF-001 harness creates deterministic fixtures in the OS temp directory, prints the exact path before use, measures the current workload phases, and removes only that directory on exit. It never stores generated trees in Git.
-
-Run the reproducible cases from a clean checkout:
+The harness creates deterministic private fixture trees in the OS temp directory, prints the exact path, and removes only that generated directory on exit. Never point it at real data. Run the cases with:
 
 ```text
-pnpm run perf:small
-pnpm run perf:medium
+pnpm run perf:small -- --enforce-budgets
+pnpm run perf:medium -- --enforce-budgets
 ```
 
-Override the fixture shape or seed when investigating a regression:
+Override the shape or seed when investigating a regression:
 
 ```text
-node scripts/perf/workload.mjs --case small --entries 10000 --depth 6 --mean-file-size 256 --changed-percent 10 --seed 20260802
+node scripts/perf/workload.mjs --case small --entries 1000 --depth 4 --mean-file-size 256 --changed-percent 10 --seed 20260802 --enforce-budgets
 ```
 
-The JSON report includes machine/build/cache metadata, phase wall times, peak working set (or process RSS when the platform sampler is unavailable), and test-only workload counters. The initial safety budgets are ten progress events per second plus five terminal/phase events and a maximum buffered run-item count of 1,000. Time is reported for comparison only; CI should gate on the bounded counters and generous machine-specific ceilings rather than elapsed time alone.
+At least one non-empty changed file is required. Separate generated Echo pairs exercise no-op and changed production runs. Changed destinations have different bytes and older modification times so the normal metadata comparison schedules copies. The harness requires completed status, expected copies and transferred bytes, no deletes, changed-run item persistence, unchanged no-op file content and timestamps, and matching changed output content and counts. These checks are always enforced.
 
-The current harness measures the deterministic workload shape and its scan/plan/history/duplicate/sniffer data-flow proxies. PERF-002 and PERF-003 will replace the corresponding counters with production test hooks as those paths are bounded.
+The JSON report records production-run counters and timings from Rust. It also reports simplified JavaScript measurements for scan, plan, History, Duplicates, and Folder Sniffer. The test event emitter measures call counts. On Windows and Linux, `rustProcessPeakResidentBytesAtRunEnd` is the Rust test process's cumulative peak at the end of each run. The changed run's value can include the earlier no-op run. On other platforms the field is null. The Node parent has a separate sampled working set field. Cache state is unknown and timings use the working-tree test build.
+
+With `--enforce-budgets`, each run's progress events are bounded by ten per second of that Rust run plus ten events for phase transitions, pending or terminal events, and scheduling tolerance. Run-item buffering is bounded at 1,000. CI enforces these counter budgets for both sizes. Elapsed time is reported and used to calculate the event allowance. Compare timings across equivalent machine, build, and cache conditions.

@@ -17,10 +17,11 @@ use crate::models::{
 use crate::path_normalization;
 use crate::persistence::DatabaseHandle;
 use crate::scanner::{
-    assert_destructive_scan_allowed, scan_directory, scan_directory_cancellable,
-    validate_name_mapping,
+    assert_destructive_scan_allowed, scan_directory_cancellable, validate_name_mapping_cancellable,
 };
 
+#[cfg(test)]
+use crate::scanner::scan_directory;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 
@@ -63,7 +64,6 @@ pub struct PreparedPlan {
     pub root_keys: [String; 2],
     pub baseline_generation: Option<String>,
     pub baseline_revision: Option<String>,
-    pub bounded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +192,17 @@ pub(crate) fn commit_temp_file(temp: &Path, dest: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
 pub fn safe_copy_file(src: &Path, dest: &Path, verify: bool) -> io::Result<u64> {
+    safe_copy_file_cancellable(src, dest, verify, &AtomicBool::new(false))
+}
+
+fn safe_copy_file_cancellable(
+    src: &Path,
+    dest: &Path,
+    verify: bool,
+    cancel: &AtomicBool,
+) -> io::Result<u64> {
     ensure_parent(dest)?;
     let stage_dir = loop {
         let parent = dest.parent().unwrap_or_else(|| Path::new("."));
@@ -207,8 +217,10 @@ pub fn safe_copy_file(src: &Path, dest: &Path, verify: bool) -> io::Result<u64> 
     let result = (|| {
         let bytes = fs::copy(src, &temp)?;
         if verify {
-            let src_hash = hashing::hash_file(src)?;
-            let dest_hash = hashing::hash_file(&temp)?;
+            let src_hash =
+                hashing::hash_file_with_progress(src, |_, _| !cancel.load(Ordering::Relaxed))?;
+            let dest_hash =
+                hashing::hash_file_with_progress(&temp, |_, _| !cancel.load(Ordering::Relaxed))?;
             if src_hash != dest_hash {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -297,10 +309,16 @@ fn save_post_run_snapshot(
                 return Err("Post-run folders did not converge; baseline retained".into());
             }
             if !l.is_dir {
-                let lh = hashing::hash_file(&join_relative(left_root, &l.relative_path))
-                    .map_err(|e| format!("Post-run verification failed: {e}"))?;
-                let rh = hashing::hash_file(&join_relative(right_root, &r.relative_path))
-                    .map_err(|e| format!("Post-run verification failed: {e}"))?;
+                let lh = hashing::hash_file_with_progress(
+                    &join_relative(left_root, &l.relative_path),
+                    |_, _| !cancel.load(Ordering::Relaxed),
+                )
+                .map_err(|e| format!("Post-run verification failed: {e}"))?;
+                let rh = hashing::hash_file_with_progress(
+                    &join_relative(right_root, &r.relative_path),
+                    |_, _| !cancel.load(Ordering::Relaxed),
+                )
+                .map_err(|e| format!("Post-run verification failed: {e}"))?;
                 if lh != rh {
                     return Err("Post-run content did not converge; baseline retained".into());
                 }
@@ -311,7 +329,7 @@ fn save_post_run_snapshot(
                 return Err("post-run verification cancelled".into());
             }
             // Re-read both hashes after comparison to detect changes during verification.
-            let mut verification_budget = ValidationBudget::default();
+            let mut verification_budget = ValidationBudget { cancel: Some(cancel) };
             validate_precondition(
                 left_root,
                 Some(&l),
@@ -436,6 +454,19 @@ where
         )
     });
 
+    if matches!(&result, Err(error) if error == "scan cancelled") {
+        return finish_cancelled(
+            db,
+            pair,
+            &left_root,
+            &right_root,
+            &mut report,
+            &mut counted_emit,
+            0,
+            0,
+            None,
+        );
+    }
     if let Err(ref error) = result {
         if report.finished_at.is_none() {
             finish_failed(db, &mut report, &mut counted_emit, error)?;
@@ -502,21 +533,52 @@ where
         {
             return Err("Preview needs refreshing: roots or baseline changed".into());
         }
-        let left = scan_directory(left_root, &pair.filters)
-            .map_err(|e| format!("Preview needs refreshing: scan left failed: {e}"))?;
-        let right = scan_directory(right_root, &pair.filters)
-            .map_err(|e| format!("Preview needs refreshing: scan right failed: {e}"))?;
+        let left = scan_directory_cancellable(left_root, &pair.filters, cancel).map_err(|e| {
+            if matches!(e, crate::scanner::ScanError::Cancelled) {
+                "scan cancelled".into()
+            } else {
+                format!("Preview needs refreshing: scan left failed: {e}")
+            }
+        })?;
+        let right = scan_directory_cancellable(right_root, &pair.filters, cancel).map_err(|e| {
+            if matches!(e, crate::scanner::ScanError::Cancelled) {
+                "scan cancelled".into()
+            } else {
+                format!("Preview needs refreshing: scan right failed: {e}")
+            }
+        })?;
         assert_destructive_scan_allowed(pair.mode, &left, &right)
             .map_err(|e| format!("Preview needs refreshing: {e}"))?;
-        validate_name_mapping(left_root, right_root, &left.entries, &right.entries)
-            .map_err(|e| format!("Preview needs refreshing: {e}"))?;
+        validate_name_mapping_cancellable(
+            left_root,
+            right_root,
+            &left.entries,
+            &right.entries,
+            cancel,
+        )
+        .map_err(|e| {
+            if e == "scan cancelled" {
+                e
+            } else {
+                format!("Preview needs refreshing: {e}")
+            }
+        })?;
         let check_scope = |observed: &[FileEntry], expected: &[FileEntry]| -> Result<(), String> {
-            let expected: HashMap<_, _> =
-                expected.iter().map(|entry| (entry.relative_path.as_str(), entry)).collect();
+            let mut expected_map = HashMap::new();
+            for entry in expected {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("scan cancelled".into());
+                }
+                expected_map.insert(entry.relative_path.as_str(), entry);
+            }
+            let expected = expected_map;
             if observed.len() != expected.len() {
                 return Err("Preview needs refreshing: folder contents changed".into());
             }
             for entry in observed {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("scan cancelled".into());
+                }
                 let Some(old) = expected.get(entry.relative_path.as_str()) else {
                     return Err(format!(
                         "Preview needs refreshing: folder contents changed at {}",
@@ -544,19 +606,33 @@ where
             return Err("Preview needs refreshing: conflict choices require a reviewed plan".into());
         }
         let (plan, left, right) =
-            crate::commands::preview::build_fresh_plan(pair, baseline.baseline.as_ref(), cancel)?;
+            crate::commands::preview::build_fresh_plan(pair, baseline.baseline.as_ref(), cancel)
+                .map_err(|e| {
+                    if matches!(
+                        e.as_str(),
+                        "scan left failed: cancelled"
+                            | "scan right failed: cancelled"
+                            | "scan cancelled"
+                    ) {
+                        "scan cancelled".into()
+                    } else {
+                        e
+                    }
+                })?;
         PreparedPlan {
             plan,
             preconditions: PlanPreconditions { left, right },
             root_keys: root_keys.clone(),
             baseline_generation: baseline.generation.clone(),
             baseline_revision: baseline.baseline.as_ref().map(|b| b.revision.clone()),
-            bounded: false,
         }
     };
-    let PreparedPlan { mut plan, preconditions, bounded, .. } = prepared;
+    let PreparedPlan { mut plan, preconditions, .. } = prepared;
     // Old cached plans may still contain recursive directory deletions.
     for action in &mut plan.actions {
+        if cancel.load(Ordering::Relaxed) {
+            return finish_cancelled(db, pair, left_root, right_root, report, emit, 0, 0, None);
+        }
         let candidate = match action {
             SyncAction::DeleteLeft { path } => Some((left_root, path.clone())),
             SyncAction::DeleteRight { path } => Some((right_root, path.clone())),
@@ -581,8 +657,8 @@ where
         return Err("Preview needs refreshing: content verification requires attention. Fix file access and preview again.".into());
     }
 
-    let precondition_index = Some(PreconditionIndex::new(&preconditions));
-    let mut initial_validation_budget = ValidationBudget { bounded, ..Default::default() };
+    let precondition_index = Some(PreconditionIndex::new_cancellable(&preconditions, cancel)?);
+    let mut initial_validation_budget = ValidationBudget { cancel: Some(cancel) };
     if let Some(index) = precondition_index.as_ref() {
         for action in &plan.actions {
             if preview_file_error(&plan, action).is_some() {
@@ -596,7 +672,14 @@ where
                 &mut initial_validation_budget,
             ) {
                 Ok(()) => {}
-                Err(error) => return Err(format!("Preview needs refreshing: {error}")),
+                Err(error) => {
+                    if matches!(error, PreconditionError::Cancelled) {
+                        return finish_cancelled(
+                            db, pair, left_root, right_root, report, emit, 0, 0, None,
+                        );
+                    }
+                    return Err(format!("Preview needs refreshing: {error}"));
+                }
             }
         }
     }
@@ -637,7 +720,7 @@ where
     let mut stopped_on_error = false;
     let mut last_executed_path = None;
     let mut last_current = 0;
-    let mut action_validation_budget = ValidationBudget { bounded, ..Default::default() };
+    let mut action_validation_budget = ValidationBudget { cancel: Some(cancel) };
     for (index, action) in
         plan.actions.iter().filter(|a| !matches!(a, SyncAction::Skip { .. })).enumerate()
     {
@@ -684,11 +767,29 @@ where
                 )
             });
             match precondition {
-                Ok(()) => {
-                    execute_action(action, left_root, right_root, verify_hashes, use_recycle_bin)
-                }
+                Ok(()) => execute_action(
+                    action,
+                    left_root,
+                    right_root,
+                    verify_hashes,
+                    use_recycle_bin,
+                    cancel,
+                ),
                 Err(error) => {
                     flush_run_items(db, &mut run_items)?;
+                    if matches!(error, PreconditionError::Cancelled) {
+                        return finish_cancelled(
+                            db,
+                            pair,
+                            left_root,
+                            right_root,
+                            report,
+                            emit,
+                            index as u32,
+                            total,
+                            last_executed_path.map(str::to_owned),
+                        );
+                    }
                     return Err(format!("Preview needs refreshing: {error}"));
                 }
             }
@@ -716,6 +817,20 @@ where
                 }
             }
             Err(e) => {
+                if e == "copy verification cancelled" {
+                    flush_run_items(db, &mut run_items)?;
+                    return finish_cancelled(
+                        db,
+                        pair,
+                        left_root,
+                        right_root,
+                        report,
+                        emit,
+                        index as u32,
+                        total,
+                        last_executed_path.map(str::to_owned),
+                    );
+                }
                 let msg = e.to_string();
                 report.errors.push(format!("{path}: {msg}"));
                 let is_conflict = matches!(action, SyncAction::Conflict { .. });
@@ -891,37 +1006,61 @@ struct PreconditionIndex<'a> {
 }
 
 #[derive(Default)]
-struct ValidationBudget {
-    bounded: bool,
-    hashed_bytes: u64,
-    hashed_files: usize,
+struct ValidationBudget<'a> {
+    cancel: Option<&'a AtomicBool>,
+}
+
+impl ValidationBudget<'_> {
+    fn check_cancel(&self) -> Result<(), PreconditionError> {
+        if self.cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(PreconditionError::Cancelled);
+        }
+        Ok(())
+    }
 }
 
 impl<'a> PreconditionIndex<'a> {
+    #[cfg(test)]
     fn new(preconditions: &'a PlanPreconditions) -> Self {
-        let mut left_ordered: Vec<_> = preconditions.left.iter().collect();
-        let mut right_ordered: Vec<_> = preconditions.right.iter().collect();
-        left_ordered.sort_unstable_by_key(|entry| entry.relative_path.as_str());
-        right_ordered.sort_unstable_by_key(|entry| entry.relative_path.as_str());
-        Self {
-            left: preconditions
-                .left
-                .iter()
-                .map(|entry| (entry.relative_path.as_str(), entry))
-                .collect(),
-            right: preconditions
-                .right
-                .iter()
-                .map(|entry| (entry.relative_path.as_str(), entry))
-                .collect(),
-            left_ordered,
-            right_ordered,
+        Self::new_cancellable(preconditions, &AtomicBool::new(false)).unwrap()
+    }
+
+    fn new_cancellable(
+        preconditions: &'a PlanPreconditions,
+        cancel: &AtomicBool,
+    ) -> Result<Self, String> {
+        let mut left = HashMap::new();
+        let mut right = HashMap::new();
+        let mut left_ordered = Vec::with_capacity(preconditions.left.len());
+        let mut right_ordered = Vec::with_capacity(preconditions.right.len());
+        for (entries, map, ordered) in [
+            (&preconditions.left, &mut left, &mut left_ordered),
+            (&preconditions.right, &mut right, &mut right_ordered),
+        ] {
+            for entry in entries {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("scan cancelled".into());
+                }
+                map.insert(entry.relative_path.as_str(), entry);
+                ordered.push(entry);
+            }
         }
+        left_ordered.sort_unstable_by_key(|entry| entry.relative_path.as_str());
+        if cancel.load(Ordering::Relaxed) {
+            return Err("scan cancelled".into());
+        }
+        right_ordered.sort_unstable_by_key(|entry| entry.relative_path.as_str());
+        if cancel.load(Ordering::Relaxed) {
+            return Err("scan cancelled".into());
+        }
+        Ok(Self { left, right, left_ordered, right_ordered })
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 enum PreconditionError {
+    #[error("validation cancelled")]
+    Cancelled,
     #[error("{0}")]
     FileAccess(String),
     #[error("{0}")]
@@ -933,8 +1072,9 @@ fn validate_action_precondition(
     left_root: &Path,
     right_root: &Path,
     index: &PreconditionIndex<'_>,
-    budget: &mut ValidationBudget,
+    budget: &mut ValidationBudget<'_>,
 ) -> Result<(), PreconditionError> {
+    budget.check_cancel()?;
     let path = action_path(action);
     match action {
         SyncAction::CopyLeftToRight { .. } => {
@@ -1029,17 +1169,12 @@ fn validate_subtree(
     entries: &[&FileEntry],
     directory: &str,
     label: &str,
-    budget: &mut ValidationBudget,
+    budget: &mut ValidationBudget<'_>,
 ) -> Result<(), PreconditionError> {
     let prefix = format!("{directory}/");
-    let expected_paths: std::collections::HashSet<&str> = entries
-        .iter()
-        .skip(entries.partition_point(|entry| entry.relative_path.as_str() < prefix.as_str()))
-        .take_while(|entry| entry.relative_path.starts_with(&prefix))
-        .map(|entry| entry.relative_path.as_str())
-        .collect();
     let subtree_root = join_relative(root, directory);
     for entry_result in WalkDir::new(&subtree_root).follow_links(false).into_iter() {
+        budget.check_cancel()?;
         let entry = entry_result.map_err(|error| {
             PreconditionError::FileAccess(format!(
                 "Preview validation failed while scanning {directory}: {error}"
@@ -1050,7 +1185,11 @@ fn validate_subtree(
             continue;
         };
         let relative_path = relative.to_string_lossy().replace('\\', "/");
-        if relative_path != directory && !expected_paths.contains(relative_path.as_str()) {
+        if relative_path != directory
+            && entries
+                .binary_search_by(|expected| expected.relative_path.as_str().cmp(&relative_path))
+                .is_err()
+        {
             return Err(PreconditionError::UnsafePlan(format!(
                 "Preview is stale: {label} changed at {relative_path}"
             )));
@@ -1071,11 +1210,9 @@ fn validate_precondition(
     expected: Option<&FileEntry>,
     relative_path: &str,
     label: &str,
-    budget: &mut ValidationBudget,
+    budget: &mut ValidationBudget<'_>,
 ) -> Result<(), PreconditionError> {
-    const PRECONDITION_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
-    const PRECONDITION_HASH_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
-    const PRECONDITION_HASH_BUDGET_FILES: usize = 10_000;
+    budget.check_cancel()?;
     let path = join_relative(root, relative_path);
     let actual = match fs::metadata(&path) {
         Ok(metadata) => Some(metadata),
@@ -1105,29 +1242,19 @@ fn validate_precondition(
                     "Preview is stale: {label} changed at {relative_path}"
                 )));
             }
-            if budget.bounded && !expected.is_dir && expected.size > PRECONDITION_HASH_MAX_BYTES {
-                return Err(PreconditionError::UnsafePlan(format!(
-                    "Preview cannot safely validate large file at {relative_path}; preview again"
-                )));
-            }
-            if !expected.is_dir && expected.size > 0 {
-                budget.hashed_bytes = budget.hashed_bytes.saturating_add(expected.size);
-                budget.hashed_files += 1;
-                if budget.bounded
-                    && (budget.hashed_bytes > PRECONDITION_HASH_BUDGET_BYTES
-                        || budget.hashed_files > PRECONDITION_HASH_BUDGET_FILES)
-                {
-                    return Err(PreconditionError::UnsafePlan(
-                        "Preview validation exceeds the bounded content budget".into(),
-                    ));
-                }
-            }
             // Scans intentionally avoid storing hashes for every entry. Rehash
-            // bounded regular files here so same-metadata edits cannot bypass a
+            // regular files here so same-metadata edits cannot bypass a
             // reusable preview's stale-plan guard.
             if !expected.is_dir && expected.size > 0 {
-                let actual_hash = crate::hashing::hash_file(&path).map_err(|error| {
-                    if error.kind() == io::ErrorKind::NotFound {
+                let actual_hash = crate::hashing::hash_file_with_progress(&path, |_, _| {
+                    budget.cancel.is_none_or(|flag| !flag.load(Ordering::Relaxed))
+                })
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::Interrupted
+                        && budget.cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+                    {
+                        PreconditionError::Cancelled
+                    } else if error.kind() == io::ErrorKind::NotFound {
                         PreconditionError::UnsafePlan(format!(
                             "Preview is stale: {label} disappeared at {relative_path}"
                         ))
@@ -1160,6 +1287,7 @@ fn execute_action(
     right_root: &Path,
     verify_hashes: bool,
     use_recycle_bin: bool,
+    cancel: &AtomicBool,
 ) -> Result<ActionStats, String> {
     match action {
         SyncAction::CreateDirLeft { path } => {
@@ -1173,13 +1301,27 @@ fn execute_action(
         SyncAction::CopyLeftToRight { path } => {
             let src = join_relative(left_root, path);
             let dest = join_relative(right_root, path);
-            let bytes = safe_copy_file(&src, &dest, verify_hashes).map_err(|e| e.to_string())?;
+            let bytes =
+                safe_copy_file_cancellable(&src, &dest, verify_hashes, cancel).map_err(|e| {
+                    if e.kind() == io::ErrorKind::Interrupted && cancel.load(Ordering::Relaxed) {
+                        "copy verification cancelled".into()
+                    } else {
+                        e.to_string()
+                    }
+                })?;
             Ok(ActionStats { copied: 1, deleted: 0, bytes })
         }
         SyncAction::CopyRightToLeft { path } => {
             let src = join_relative(right_root, path);
             let dest = join_relative(left_root, path);
-            let bytes = safe_copy_file(&src, &dest, verify_hashes).map_err(|e| e.to_string())?;
+            let bytes =
+                safe_copy_file_cancellable(&src, &dest, verify_hashes, cancel).map_err(|e| {
+                    if e.kind() == io::ErrorKind::Interrupted && cancel.load(Ordering::Relaxed) {
+                        "copy verification cancelled".into()
+                    } else {
+                        e.to_string()
+                    }
+                })?;
             Ok(ActionStats { copied: 1, deleted: 0, bytes })
         }
         SyncAction::DeleteLeft { path } => {
@@ -1276,6 +1418,30 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    #[test]
+    fn cancelled_copy_verification_preserves_destination_and_cleans_stage() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&destination, b"original").unwrap();
+        let error = safe_copy_file_cancellable(&source, &destination, true, &AtomicBool::new(true))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read(destination).unwrap(), b"original");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn cancellation_stops_precondition_validation_and_index_building() {
+        let flag = AtomicBool::new(true);
+        let preconditions = PlanPreconditions { left: vec![], right: vec![] };
+        assert!(PreconditionIndex::new_cancellable(&preconditions, &flag).is_err());
+        let mut budget = ValidationBudget { cancel: Some(&flag) };
+        assert!(validate_precondition(Path::new("unused"), None, "item", "target", &mut budget)
+            .is_err());
+    }
 
     #[test]
     fn staging_preserves_existing_sibling_and_cleans_failed_stage() {
@@ -1586,7 +1752,6 @@ mod tests {
             root_keys,
             baseline_generation: baseline.generation,
             baseline_revision: baseline.baseline.map(|b| b.revision),
-            bounded: true,
         }
     }
 
@@ -1942,7 +2107,7 @@ mod tests {
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let report = run_pair_impl(&db, &pair, RunOptions::default(), &cancel, |p| {
             if let ProgressEvent::Update(p) = p {
-                if p.phase == "running" && p.current >= 1 {
+                if p.phase == "running" && p.current >= 2 {
                     cancel.store(true, Ordering::Relaxed);
                 }
             }

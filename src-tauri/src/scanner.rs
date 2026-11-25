@@ -89,19 +89,36 @@ pub fn assert_destructive_scan_allowed(
 /// A spelling absent from a scan must also be absent on the opposite volume.
 /// This asks the destination filesystem about its own case rules, including
 /// per-directory case sensitivity, without rewriting names or snapshot keys.
+#[cfg(test)]
 pub fn validate_name_mapping(
     left_root: &Path,
     right_root: &Path,
     left: &[FileEntry],
     right: &[FileEntry],
 ) -> Result<(), String> {
+    validate_name_mapping_cancellable(left_root, right_root, left, right, &NEVER_CANCEL)
+}
+
+pub fn validate_name_mapping_cancellable(
+    left_root: &Path,
+    right_root: &Path,
+    left: &[FileEntry],
+    right: &[FileEntry],
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("scan cancelled".into());
+    }
     #[cfg(windows)]
     {
-        validate_prospective_windows_names(left, right_root)?;
-        validate_prospective_windows_names(right, left_root)?;
+        validate_prospective_windows_names(left, right_root, cancel)?;
+        validate_prospective_windows_names(right, left_root, cancel)?;
     }
     for (entries, other, other_root) in [(left, right, right_root), (right, left, left_root)] {
         for entry in entries {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("scan cancelled".into());
+            }
             if other
                 .binary_search_by(|candidate| candidate.relative_path.cmp(&entry.relative_path))
                 .is_ok()
@@ -127,6 +144,7 @@ pub fn validate_name_mapping(
 fn validate_prospective_windows_names(
     entries: &[FileEntry],
     target_root: &Path,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     use std::cmp::Ordering;
     use std::os::windows::ffi::OsStrExt;
@@ -172,6 +190,9 @@ fn validate_prospective_windows_names(
         return Err("Cannot safely compare file names on this Windows filesystem".into());
     }
     for pair in names.windows(2) {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("scan cancelled".into());
+        }
         if pair[0].0 != pair[1].0 && compare(&pair[0].1, &pair[1].1)? == Ordering::Equal {
             let mut parent = target_root.to_path_buf();
             for (a, b) in pair[0].0.split('/').zip(pair[1].0.split('/')) {
@@ -301,9 +322,11 @@ pub use scan_test_hooks::with_scan_counting;
 const CANCEL_CHECK_INTERVAL: usize = 512;
 
 /// Cancel flag for callers that have nothing to cancel with.
+#[cfg(test)]
 static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
 
 /// Scans `root` in parallel and returns filtered entries keyed by relative path.
+#[cfg(test)]
 pub fn scan_directory(root: &Path, filters: &Filters) -> ScanResult {
     scan_directory_cancellable(root, filters, &NEVER_CANCEL)
 }
@@ -311,7 +334,7 @@ pub fn scan_directory(root: &Path, filters: &Filters) -> ScanResult {
 /// How often the walk reports progress — often enough to look alive.
 const PROGRESS_REPORT_INTERVAL: usize = 128;
 
-/// Same as [`scan_directory`], but aborts with [`ScanError::Cancelled`] when
+/// Scans with cancellation and aborts with [`ScanError::Cancelled`] when
 /// `cancel` is set. Long scans on spinning disks must be stoppable.
 pub fn scan_directory_cancellable(
     root: &Path,
@@ -506,12 +529,16 @@ mod tests {
         other.relative_path = "name".into();
         let sensitive = windows_directory_case_sensitive(root.path()).unwrap();
         assert_eq!(
-            validate_prospective_windows_names(&[entry.clone(), other.clone()], root.path())
-                .is_ok(),
+            validate_prospective_windows_names(
+                &[entry.clone(), other.clone()],
+                root.path(),
+                &NEVER_CANCEL
+            )
+            .is_ok(),
             sensitive
         );
         assert_eq!(
-            validate_prospective_windows_names(&[other, entry], root.path()).is_ok(),
+            validate_prospective_windows_names(&[other, entry], root.path(), &NEVER_CANCEL).is_ok(),
             sensitive
         );
     }

@@ -13,7 +13,8 @@ use crate::models::{
 use crate::path_normalization;
 use crate::persistence::DatabaseHandle;
 use crate::scanner::{
-    assert_destructive_scan_allowed, scan_directory_observed, validate_name_mapping, ScanIntegrity,
+    assert_destructive_scan_allowed, scan_directory_observed, validate_name_mapping_cancellable,
+    ScanIntegrity,
 };
 use crate::state::{
     canonical_job_roots, AppState, HeavyJobKind, HeavyJobPermit, WorkCoordinator, WorkRequest,
@@ -99,14 +100,7 @@ pub(crate) fn build_preview(
     snapshot_entries: Option<&SyncBaseline>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(SyncPlan, Vec<FileEntry>, Vec<FileEntry>), String> {
-    build_preview_inner(
-        pair,
-        snapshot_entries,
-        cancel,
-        Some(Arc::clone(cancel)),
-        &silent_reporter(),
-        true,
-    )
+    build_preview_inner(pair, snapshot_entries, cancel, &silent_reporter())
 }
 
 /// `on_scan` receives `(phase, count, latest path)` through every phase of the
@@ -117,7 +111,7 @@ pub(crate) fn build_preview_observed(
     cancel: &Arc<AtomicBool>,
     on_scan: &ScanReporter,
 ) -> Result<(SyncPlan, Vec<FileEntry>, Vec<FileEntry>), String> {
-    build_preview_inner(pair, snapshot_entries, cancel, Some(Arc::clone(cancel)), on_scan, true)
+    build_preview_inner(pair, snapshot_entries, cancel, on_scan)
 }
 
 pub(crate) fn build_fresh_plan(
@@ -125,16 +119,14 @@ pub(crate) fn build_fresh_plan(
     baseline: Option<&SyncBaseline>,
     cancel: &AtomicBool,
 ) -> Result<(SyncPlan, Vec<FileEntry>, Vec<FileEntry>), String> {
-    build_preview_inner(pair, baseline, cancel, None, &silent_reporter(), false)
+    build_preview_inner(pair, baseline, cancel, &silent_reporter())
 }
 
 fn build_preview_inner(
     pair: &FolderPair,
     snapshot_entries: Option<&SyncBaseline>,
     cancel: &AtomicBool,
-    owned_cancel: Option<Arc<AtomicBool>>,
     on_scan: &ScanReporter,
-    bounded: bool,
 ) -> Result<(SyncPlan, Vec<FileEntry>, Vec<FileEntry>), String> {
     if pair.id.is_empty() {
         return Err("pair id required for preview".into());
@@ -160,11 +152,12 @@ fn build_preview_inner(
     .map_err(|e| format!("scan right failed: {e}"))?;
 
     assert_destructive_scan_allowed(pair.mode, &left_scan, &right_scan)?;
-    validate_name_mapping(
+    validate_name_mapping_cancellable(
         Path::new(&left_path),
         Path::new(&right_path),
         &left_scan.entries,
         &right_scan.entries,
+        cancel,
     )?;
 
     let scan = ScanIntegrity::from_sides(&left_scan, &right_scan);
@@ -180,7 +173,7 @@ fn build_preview_inner(
         DiffOptions {
             left_root: Some(Path::new(&left_path).to_path_buf()),
             right_root: Some(Path::new(&right_path).to_path_buf()),
-            cancel: owned_cancel,
+            cancel: Some(cancel),
             hash_progress: Some({
                 let reporter = Arc::clone(on_scan);
                 Arc::new(move |files, path: &str| reporter("comparing", files, path))
@@ -197,15 +190,12 @@ fn build_preview_inner(
     {
         return Err("Preview requires attention: a content hash could not be read safely. Fix access and preview again.".into());
     }
-    let mut preview_hash_bytes = 0;
     let mut preview_hash_files = 0;
     populate_preview_hashes_for_actions(
         &mut left_scan.entries,
         Path::new(&left_path),
         &plan.actions,
-        &mut preview_hash_bytes,
         &mut preview_hash_files,
-        bounded,
         cancel,
         pair.continue_on_error.then_some(&mut plan.preview_file_errors),
         &mut |files, path| on_scan("hashing left", files, path),
@@ -215,9 +205,7 @@ fn build_preview_inner(
         &mut right_scan.entries,
         Path::new(&right_path),
         &plan.actions,
-        &mut preview_hash_bytes,
         &mut preview_hash_files,
-        bounded,
         cancel,
         pair.continue_on_error.then_some(&mut plan.preview_file_errors),
         &mut |files, path| on_scan("hashing right", files, path),
@@ -236,39 +224,36 @@ fn populate_preview_hashes_for_actions(
     entries: &mut [FileEntry],
     root: &Path,
     actions: &[SyncAction],
-    hashed_bytes: &mut u64,
     hashed_files: &mut usize,
-    bounded: bool,
     cancel: &AtomicBool,
     mut file_errors: Option<&mut BTreeMap<String, String>>,
     on_hash: &mut dyn FnMut(u64, &str),
 ) -> Result<(), String> {
-    const PREVIEW_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
-    const PREVIEW_SUBTREE_HASH_MAX_BYTES: u64 = 512 * 1024 * 1024;
-    const PREVIEW_SUBTREE_HASH_MAX_FILES: usize = 10_000;
-    let paths: HashSet<&str> = actions
-        .iter()
-        .filter_map(|action| match action {
+    let mut paths = HashSet::new();
+    let mut deleted_directories = HashSet::new();
+    for action in actions {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("scan cancelled".into());
+        }
+        match action {
             SyncAction::CopyLeftToRight { path }
             | SyncAction::CopyRightToLeft { path }
-            | SyncAction::DeleteLeft { path }
-            | SyncAction::DeleteRight { path }
             | SyncAction::CreateDirLeft { path }
             | SyncAction::CreateDirRight { path }
-            | SyncAction::Conflict { path, .. } => Some(path.as_str()),
-            SyncAction::Skip { .. } => None,
-        })
-        .collect();
-    let deleted_directories: HashSet<&str> = actions
-        .iter()
-        .filter_map(|action| match action {
-            SyncAction::DeleteLeft { path } | SyncAction::DeleteRight { path } => {
-                Some(path.as_str())
+            | SyncAction::Conflict { path, .. } => {
+                paths.insert(path.as_str());
             }
-            _ => None,
-        })
-        .collect();
+            SyncAction::DeleteLeft { path } | SyncAction::DeleteRight { path } => {
+                paths.insert(path.as_str());
+                deleted_directories.insert(path.as_str());
+            }
+            SyncAction::Skip { .. } => {}
+        }
+    }
     for entry in entries.iter_mut() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("scan cancelled".into());
+        }
         let under_deleted_directory = entry
             .relative_path
             .split('/')
@@ -284,20 +269,7 @@ fn populate_preview_hashes_for_actions(
         if !is_selected || entry.is_dir || entry.size == 0 {
             continue;
         }
-        if bounded && entry.size > PREVIEW_HASH_MAX_BYTES {
-            return Err(format!(
-                "preview cannot safely validate large file at {}; reduce the workload or preview again",
-                entry.relative_path
-            ));
-        }
-        *hashed_bytes = (*hashed_bytes).saturating_add(entry.size);
         *hashed_files += 1;
-        if bounded
-            && (*hashed_bytes > PREVIEW_SUBTREE_HASH_MAX_BYTES
-                || *hashed_files > PREVIEW_SUBTREE_HASH_MAX_FILES)
-        {
-            return Err("preview content exceeds the bounded validation budget".into());
-        }
         // Hashing is the slowest phase of a preview; without this check a cancel
         // during it would be ignored until every selected file had been read.
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -305,9 +277,14 @@ fn populate_preview_hashes_for_actions(
         }
         on_hash(*hashed_files as u64, &entry.relative_path);
         let path = root.join(entry.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        match crate::hashing::hash_file(&path) {
+        match crate::hashing::hash_file_with_progress(&path, |_, _| {
+            !cancel.load(std::sync::atomic::Ordering::Relaxed)
+        }) {
             Ok(hash) => entry.hash = Some(hash),
             Err(error) => {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("scan cancelled".into());
+                }
                 let message = format!("content hash failed at {}: {error}", entry.relative_path);
                 match file_errors.as_deref_mut() {
                     Some(file_errors) if error.kind() != ErrorKind::NotFound => {
@@ -362,7 +339,9 @@ pub async fn preview_pair(
         let last_event = std::sync::Mutex::new(None::<std::time::Instant>);
         let reporter: ScanReporter = Arc::new(move |side: &str, entries, path: &str| {
             {
-                let Ok(mut last) = last_event.lock() else { return };
+                let Ok(mut last) = last_event.lock() else {
+                    return;
+                };
                 let now = std::time::Instant::now();
                 // Always let a phase change through, otherwise the UI can sit on
                 // a stale phase for as long as the throttle window.
@@ -403,7 +382,6 @@ pub async fn preview_pair(
                 root_keys,
                 baseline_generation: baseline.generation,
                 baseline_revision: baseline.baseline.map(|b| b.revision),
-                bounded: true,
             },
             created_at,
         )?;
@@ -654,7 +632,6 @@ mod tests {
                 root_keys,
                 baseline_generation: baseline.generation,
                 baseline_revision: baseline.baseline.map(|b| b.revision),
-                bounded: true,
             }),
             ..RunOptions::default()
         };
@@ -873,5 +850,253 @@ mod tests {
         assert!(err.contains("skipped"));
 
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("restore");
+    }
+    #[test]
+    fn selection_does_not_impose_read_budgets() {
+        use crate::models::SyncAction;
+        use std::sync::atomic::AtomicBool;
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("fixture"), b"x").unwrap();
+        // Synthetic sizes exercise the old per-file and aggregate guards without
+        // allocating hundreds of MiB. The repeated entries exercise the old file cap.
+        let item = FileEntry {
+            relative_path: "fixture".into(),
+            size: 513 * 1024 * 1024,
+            modified_secs: 0,
+            modified_nanos: 0,
+            is_dir: false,
+            hash: None,
+            deleted: false,
+        };
+        let mut entries = vec![item; 10_001];
+        let actions = vec![SyncAction::CopyLeftToRight { path: "fixture".into() }];
+        let mut count = 0;
+        super::populate_preview_hashes_for_actions(
+            &mut entries,
+            dir.path(),
+            &actions,
+            &mut count,
+            &AtomicBool::new(false),
+            None,
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(count, 10_001);
+        assert!(entries.iter().all(|entry| entry.hash.is_some()));
+    }
+    #[cfg(windows)]
+    fn create_sparse_fixture(path: &std::path::Path, size: u64) {
+        use std::ffi::c_void;
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn DeviceIoControl(
+                device: *mut c_void,
+                code: u32,
+                input: *const c_void,
+                input_len: u32,
+                output: *mut c_void,
+                output_len: u32,
+                returned: *mut u32,
+                overlapped: *mut c_void,
+            ) -> i32;
+        }
+        let file = fs::File::create(path).unwrap();
+        let mut returned = 0;
+        let marked_sparse = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                0x0009_00c4,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            marked_sparse,
+            0,
+            "mark generated fixture sparse: {}",
+            std::io::Error::last_os_error()
+        );
+        file.set_len(size).unwrap();
+        drop(file);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn preview_accepts_real_sparse_file_over_512_mib() {
+        let data = TempDir::new().unwrap();
+        let left = data.path().join("left");
+        let right = data.path().join("right");
+        fs::create_dir_all(&left).unwrap();
+        fs::create_dir_all(&right).unwrap();
+        create_sparse_fixture(&left.join("large.bin"), 512 * 1024 * 1024 + 1);
+        let db = Database::open(&data.path().join("test.db")).unwrap();
+        save_echo_pair(&db, "large", &left, &right);
+        let pair = db.get_pair("large").unwrap().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (plan, entries, right_entries) = super::build_preview(&pair, None, &cancel).unwrap();
+        assert!(plan.actions.iter().any(|a| matches!(a, crate::models::SyncAction::CopyLeftToRight { path } if path == "large.bin")));
+        assert_eq!(entries[0].size, 512 * 1024 * 1024 + 1);
+        assert!(entries[0].hash.is_some());
+        let root_keys = crate::path_normalization::pair_root_keys(&left, &right).unwrap();
+        let baseline =
+            crate::persistence::DatabaseHandle::load_sync_baseline(&db, &pair, &root_keys).unwrap();
+        let options = crate::engine::RunOptions {
+            prepared: Some(crate::engine::PreparedPlan {
+                plan,
+                preconditions: crate::engine::PlanPreconditions {
+                    left: entries,
+                    right: right_entries,
+                },
+                root_keys,
+                baseline_generation: baseline.generation,
+                baseline_revision: baseline.baseline.map(|value| value.revision),
+            }),
+            use_recycle_bin: false,
+            ..Default::default()
+        };
+        let report = crate::engine::run_pair_impl(&db, &pair, options, &cancel, |_| {}).unwrap();
+        assert_eq!(report.status, crate::models::RunStatus::Completed);
+        assert_eq!(report.files_copied, 1);
+        assert_eq!(report.bytes_transferred, 512 * 1024 * 1024 + 1);
+        assert_eq!(fs::metadata(right.join("large.bin")).unwrap().len(), 512 * 1024 * 1024 + 1);
+    }
+    #[test]
+    fn reviewed_run_rejects_late_target_edit_with_same_size_and_mtime() {
+        let data = TempDir::new().unwrap();
+        let left = data.path().join("left");
+        let right = data.path().join("right");
+        fs::create_dir_all(&left).unwrap();
+        fs::create_dir_all(&right).unwrap();
+        fs::write(left.join("file.txt"), b"source").unwrap();
+        let target = right.join("file.txt");
+        fs::write(&target, b"before").unwrap();
+        let set_time = |time| {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&target)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(time))
+                .unwrap();
+        };
+        set_time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000));
+        let reviewed_mtime = fs::metadata(&target).unwrap().modified().unwrap();
+        let db = Database::open(&data.path().join("test.db")).unwrap();
+        save_echo_pair(&db, "late-edit", &left, &right);
+        let pair = db.get_pair("late-edit").unwrap().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (plan, left_entries, right_entries) =
+            super::build_preview(&pair, None, &cancel).unwrap();
+        let root_keys = crate::path_normalization::pair_root_keys(&left, &right).unwrap();
+        let baseline =
+            crate::persistence::DatabaseHandle::load_sync_baseline(&db, &pair, &root_keys).unwrap();
+        let options = crate::engine::RunOptions {
+            prepared: Some(crate::engine::PreparedPlan {
+                plan,
+                preconditions: crate::engine::PlanPreconditions {
+                    left: left_entries,
+                    right: right_entries,
+                },
+                root_keys,
+                baseline_generation: baseline.generation,
+                baseline_revision: baseline.baseline.map(|value| value.revision),
+            }),
+            use_recycle_bin: false,
+            ..Default::default()
+        };
+        let error = crate::engine::run_pair_impl(&db, &pair, options, &cancel, |event| {
+            if matches!(event, crate::engine::ProgressEvent::Update(update)
+                if update.phase == "running" && update.path == Some("file.txt"))
+            {
+                fs::write(&target, b"edited").unwrap();
+                set_time(reviewed_mtime);
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("target content changed"), "{error}");
+        assert_eq!(fs::read(target).unwrap(), b"edited");
+    }
+
+    #[test]
+    fn reviewed_run_accepts_over_10000_distinct_files() {
+        let data = TempDir::new().unwrap();
+        let left = data.path().join("left");
+        let right = data.path().join("right");
+        fs::create_dir_all(&left).unwrap();
+        fs::create_dir_all(&right).unwrap();
+        for i in 0..10_001 {
+            fs::write(left.join(format!("{i:05}.txt")), b"x").unwrap();
+        }
+        let db = Database::open(&data.path().join("test.db")).unwrap();
+        save_echo_pair(&db, "many", &left, &right);
+        let pair = db.get_pair("many").unwrap().unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (plan, left_entries, right_entries) =
+            super::build_preview(&pair, None, &cancel).unwrap();
+        assert_eq!(plan.actions.len(), 10_001);
+        assert!(left_entries.iter().all(|entry| entry.hash.is_some()));
+        let root_keys = crate::path_normalization::pair_root_keys(&left, &right).unwrap();
+        let baseline =
+            crate::persistence::DatabaseHandle::load_sync_baseline(&db, &pair, &root_keys).unwrap();
+        let prepared = crate::engine::PreparedPlan {
+            plan,
+            preconditions: crate::engine::PlanPreconditions {
+                left: left_entries,
+                right: right_entries,
+            },
+            root_keys,
+            baseline_generation: baseline.generation,
+            baseline_revision: baseline.baseline.map(|value| value.revision),
+        };
+        let mut cache = crate::state::PreviewPlanStore::new();
+        let handle = cache.insert("many".into(), "fingerprint".into(), prepared, 1).unwrap();
+        let prepared = cache.take(&handle, "many", "fingerprint", 2).unwrap();
+        let options = crate::engine::RunOptions {
+            prepared: Some(prepared),
+            use_recycle_bin: false,
+            ..Default::default()
+        };
+        let report = crate::engine::run_pair_impl(&db, &pair, options, &cancel, |_| {}).unwrap();
+        assert_eq!(report.status, crate::models::RunStatus::Completed);
+        assert_eq!(report.files_copied, 10_001);
+        assert_eq!(report.bytes_transferred, 10_001);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn preview_accepts_aggregate_over_512_mib() {
+        let data = TempDir::new().unwrap();
+        let left = data.path().join("left");
+        let right = data.path().join("right");
+        fs::create_dir_all(&left).unwrap();
+        fs::create_dir_all(&right).unwrap();
+        create_sparse_fixture(&left.join("a.bin"), 256 * 1024 * 1024 + 1);
+        create_sparse_fixture(&left.join("b.bin"), 256 * 1024 * 1024 + 1);
+        let db = Database::open(&data.path().join("test.db")).unwrap();
+        save_echo_pair(&db, "aggregate", &left, &right);
+        let pair = db.get_pair("aggregate").unwrap().unwrap();
+        let (plan, entries, _) = super::build_preview(
+            &pair,
+            None,
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(plan.actions.len(), 2);
+        assert_eq!(entries.iter().map(|e| e.size).sum::<u64>(), 512 * 1024 * 1024 + 2);
+        assert!(entries.iter().all(|e| e.hash.is_some()));
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let report = crate::engine::run_pair_impl(
+            &db,
+            &pair,
+            crate::engine::RunOptions { use_recycle_bin: false, ..Default::default() },
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.status, crate::models::RunStatus::Completed);
+        assert_eq!(report.files_copied, 2);
+        assert_eq!(report.bytes_transferred, 512 * 1024 * 1024 + 2);
     }
 }

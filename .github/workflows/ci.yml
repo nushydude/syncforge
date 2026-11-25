@@ -114,7 +114,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       - name: Run small performance harness
-        run: pnpm run perf:small
+        run: pnpm run perf:small -- --enforce-budgets
 
       - name: Run medium performance harness
-        run: pnpm run perf:medium
+        run: pnpm run perf:medium -- --enforce-budgets

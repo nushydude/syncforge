@@ -364,7 +364,6 @@ pub(crate) fn run_watch_sync(app: AppHandle, state: Arc<AppState>, pair_id: Stri
                 root_keys,
                 baseline_generation: baseline.generation,
                 baseline_revision: baseline.baseline.map(|b| b.revision),
-                bounded: true,
             };
 
             remove_equivalent_watch_copies(&mut prepared);
@@ -540,7 +539,6 @@ pub(crate) fn run_scheduled_sync(app: AppHandle, state: Arc<AppState>, pair_id: 
                 root_keys,
                 baseline_generation: baseline.generation,
                 baseline_revision: baseline.baseline.map(|b| b.revision),
-                bounded: true,
             };
 
             if pair.conflict_policy == ConflictPolicy::Ask
@@ -647,7 +645,6 @@ mod tests {
             root_keys: ["l".into(), "r".into()],
             baseline_generation: None,
             baseline_revision: None,
-            bounded: true,
         };
         (pair, prepared)
     }

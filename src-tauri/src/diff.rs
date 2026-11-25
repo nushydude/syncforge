@@ -15,7 +15,7 @@ pub type HashProgress = Arc<dyn Fn(u64, &str) + Send + Sync>;
 
 /// Options for comparing file entries during sync planning.
 #[derive(Clone)]
-pub struct DiffOptions {
+pub struct DiffOptions<'a> {
     pub left_root: Option<PathBuf>,
     pub right_root: Option<PathBuf>,
     /// Hash file contents when size and modification time already match.
@@ -29,13 +29,13 @@ pub struct DiffOptions {
     pub content_hash_max_bytes: u64,
     /// Stops content hashing when set. Planning a large pair reads a lot of file
     /// data, so a cancel must be honoured here and not only during the walk.
-    pub cancel: Option<Arc<AtomicBool>>,
+    pub cancel: Option<&'a AtomicBool>,
     /// Called as files are hashed. Without it a long planning pass looks frozen,
     /// because the walk counters have already stopped moving by then.
     pub hash_progress: Option<HashProgress>,
 }
 
-impl std::fmt::Debug for DiffOptions {
+impl std::fmt::Debug for DiffOptions<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiffOptions")
             .field("left_root", &self.left_root)
@@ -48,7 +48,7 @@ impl std::fmt::Debug for DiffOptions {
     }
 }
 
-impl Default for DiffOptions {
+impl Default for DiffOptions<'_> {
     fn default() -> Self {
         Self {
             left_root: None,
@@ -61,7 +61,7 @@ impl Default for DiffOptions {
     }
 }
 
-impl DiffOptions {
+impl DiffOptions<'_> {
     /// True when a caller asked to stop; planning reads file data, so callers
     /// must be able to interrupt it.
     fn cancelled(&self) -> bool {
@@ -86,7 +86,7 @@ struct HashKey {
 }
 
 struct DiffContext<'a> {
-    options: &'a DiffOptions,
+    options: &'a DiffOptions<'a>,
     hashes: RefCell<HashMap<HashKey, Result<String, String>>>,
     hash_warnings: RefCell<Vec<String>>,
     hashed_files: std::cell::Cell<u64>,
@@ -101,7 +101,7 @@ pub fn build_sync_plan(
     right: &[FileEntry],
     baseline: Option<&SyncBaseline>,
     scan: ScanIntegrity,
-    diff_options: DiffOptions,
+    diff_options: DiffOptions<'_>,
 ) -> SyncPlan {
     let ctx = DiffContext {
         options: &diff_options,
@@ -110,11 +110,20 @@ pub fn build_sync_plan(
         hashed_files: std::cell::Cell::new(0),
     };
     let mut actions = Vec::new();
-    let evidence: HashMap<&str, &(FileEntry, FileEntry)> = baseline
-        .map(|b| b.entries.iter().map(|entry| (entry.0.relative_path.as_str(), entry)).collect())
-        .unwrap_or_default();
+    let mut evidence = HashMap::new();
+    if let Some(baseline) = baseline {
+        for entry in &baseline.entries {
+            if ctx.options.cancelled() {
+                break;
+            }
+            evidence.insert(entry.0.relative_path.as_str(), entry);
+        }
+    }
 
     for (path, l, r, _) in ThreeWayMerge::new(left, right, &[]) {
+        if ctx.options.cancelled() {
+            break;
+        }
         match mode {
             SyncMode::Echo => {
                 // Echo mirrors left → right; snapshot is not used for planning.
@@ -137,10 +146,15 @@ pub fn build_sync_plan(
         }
     }
 
-    ensure_parent_dirs(&mut actions, mode, left, right);
+    if !ctx.options.cancelled() {
+        ensure_parent_dirs(&mut actions, mode, left, right, ctx.options);
+    }
     // A filtered scan cannot establish complete membership of a physical tree.
     // Retain directories explicitly while allowing eligible file deletions.
     for action in &mut actions {
+        if ctx.options.cancelled() {
+            break;
+        }
         let blocked = match action {
             SyncAction::DeleteLeft { path } => contains_directory(left, path),
             SyncAction::DeleteRight { path } => contains_directory(right, path),
@@ -154,7 +168,9 @@ pub fn build_sync_plan(
             };
         }
     }
-    sort_actions(&mut actions);
+    if !ctx.options.cancelled() {
+        sort_actions(&mut actions);
+    }
 
     let hash_warnings = ctx.hash_warnings.borrow().clone();
     SyncPlan {
@@ -475,12 +491,16 @@ fn ensure_parent_dirs(
     mode: SyncMode,
     left: &[FileEntry],
     right: &[FileEntry],
+    options: &DiffOptions<'_>,
 ) {
     let mut planned_right = HashSet::new();
     let mut planned_left = HashSet::new();
     let mut additions = Vec::new();
 
     for action in actions.iter() {
+        if options.cancelled() {
+            return;
+        }
         match action {
             SyncAction::CopyLeftToRight { path } | SyncAction::CreateDirRight { path } => {
                 for parent in parent_paths(path) {
@@ -693,7 +713,7 @@ fn hash_entry(
         report(hashed, &entry.relative_path);
     }
     let path = join_relative(root, &entry.relative_path);
-    let result = hashing::hash_file(&path)
+    let result = hashing::hash_file_with_progress(&path, |_, _| !ctx.options.cancelled())
         .map_err(|error| format!("{}: content hash failed: {error}", entry.relative_path));
     if let Err(error) = &result {
         ctx.hash_warnings.borrow_mut().push(error.clone());
