@@ -38,6 +38,9 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Check version consistency
+        run: pnpm run check:version
+
       - name: Check formatting
         run: pnpm run format:check
 
@@ -51,8 +54,12 @@ jobs:
         run: pnpm run build
 
   rust-quality:
-    name: Rust Quality Gate
-    runs-on: ubuntu-latest
+    name: Rust Quality Gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
 
     steps:
       - uses: actions/checkout@v6
@@ -63,6 +70,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install Tauri dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
