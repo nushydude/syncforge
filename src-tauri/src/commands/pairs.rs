@@ -17,11 +17,11 @@ fn validate_pair_paths(left: &str, right: &str) -> Result<(), String> {
         return Ok(());
     }
     if path_normalization::paths_equal(left, right) {
-        return Err("left and right folders must be different".into());
+        return Err("Invalid folder pair: left and right folders must be different".into());
     }
     if path_normalization::pair_roots_nested(left, right) {
         return Err(
-            "folder pair roots cannot be nested: one path must not be inside the other".into()
+            "Invalid folder pair: folder pair roots cannot be nested: one path must not be inside the other".into()
         );
     }
     Ok(())
@@ -59,7 +59,7 @@ pub fn save_pair(
 
     let saved = state.db.save_pair(&pair).map_err(|e| e.to_string())?;
 
-    refresh_watch_service(&app, &state)?;
+    let _ = refresh_watch_service(&app, &state);
     refresh_schedule_service(&app, &state)?;
     Ok(saved)
 }
@@ -78,7 +78,7 @@ pub fn delete_pair(
         }
     })?;
 
-    refresh_watch_service(&app, &state)?;
+    let _ = refresh_watch_service(&app, &state);
     refresh_schedule_service(&app, &state)?;
     Ok(())
 }

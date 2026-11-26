@@ -71,8 +71,9 @@ function generateFixture(
   const changedEntries = Math.floor((entries * changedPercent) / 100);
   const left = join(root, "left");
   const right = join(root, "right");
-  mkdirSync(left);
-  mkdirSync(right);
+  const changedLeft = join(root, "changed-left");
+  const changedRight = join(root, "changed-right");
+  for (const side of [left, right, changedLeft, changedRight]) mkdirSync(side);
   for (let i = 0; i < entries; i += 1) {
     const parts = [];
     for (let level = 0; level < depth; level += 1)
@@ -80,21 +81,29 @@ function generateFixture(
     const relative = join(...parts, `f${String(i).padStart(7, "0")}.dat`);
     const leftFile = join(left, relative);
     const rightFile = join(right, relative);
-    mkdirSync(join(leftFile, ".."), { recursive: true });
-    mkdirSync(join(rightFile, ".."), { recursive: true });
+    const changedLeftFile = join(changedLeft, relative);
+    const changedRightFile = join(changedRight, relative);
+    for (const file of [leftFile, rightFile, changedLeftFile, changedRightFile])
+      mkdirSync(join(file, ".."), { recursive: true });
     const content = Buffer.alloc(meanFileSize, 0);
     content.write(
       `${seed}:${i}:${Math.floor(random() * 1_000_000)}`.slice(0, meanFileSize),
     );
     writeFileSync(leftFile, content);
+    writeFileSync(rightFile, content);
+    writeFileSync(changedLeftFile, content);
     const rightContent = Buffer.from(content);
     if (i < changedEntries) rightContent[0] ^= 0xff;
-    writeFileSync(rightFile, rightContent);
+    writeFileSync(changedRightFile, rightContent);
     const fixedTime = new Date(1_700_000_000_000 + i);
     utimesSync(leftFile, fixedTime, fixedTime);
     utimesSync(rightFile, fixedTime, fixedTime);
+    utimesSync(changedLeftFile, fixedTime, fixedTime);
+    const rightTime =
+      i < changedEntries ? new Date(fixedTime.getTime() - 10_000) : fixedTime;
+    utimesSync(changedRightFile, rightTime, rightTime);
   }
-  return { left, right };
+  return { left, right, changedLeft, changedRight };
 }
 
 function walk(root) {
@@ -107,6 +116,8 @@ function walk(root) {
         files.push({
           path: path.slice(root.length + 1),
           size: statSync(path).size,
+          mtimeMs: statSync(path).mtimeMs,
+          content: readFileSync(path).toString("base64"),
         });
     }
   };
@@ -141,7 +152,7 @@ function workingSetBytes() {
   }
 }
 
-function runRustScanHarness(root) {
+function runRustScanHarness(root, expectedCopies, expectedBytes) {
   const resultFile = join(root, "rust-counters.json");
   execFileSync(
     "cargo",
@@ -160,6 +171,8 @@ function runRustScanHarness(root) {
         ...process.env,
         PERF_FIXTURE_ROOT: root,
         PERF_RESULT_FILE: resultFile,
+        PERF_EXPECTED_COPIES: String(expectedCopies),
+        PERF_EXPECTED_BYTES: String(expectedBytes),
       },
       stdio: "inherit",
     },
@@ -187,6 +200,10 @@ function main() {
   const changedEntries = Math.floor(
     (config.entries * config.changedPercent) / 100,
   );
+  if (changedEntries === 0 || config.meanFileSize === 0)
+    throw new Error(
+      "workload requires at least one changed file and a nonzero file size",
+    );
   const enforceBudgets = process.argv.includes("--enforce-budgets");
   const root = fixturePath();
   const metrics = {};
@@ -198,11 +215,13 @@ function main() {
       () => generateFixture(root, config, seed),
       metrics,
     );
-    const left = measure("scan", () => walk(sides.left), metrics);
-    const right = measure("scanRight", () => walk(sides.right), metrics);
+    const left = measure("proxyScan", () => walk(sides.left), metrics);
+    const right = measure("proxyScanRight", () => walk(sides.right), metrics);
+    if (left.length !== config.entries || right.length !== config.entries)
+      throw new Error("generated no-op fixture has unexpected file count");
     peakWorkingSetBytes = Math.max(peakWorkingSetBytes, workingSetBytes());
     const plan = measure(
-      "planBuild",
+      "proxyPlanBuild",
       () =>
         left.map((entry, index) => ({
           ...entry,
@@ -211,18 +230,18 @@ function main() {
       metrics,
     );
     measure(
-      "noOpRun",
+      "proxyNoOpRun",
       () => plan.filter((entry) => !entry.changed).length,
       metrics,
     );
     measure(
-      "changedFileRun",
+      "proxyChangedFileRun",
       () => plan.filter((entry) => entry.changed).length,
       metrics,
     );
-    measure("historyDetailQuery", () => plan.slice(0, 200), metrics);
+    measure("proxyHistoryDetailQuery", () => plan.slice(0, 200), metrics);
     measure(
-      "duplicateScan",
+      "proxyDuplicateScan",
       () => {
         const groups = new Map();
         for (const entry of left)
@@ -232,19 +251,47 @@ function main() {
       metrics,
     );
     measure(
-      "snifferScan",
+      "proxySnifferScan",
       () => left.reduce((total, entry) => total + entry.size, 0),
       metrics,
     );
     const rustCounters = measure(
       "rustRun",
-      () => runRustScanHarness(root),
+      () =>
+        runRustScanHarness(
+          root,
+          changedEntries,
+          changedEntries * config.meanFileSize,
+        ),
       metrics,
     );
     peakWorkingSetBytes = Math.max(peakWorkingSetBytes, workingSetBytes());
-    const totalSeconds =
-      Object.values(metrics).reduce((sum, item) => sum + item.elapsedMs, 0) /
-      1000;
+    const unchangedLeft = walk(sides.left);
+    const unchangedRight = walk(sides.right);
+    if (
+      JSON.stringify(left) !== JSON.stringify(unchangedLeft) ||
+      JSON.stringify(right) !== JSON.stringify(unchangedRight)
+    )
+      throw new Error("no-op run mutated fixture files");
+    const copiedLeft = walk(sides.changedLeft);
+    const copiedRight = walk(sides.changedRight);
+    if (
+      copiedLeft.length !== config.entries ||
+      copiedRight.length !== config.entries ||
+      copiedLeft.some(
+        (file, i) =>
+          file.path !== copiedRight[i].path ||
+          file.size !== copiedRight[i].size ||
+          file.content !== copiedRight[i].content,
+      )
+    )
+      throw new Error("changed run output differs from source");
+    const progressBudgets = Object.fromEntries(
+      Object.entries(rustCounters).map(([phase, counters]) => [
+        phase,
+        Math.ceil((counters.elapsedMs / 1000) * MAX_PROGRESS_PER_SECOND) + 10,
+      ]),
+    );
     const report = {
       metadata: {
         case: caseName,
@@ -262,22 +309,15 @@ function main() {
         leftEntries: left.length,
         rightEntries: right.length,
       },
-      counters: {
-        scanDirectory: rustCounters.scanDirectory,
-        hashFile: rustCounters.hashFile,
-        engineProgressCallbacks: rustCounters.engineProgressCallbacks,
-        progressEvents: rustCounters.progressEvents,
-        dbItemFlushes: rustCounters.dbItemFlushes,
-        maxRunItemBuffer: rustCounters.maxRunItemBuffer,
-        tauriEmits: rustCounters.tauriEmits,
-      },
+      productionRuns: rustCounters,
       budgets: {
-        maxProgressEvents:
-          Math.floor(totalSeconds * MAX_PROGRESS_PER_SECOND) + 5,
+        maxProgressEvents: progressBudgets,
+        maxProgressEventsPerSecond: MAX_PROGRESS_PER_SECOND,
+        phaseAndSchedulerAllowance: 10,
         maxRunItemBuffer: MAX_RUN_ITEM_BUFFER,
         enforced: enforceBudgets,
       },
-      peakWorkingSetBytes,
+      sampledNodeParentWorkingSetBytes: peakWorkingSetBytes,
       phases: Object.fromEntries(
         Object.entries(metrics).map(([name, value]) => [
           name,
@@ -285,23 +325,32 @@ function main() {
             elapsedMs: value.elapsedMs,
             resultCount: Array.isArray(value.result)
               ? value.result.length
-              : value.result,
+              : typeof value.result === "number"
+                ? value.result
+                : undefined,
           },
         ]),
       ),
     };
     console.log(JSON.stringify(report, null, 2));
-    if (
-      enforceBudgets &&
-      rustCounters.progressEvents > report.budgets.maxProgressEvents
-    )
-      throw new Error(
-        `progress budget exceeded: ${rustCounters.progressEvents} > ${report.budgets.maxProgressEvents}`,
-      );
-    if (enforceBudgets && rustCounters.maxRunItemBuffer > MAX_RUN_ITEM_BUFFER)
-      throw new Error(
-        `run-item buffer budget exceeded: ${rustCounters.maxRunItemBuffer} > ${MAX_RUN_ITEM_BUFFER}`,
-      );
+    for (const [phase, counters] of Object.entries(rustCounters)) {
+      if (
+        (platform() === "win32" || platform() === "linux") &&
+        !counters.rustProcessPeakResidentBytesAtRunEnd
+      )
+        throw new Error(`${phase} did not report Rust process memory`);
+      // Coalescing also permits phase changes and terminal/pending events. Measure only
+      // the engine run, with a fixed allowance for these and scheduler jitter.
+      const progressBudget = progressBudgets[phase];
+      if (enforceBudgets && counters.progressEvents > progressBudget)
+        throw new Error(
+          `${phase} progress budget exceeded: ${counters.progressEvents} > ${progressBudget}`,
+        );
+      if (enforceBudgets && counters.maxRunItemBuffer > MAX_RUN_ITEM_BUFFER)
+        throw new Error(
+          `${phase} run-item buffer budget exceeded: ${counters.maxRunItemBuffer} > ${MAX_RUN_ITEM_BUFFER}`,
+        );
+    }
   } finally {
     removeFixture(root);
   }

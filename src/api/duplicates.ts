@@ -1,9 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  DuplicateCleanupResult,
   DuplicateMatchMode,
+  DuplicateGroupsPage,
+  DuplicateMembersPage,
   DuplicateScanJob,
-  DuplicateScanResult,
 } from "../types";
 
 export function startDuplicateScan(
@@ -23,20 +23,42 @@ export function resumeDuplicateScan(id: string): Promise<DuplicateScanJob> {
 
 export function cancelDuplicateScan(
   id: string,
+  attempt: number,
 ): Promise<DuplicateScanJob | null> {
-  return invoke<DuplicateScanJob | null>("cancel_duplicate_scan", { id });
+  return invoke<DuplicateScanJob | null>("cancel_duplicate_scan", {
+    id,
+    attempt,
+  });
 }
 
-export function findDuplicates(
-  root: string,
-  mode: DuplicateMatchMode,
-): Promise<DuplicateScanResult> {
-  return invoke<DuplicateScanResult>("find_duplicates", { root, mode });
+export function revealDuplicate(
+  jobId: string,
+  resultRevision: string,
+  itemId: string,
+): Promise<void> {
+  return invoke("reveal_duplicate", { jobId, resultRevision, itemId });
 }
 
-export function removeDuplicates(
-  root: string,
-  paths: string[],
-): Promise<DuplicateCleanupResult> {
-  return invoke<DuplicateCleanupResult>("remove_duplicates", { root, paths });
+export function getDuplicateGroupsPage(
+  jobId: string,
+  revision: string,
+  cursor: number,
+  limit = 50,
+): Promise<DuplicateGroupsPage> {
+  return invoke("duplicate_groups_page", { jobId, revision, cursor, limit });
+}
+export function getDuplicateMembersPage(
+  jobId: string,
+  revision: string,
+  groupId: string,
+  cursor: number,
+  limit = 50,
+): Promise<DuplicateMembersPage> {
+  return invoke("duplicate_members_page", {
+    jobId,
+    revision,
+    groupId,
+    cursor,
+    limit,
+  });
 }

@@ -37,9 +37,11 @@ function phaseLabel(run: PairRunState): string {
 export const RunProgress = memo(function RunProgress({
   pairId,
   onViewReport,
+  inlineError,
 }: {
   pairId: string;
   onViewReport?: (runId: string) => void;
+  inlineError?: string;
 }) {
   const selectRun = useCallback(
     (s: RunStoreState) => getPairRun(s, pairId),
@@ -106,7 +108,7 @@ export const RunProgress = memo(function RunProgress({
         </p>
       )}
 
-      {run.error && (
+      {run.error && run.error !== inlineError && (
         <p className="form-error" role="alert">
           {run.error}
         </p>

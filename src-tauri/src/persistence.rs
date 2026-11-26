@@ -31,7 +31,8 @@ pub fn fail_next_run_item_batch() {
 
 use crate::duplicates::{self, DuplicateScanJob};
 use crate::models::{
-    ConflictPolicy, FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot, SyncMode,
+    ConflictPolicy, FileEntry, FolderPair, RunItem, RunReport, RunStatus, Snapshot, SyncBaseline,
+    SyncBaselineView, SyncMode,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +69,30 @@ pub struct DatabaseManager {
 /// Implementations must keep filesystem work and JSON processing outside their
 /// own database critical section where possible.
 pub trait DatabaseHandle {
+    fn load_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+    ) -> Result<SyncBaselineView>;
+    #[allow(dead_code)] // Retained for legacy baseline callers and tests.
+    fn save_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+    ) -> Result<bool>;
+    fn save_sync_baseline_and_run(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+        report: &RunReport,
+    ) -> Result<bool>;
+    #[allow(dead_code)] // Retained for legacy history consumers.
     fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>>;
     fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()>;
     fn save_run(&self, report: &RunReport) -> Result<()>;
@@ -181,6 +206,12 @@ impl Database {
                  ON run_items(run_id, action, path COLLATE NOCASE, id);",
         )?;
 
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sync_baselines (
+            pair_id TEXT PRIMARY KEY NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+            generation TEXT NOT NULL, root_keys_json TEXT, revision TEXT, entries_json TEXT
+        );",
+        )?;
         self.migrate_watch_enabled()?;
         self.migrate_schedule_fields()?;
         self.migrate_continue_on_error()?;
@@ -287,8 +318,48 @@ impl Database {
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_duplicate_scans_updated_at
-                ON duplicate_scans(updated_at DESC);",
+                ON duplicate_scans(updated_at DESC);
+            CREATE TABLE IF NOT EXISTS duplicate_result_index (
+                job_id TEXT NOT NULL, revision TEXT NOT NULL,
+                PRIMARY KEY(job_id, revision)
+            );
+            CREATE TABLE IF NOT EXISTS duplicate_group_index (
+                job_id TEXT NOT NULL, revision TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                group_id TEXT NOT NULL, key TEXT NOT NULL, file_count INTEGER NOT NULL,
+                potential_savings INTEGER NOT NULL, first_size INTEGER NOT NULL,
+                PRIMARY KEY(job_id, revision, ordinal),
+                UNIQUE(job_id, revision, group_id)
+            );
+            CREATE TABLE IF NOT EXISTS duplicate_member_index (
+                job_id TEXT NOT NULL, revision TEXT NOT NULL, group_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL, file_json TEXT NOT NULL, item_id TEXT,
+                PRIMARY KEY(job_id, revision, group_id, ordinal)
+            );",
         )?;
+        for (column, definition) in [
+            ("attempt", "INTEGER NOT NULL DEFAULT 1"),
+            ("sequence", "INTEGER NOT NULL DEFAULT 0"),
+            ("summary_json", "TEXT"),
+        ] {
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('duplicate_scans') WHERE name=?1)",
+                [column],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                self.conn.execute(
+                    &format!("ALTER TABLE duplicate_scans ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        let has_item_id: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('duplicate_member_index') WHERE name='item_id')", [], |r| r.get(0))?;
+        if !has_item_id {
+            self.conn.execute("ALTER TABLE duplicate_member_index ADD COLUMN item_id TEXT", [])?;
+        }
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS duplicate_member_id ON duplicate_member_index(job_id,revision,item_id) WHERE item_id IS NOT NULL", [])?;
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_duplicate_scans_sequence ON duplicate_scans(sequence DESC)", [])?;
+        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS duplicate_sequence (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL); INSERT OR IGNORE INTO duplicate_sequence(id,value) VALUES(1,0);")?;
         Ok(())
     }
 
@@ -371,20 +442,24 @@ impl Database {
     #[allow(dead_code)]
     pub fn save_duplicate_scan(&self, job: &DuplicateScanJob) -> Result<()> {
         let result_json = job.result.as_ref().map(serde_json::to_string).transpose()?;
-        self.save_duplicate_scan_json(job, result_json.as_deref())
+        self.save_duplicate_scan_json(job, result_json.as_deref()).map(|_| ())
     }
 
     fn save_duplicate_scan_json(
         &self,
         job: &DuplicateScanJob,
         result_json: Option<&str>,
-    ) -> Result<()> {
-        self.conn.execute(
+    ) -> Result<u64> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE duplicate_sequence SET value=value+1 WHERE id=1", [])?;
+        let sequence: i64 =
+            tx.query_row("SELECT value FROM duplicate_sequence WHERE id=1", [], |row| row.get(0))?;
+        let changed = tx.execute(
             "INSERT INTO duplicate_scans (
                 id, root, mode, status, phase, files_found, total_files,
                 hashed_files, hash_total, bytes_processed, bytes_total,
-                current_path, cancel_requested, result_json, error, started_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                current_path, cancel_requested, result_json, error, started_at, updated_at, attempt, sequence
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
              ON CONFLICT(id) DO UPDATE SET
                 root = excluded.root,
                 mode = excluded.mode,
@@ -397,11 +472,16 @@ impl Database {
                 bytes_processed = excluded.bytes_processed,
                 bytes_total = excluded.bytes_total,
                 current_path = excluded.current_path,
-                cancel_requested = excluded.cancel_requested,
+                cancel_requested = CASE WHEN excluded.attempt = duplicate_scans.attempt AND excluded.status = 'running' THEN MAX(duplicate_scans.cancel_requested,excluded.cancel_requested) ELSE excluded.cancel_requested END,
+                attempt = excluded.attempt,
+                sequence = excluded.sequence,
+                summary_json = CASE WHEN excluded.status = 'running' AND excluded.attempt != duplicate_scans.attempt THEN NULL ELSE duplicate_scans.summary_json END,
                 result_json = excluded.result_json,
                 error = excluded.error,
                 started_at = excluded.started_at,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at
+             WHERE (duplicate_scans.status = 'running' AND excluded.attempt = duplicate_scans.attempt)
+                OR (duplicate_scans.status != 'running' AND excluded.status = 'running' AND excluded.attempt = duplicate_scans.attempt + 1)",
             rusqlite::params![
                 job.id,
                 job.root,
@@ -420,9 +500,228 @@ impl Database {
                 job.error,
                 job.started_at,
                 job.updated_at,
+                job.attempt as i64,
+                sequence,
             ],
         )?;
+        if changed != 1 {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
+        if let Some(result) = &job.result {
+            Self::write_duplicate_index(&tx, &job.id, result)?;
+        }
+        tx.commit()?;
+        Ok(sequence as u64)
+    }
+
+    /// Build an additive index exactly once, including for historical JSON rows.
+    /// Original JSON is retained for the reviewed cleanup contract and recovery.
+    fn index_duplicate_result(
+        &self,
+        job_id: &str,
+        result: &duplicates::DuplicateScanResult,
+    ) -> Result<String> {
+        let tx = self.conn.unchecked_transaction()?;
+        let revision = Self::write_duplicate_index(&tx, job_id, result)?;
+        tx.commit()?;
+        Ok(revision)
+    }
+
+    fn write_duplicate_index(
+        tx: &rusqlite::Transaction<'_>,
+        job_id: &str,
+        result: &duplicates::DuplicateScanResult,
+    ) -> Result<String> {
+        let revision = result.revision.clone().unwrap_or_else(|| format!("legacy:{job_id}"));
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM duplicate_result_index WHERE job_id=?1 AND revision=?2)",
+            params![job_id, revision],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            for (ordinal, group) in result.groups.iter().enumerate() {
+                let id = group.id.clone().unwrap_or_else(|| format!("legacy-group:{ordinal}"));
+                tx.execute("INSERT INTO duplicate_group_index(job_id,revision,ordinal,group_id,key,file_count,potential_savings,first_size) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![job_id,revision,ordinal as i64,id,group.key,group.files.len() as i64,group.potential_savings_bytes as i64,group.files.first().map_or(0, |f| f.size) as i64])?;
+                for (member_ordinal, file) in group.files.iter().enumerate() {
+                    tx.execute("INSERT INTO duplicate_member_index(job_id,revision,group_id,ordinal,file_json,item_id) VALUES(?1,?2,?3,?4,?5,?6)",
+                        params![job_id,revision,id,member_ordinal as i64,serde_json::to_string(file)?,file.id])?;
+                }
+            }
+            tx.execute(
+                "INSERT INTO duplicate_result_index(job_id,revision) VALUES(?1,?2)",
+                params![job_id, revision],
+            )?;
+        }
+        let summary = duplicates::DuplicateResultSummary::from_result(job_id, result);
+        tx.execute(
+            "UPDATE duplicate_scans SET summary_json=?1 WHERE id=?2",
+            params![serde_json::to_string(&summary)?, job_id],
+        )?;
+        Ok(revision)
+    }
+
+    fn ensure_duplicate_index(&self, job_id: &str) -> Result<Option<String>> {
+        let summary: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT summary_json FROM duplicate_scans WHERE id=?1", [job_id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let Some(Some(summary)) = summary {
+            let parsed: duplicates::DuplicateResultSummary = serde_json::from_str(&summary)?;
+            return Ok(Some(parsed.revision));
+        }
+        let job = match self.get_duplicate_scan(job_id)? {
+            Some(job) => job,
+            None => return Ok(None),
+        };
+        let result = match job.result {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+        self.index_duplicate_result(job_id, &result).map(Some)
+    }
+
+    fn validate_duplicate_revision(&self, job_id: &str, revision: &str) -> Result<()> {
+        let row: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT status,summary_json FROM duplicate_scans WHERE id=?1",
+                [job_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (status, summary) = row.ok_or(rusqlite::Error::InvalidQuery)?;
+        let summary: duplicates::DuplicateResultSummary =
+            serde_json::from_str(&summary.ok_or(rusqlite::Error::InvalidQuery)?)?;
+        if status != "completed" || summary.revision != revision {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
         Ok(())
+    }
+
+    fn duplicate_groups_page(
+        &self,
+        job_id: &str,
+        revision: &str,
+        cursor: usize,
+        limit: usize,
+    ) -> Result<duplicates::DuplicateGroupsPage> {
+        self.validate_duplicate_revision(job_id, revision)?;
+        let limit = limit.clamp(1, duplicates::DUPLICATE_PAGE_LIMIT);
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM duplicate_result_index WHERE job_id=?1 AND revision=?2)",
+            params![job_id, revision],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
+        let mut stmt = self.conn.prepare("SELECT group_id,key,file_count,potential_savings,first_size FROM duplicate_group_index WHERE job_id=?1 AND revision=?2 AND ordinal>=?3 ORDER BY ordinal LIMIT ?4")?;
+        let rows = stmt
+            .query_map(params![job_id, revision, cursor as i64, (limit + 1) as i64], |r| {
+                Ok(duplicates::DuplicateGroupSummary {
+                    id: r.get(0)?,
+                    key: r.get(1)?,
+                    file_count: r.get::<_, i64>(2)? as u64,
+                    potential_savings_bytes: r.get::<_, i64>(3)? as u64,
+                    first_size: r.get::<_, i64>(4)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let more = rows.len() > limit;
+        Ok(duplicates::DuplicateGroupsPage {
+            revision: revision.into(),
+            groups: rows.into_iter().take(limit).collect(),
+            next_cursor: more.then_some(cursor + limit),
+        })
+    }
+
+    fn duplicate_member_by_id(
+        &self,
+        job_id: &str,
+        revision: &str,
+        item_id: &str,
+    ) -> Result<Option<(String, duplicates::DuplicateFile)>> {
+        self.validate_duplicate_revision(job_id, revision)?;
+        let row: Option<(String,String)> = self.conn.query_row("SELECT group_id,file_json FROM duplicate_member_index WHERE job_id=?1 AND revision=?2 AND item_id=?3", params![job_id,revision,item_id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        row.map(|(id, json)| Ok((id, serde_json::from_str(&json)?))).transpose()
+    }
+
+    fn duplicate_members_page(
+        &self,
+        job_id: &str,
+        revision: &str,
+        group_id: &str,
+        cursor: usize,
+        limit: usize,
+    ) -> Result<duplicates::DuplicateMembersPage> {
+        self.validate_duplicate_revision(job_id, revision)?;
+        let limit = limit.clamp(1, duplicates::DUPLICATE_PAGE_LIMIT);
+        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM duplicate_group_index WHERE job_id=?1 AND revision=?2 AND group_id=?3)", params![job_id,revision,group_id], |r| r.get(0))?;
+        if !exists {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
+        let mut stmt = self.conn.prepare("SELECT file_json FROM duplicate_member_index WHERE job_id=?1 AND revision=?2 AND group_id=?3 AND ordinal>=?4 ORDER BY ordinal LIMIT ?5")?;
+        let json = stmt
+            .query_map(
+                params![job_id, revision, group_id, cursor as i64, (limit + 1) as i64],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let more = json.len() > limit;
+        let files = json
+            .into_iter()
+            .take(limit)
+            .map(|v| serde_json::from_str(&v))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(duplicates::DuplicateMembersPage {
+            revision: revision.into(),
+            group_id: group_id.into(),
+            files,
+            next_cursor: more.then_some(cursor + limit),
+        })
+    }
+
+    fn duplicate_snapshot(&self, id: &str) -> Result<Option<duplicates::DuplicateJobSnapshot>> {
+        let mut stmt = self.conn.prepare("SELECT id,root,mode,status,phase,files_found,total_files,hashed_files,hash_total,bytes_processed,bytes_total,current_path,cancel_requested,NULL,error,started_at,updated_at,attempt,sequence,summary_json FROM duplicate_scans WHERE id=?1")?;
+        let mut rows = stmt.query([id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let job = row_to_duplicate_scan(row)?;
+        let summary: Option<String> = row.get(19)?;
+        Ok(Some(duplicates::DuplicateJobSnapshot {
+            job,
+            summary: summary.map(|s| serde_json::from_str(&s)).transpose()?,
+        }))
+    }
+    fn latest_duplicate_id(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM duplicate_scans ORDER BY sequence DESC,updated_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn interrupt_abandoned_duplicate(&self, id: &str, attempt: u64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE duplicate_sequence SET value=value+1 WHERE id=1", [])?;
+        tx.execute("UPDATE duplicate_scans SET status='interrupted',phase=NULL,cancel_requested=0,error='Scan stopped before its results could be saved. Scan again.',sequence=(SELECT value FROM duplicate_sequence WHERE id=1) WHERE id=?1 AND attempt=?2 AND status='running'", params![id,attempt as i64])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn request_duplicate_cancel(&self, id: &str, attempt: u64) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE duplicate_sequence SET value=value+1 WHERE id=1", [])?;
+        let changed = tx.execute("UPDATE duplicate_scans SET cancel_requested=1, sequence=(SELECT value FROM duplicate_sequence WHERE id=1) WHERE id=?1 AND attempt=?2 AND status='running' AND cancel_requested=0", params![id,attempt as i64])?;
+        tx.commit()?;
+        Ok(changed == 1)
     }
 
     fn save_snapshot_json(&self, snapshot: &Snapshot, entries_json: &str) -> Result<()> {
@@ -461,34 +760,15 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, root, mode, status, phase, files_found, total_files,
                     hashed_files, hash_total, bytes_processed, bytes_total,
-                    current_path, cancel_requested, result_json, error, started_at, updated_at
+                    current_path, cancel_requested, result_json, error, started_at, updated_at, attempt, sequence
              FROM duplicate_scans WHERE id = ?1",
         )?;
         let mut rows = stmt.query(rusqlite::params![id])?;
         rows.next()?.map(row_to_duplicate_scan).transpose()
     }
 
-    pub fn latest_duplicate_scan(&self) -> Result<Option<DuplicateScanJob>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, root, mode, status, phase, files_found, total_files,
-                    hashed_files, hash_total, bytes_processed, bytes_total,
-                    current_path, cancel_requested, result_json, error, started_at, updated_at
-             FROM duplicate_scans ORDER BY updated_at DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query([])?;
-        rows.next()?.map(row_to_duplicate_scan).transpose()
-    }
-
     pub fn mark_duplicate_scans_interrupted(&self) -> Result<()> {
-        self.conn.execute(
-            "UPDATE duplicate_scans
-             SET status = 'interrupted',
-                 cancel_requested = 0,
-                 error = 'The previous scan was interrupted. Resume it to continue.',
-                 updated_at = updated_at
-             WHERE status = 'running'",
-            [],
-        )?;
+        self.conn.execute("UPDATE duplicate_scans SET status='interrupted',phase=NULL,cancel_requested=0,error='The previous scan was interrupted. Resume it to continue.' WHERE status='running'", [])?;
         Ok(())
     }
 
@@ -497,7 +777,13 @@ impl Database {
         let mode = sync_mode_to_str(pair.mode);
         let conflict_policy = conflict_policy_to_str(pair.conflict_policy);
 
-        self.conn.execute(
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let previous = self.get_pair(&pair.id)?;
+        let scope_changed = previous.as_ref().is_none_or(|old| !same_sync_scope(old, pair));
+        tx.execute(
             "INSERT INTO pairs (
                 id, name, left_path, right_path, mode, filters_json, conflict_policy,
                 enabled, watch_enabled, schedule_enabled, schedule_cron, created_at, updated_at,
@@ -534,7 +820,132 @@ impl Database {
             ],
         )?;
 
+        if scope_changed {
+            tx.execute(
+                "INSERT INTO sync_baselines (pair_id, generation) VALUES (?1, ?2)
+                ON CONFLICT(pair_id) DO UPDATE SET generation = excluded.generation,
+                root_keys_json = NULL, revision = NULL, entries_json = NULL",
+                params![pair.id, Uuid::new_v4().to_string()],
+            )?;
+        }
+        tx.commit()?;
         self.get_pair(&pair.id)?.ok_or_else(|| PersistenceError::PairNotFound(pair.id.clone()))
+    }
+
+    pub fn load_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+    ) -> Result<SyncBaselineView> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !self.get_pair(&pair.id)?.as_ref().is_some_and(|saved| same_sync_scope(saved, pair)) {
+            tx.commit()?;
+            return Ok(SyncBaselineView { generation: None, baseline: None });
+        }
+        let roots = serde_json::to_string(root_keys)?;
+        type BaselineRow = (String, Option<String>, Option<String>, Option<String>);
+        let row: Option<BaselineRow> = tx.query_row(
+            "SELECT generation, root_keys_json, revision, entries_json FROM sync_baselines WHERE pair_id = ?1",
+            params![pair.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+        let (generation, revision, entries) = match row {
+            Some((generation, Some(old_roots), revision, entries)) if old_roots == roots => {
+                (generation, revision, entries)
+            }
+            other => {
+                let generation = match other {
+                    Some((generation, None, _, _)) => generation,
+                    _ => Uuid::new_v4().to_string(),
+                };
+                tx.execute("INSERT INTO sync_baselines (pair_id, generation, root_keys_json) VALUES (?1, ?2, ?3)
+                    ON CONFLICT(pair_id) DO UPDATE SET generation=excluded.generation, root_keys_json=excluded.root_keys_json, revision=NULL, entries_json=NULL",
+                    params![pair.id, generation, roots])?;
+                (generation, None, None)
+            }
+        };
+        tx.commit()?;
+        let baseline = match (revision, entries) {
+            (Some(revision), Some(entries)) => {
+                Some(SyncBaseline { revision, entries: serde_json::from_str(&entries)? })
+            }
+            _ => None,
+        };
+        Ok(SyncBaselineView { generation: Some(generation), baseline })
+    }
+
+    pub fn save_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+    ) -> Result<bool> {
+        let roots = serde_json::to_string(root_keys)?;
+        let json = serde_json::to_string(entries)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !self.get_pair(&pair.id)?.as_ref().is_some_and(|saved| same_sync_scope(saved, pair)) {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE sync_baselines SET revision=CASE WHEN entries_json=?2 THEN revision ELSE ?1 END, entries_json=?2
+            WHERE pair_id=?3 AND generation=?4 AND root_keys_json=?5 AND revision IS ?6",
+            params![
+                Uuid::new_v4().to_string(),
+                json,
+                pair.id,
+                expected_generation,
+                roots,
+                expected_revision
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_sync_baseline_and_run(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+        report: &RunReport,
+    ) -> Result<bool> {
+        if report.pair_id != pair.id
+            || report.status != RunStatus::Completed
+            || report.finished_at.is_none()
+        {
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
+        let roots = serde_json::to_string(root_keys)?;
+        let json = serde_json::to_string(entries)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !self.get_pair(&pair.id)?.as_ref().is_some_and(|saved| same_sync_scope(saved, pair)) {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE sync_baselines SET revision=CASE WHEN entries_json=?2 THEN revision ELSE ?1 END, entries_json=?2 WHERE pair_id=?3 AND generation=?4 AND root_keys_json=?5 AND revision IS ?6",
+            params![Uuid::new_v4().to_string(), json, pair.id, expected_generation, roots, expected_revision],
+        )?;
+        if changed != 1 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        self.save_run(report)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn delete_pair(&self, id: &str) -> Result<()> {
@@ -629,6 +1040,7 @@ impl Database {
         Ok(None)
     }
 
+    #[allow(dead_code)] // Supports the retained legacy history facade.
     fn latest_snapshot_json(&self, pair_id: &str) -> Result<Option<(String, String, i64, String)>> {
         self.conn
             .query_row(
@@ -917,6 +1329,7 @@ impl DatabaseManager {
     pub fn get_pair(&self, id: &str) -> Result<Option<FolderPair>> {
         self.read(|db| db.get_pair(id))
     }
+    #[allow(dead_code)] // Retained for legacy history consumers.
     pub fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
         let raw = self.read(|db| db.latest_snapshot_json(pair_id))?;
         raw.map(|(id, pair_id, captured_at, entries_json)| {
@@ -926,13 +1339,68 @@ impl DatabaseManager {
     }
     pub fn save_duplicate_scan(&self, job: &DuplicateScanJob) -> Result<()> {
         let result_json = job.result.as_ref().map(serde_json::to_string).transpose()?;
-        self.write(|db| db.save_duplicate_scan_json(job, result_json.as_deref()))
+        self.write(|db| db.save_duplicate_scan_json(job, result_json.as_deref())).map(|_| ())
+    }
+    pub fn save_duplicate_terminal(
+        &self,
+        job: &DuplicateScanJob,
+    ) -> Result<duplicates::DuplicateJobSnapshot> {
+        let sequence = self.write(|db| db.save_duplicate_scan_json(job, None))?;
+        let summary = job
+            .result
+            .as_ref()
+            .map(|r| duplicates::DuplicateResultSummary::from_result(&job.id, r));
+        Ok(duplicates::DuplicateJobSnapshot { job: job.compact_copy(sequence), summary })
+    }
+    pub fn latest_duplicate_snapshot(&self) -> Result<Option<duplicates::DuplicateJobSnapshot>> {
+        let Some(id) = self.read(Database::latest_duplicate_id)? else {
+            return Ok(None);
+        };
+        self.write(|db| db.ensure_duplicate_index(&id))?;
+        self.read(|db| db.duplicate_snapshot(&id))
+    }
+    pub fn duplicate_snapshot(&self, id: &str) -> Result<Option<duplicates::DuplicateJobSnapshot>> {
+        self.write(|db| db.ensure_duplicate_index(id))?;
+        self.read(|db| db.duplicate_snapshot(id))
+    }
+    pub fn interrupt_abandoned_duplicate(&self, id: &str, attempt: u64) -> Result<()> {
+        self.write(|db| db.interrupt_abandoned_duplicate(id, attempt))
+    }
+    pub fn request_duplicate_cancel(&self, id: &str, attempt: u64) -> Result<bool> {
+        self.write(|db| db.request_duplicate_cancel(id, attempt))
+    }
+    pub fn ensure_duplicate_index(&self, id: &str) -> Result<Option<String>> {
+        self.write(|db| db.ensure_duplicate_index(id))
+    }
+    pub fn duplicate_groups_page(
+        &self,
+        id: &str,
+        revision: &str,
+        cursor: usize,
+        limit: usize,
+    ) -> Result<duplicates::DuplicateGroupsPage> {
+        self.read(|db| db.duplicate_groups_page(id, revision, cursor, limit))
+    }
+    pub fn duplicate_member_by_id(
+        &self,
+        id: &str,
+        revision: &str,
+        item: &str,
+    ) -> Result<Option<(String, duplicates::DuplicateFile)>> {
+        self.read(|db| db.duplicate_member_by_id(id, revision, item))
+    }
+    pub fn duplicate_members_page(
+        &self,
+        id: &str,
+        revision: &str,
+        group: &str,
+        cursor: usize,
+        limit: usize,
+    ) -> Result<duplicates::DuplicateMembersPage> {
+        self.read(|db| db.duplicate_members_page(id, revision, group, cursor, limit))
     }
     pub fn get_duplicate_scan(&self, id: &str) -> Result<Option<DuplicateScanJob>> {
         self.read(|db| db.get_duplicate_scan(id))
-    }
-    pub fn latest_duplicate_scan(&self) -> Result<Option<DuplicateScanJob>> {
-        self.read(Database::latest_duplicate_scan)
     }
     pub fn mark_duplicate_scans_interrupted(&self) -> Result<()> {
         self.write(Database::mark_duplicate_scans_interrupted)
@@ -949,6 +1417,53 @@ impl DatabaseManager {
             .map(|value| serde_json::from_str(&value).map_err(Into::into))
             .transpose()
     }
+    /// Visit one immutable report in browse order without materializing its rows.
+    /// The dedicated read connection keeps a single SQLite snapshot and index cursor.
+    pub fn visit_run_items(
+        &self,
+        expected: &RunReport,
+        mut visit: impl FnMut(RunItem) -> std::result::Result<(), String>,
+    ) -> std::result::Result<(), String> {
+        let conn = Database::open_connection(&self.path).map_err(|e| e.to_string())?;
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        let summary: Option<String> = conn
+            .query_row(
+                "SELECT summary_json FROM runs WHERE id = ?1",
+                params![expected.run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let actual: RunReport =
+            serde_json::from_str(summary.as_deref().ok_or("Run no longer exists")?)
+                .map_err(|e| e.to_string())?;
+        if actual != *expected || actual.status == RunStatus::Running {
+            return Err("Run changed while preparing export; try again after it finishes".into());
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, run_id, path, action, status, message, bytes
+             FROM run_items INDEXED BY idx_run_items_run_path WHERE run_id = ?1
+             ORDER BY path COLLATE NOCASE, id",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query(params![expected.run_id]).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let bytes: Option<i64> = row.get(6).map_err(|e| e.to_string())?;
+            let item = RunItem {
+                id: row.get(0).map_err(|e| e.to_string())?,
+                run_id: row.get(1).map_err(|e| e.to_string())?,
+                path: row.get(2).map_err(|e| e.to_string())?,
+                action: row.get(3).map_err(|e| e.to_string())?,
+                status: row.get(4).map_err(|e| e.to_string())?,
+                message: row.get(5).map_err(|e| e.to_string())?,
+                bytes: bytes.map(|b| b as u64),
+            };
+            visit(item)?;
+        }
+        Ok(())
+    }
+
     pub fn list_run_items_page(
         &self,
         run_id: &str,
@@ -968,7 +1483,57 @@ impl DatabaseManager {
     }
 }
 
+fn same_sync_scope(a: &FolderPair, b: &FolderPair) -> bool {
+    a.left_path == b.left_path
+        && a.right_path == b.right_path
+        && a.mode == b.mode
+        && a.filters == b.filters
+}
+
 impl DatabaseHandle for Database {
+    fn load_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+    ) -> Result<SyncBaselineView> {
+        Database::load_sync_baseline(self, pair, root_keys)
+    }
+    fn save_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+    ) -> Result<bool> {
+        Database::save_sync_baseline(
+            self,
+            pair,
+            root_keys,
+            expected_generation,
+            expected_revision,
+            entries,
+        )
+    }
+    fn save_sync_baseline_and_run(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+        report: &RunReport,
+    ) -> Result<bool> {
+        Database::save_sync_baseline_and_run(
+            self,
+            pair,
+            root_keys,
+            expected_generation,
+            expected_revision,
+            entries,
+            report,
+        )
+    }
     fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
         Database::latest_snapshot(self, pair_id)
     }
@@ -984,6 +1549,45 @@ impl DatabaseHandle for Database {
 }
 
 impl DatabaseHandle for DatabaseManager {
+    fn load_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+    ) -> Result<SyncBaselineView> {
+        self.write(|db| db.load_sync_baseline(pair, root_keys))
+    }
+    fn save_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+    ) -> Result<bool> {
+        self.write(|db| {
+            db.save_sync_baseline(pair, root_keys, expected_generation, expected_revision, entries)
+        })
+    }
+    fn save_sync_baseline_and_run(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+        report: &RunReport,
+    ) -> Result<bool> {
+        self.write(|db| {
+            db.save_sync_baseline_and_run(
+                pair,
+                root_keys,
+                expected_generation,
+                expected_revision,
+                entries,
+                report,
+            )
+        })
+    }
     fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
         self.latest_snapshot(pair_id)
     }
@@ -1002,6 +1606,47 @@ impl DatabaseHandle for DatabaseManager {
 
 #[cfg(test)]
 impl DatabaseHandle for Mutex<Database> {
+    fn load_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+    ) -> Result<SyncBaselineView> {
+        self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.load_sync_baseline(pair, root_keys)
+    }
+    fn save_sync_baseline(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+    ) -> Result<bool> {
+        self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.save_sync_baseline(
+            pair,
+            root_keys,
+            expected_generation,
+            expected_revision,
+            entries,
+        )
+    }
+    fn save_sync_baseline_and_run(
+        &self,
+        pair: &FolderPair,
+        root_keys: &[String; 2],
+        expected_generation: &str,
+        expected_revision: Option<&str>,
+        entries: &[(FileEntry, FileEntry)],
+        report: &RunReport,
+    ) -> Result<bool> {
+        self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.save_sync_baseline_and_run(
+            pair,
+            root_keys,
+            expected_generation,
+            expected_revision,
+            entries,
+            report,
+        )
+    }
     fn latest_snapshot(&self, pair_id: &str) -> Result<Option<Snapshot>> {
         self.lock().map_err(|_| rusqlite::Error::InvalidQuery)?.latest_snapshot(pair_id)
     }
@@ -1068,6 +1713,8 @@ fn row_to_duplicate_scan(row: &rusqlite::Row<'_>) -> Result<DuplicateScanJob> {
 
     Ok(DuplicateScanJob {
         id: row.get(0)?,
+        attempt: row.get::<_, i64>(17)? as u64,
+        sequence: row.get::<_, i64>(18)? as u64,
         root: row.get(1)?,
         mode,
         status,
@@ -1156,6 +1803,126 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = Database::open(&path).expect("open db");
         (dir, db)
+    }
+
+    #[test]
+    fn trusted_baseline_is_scoped_cas_and_preserves_legacy_history() {
+        let (_dir, db) = temp_db();
+        let mut pair = FolderPair {
+            id: new_pair_id(),
+            name: "test".into(),
+            left_path: "/a".into(),
+            right_path: "/b".into(),
+            mode: SyncMode::Synchronize,
+            filters: Filters::default(),
+            conflict_policy: ConflictPolicy::Ask,
+            enabled: true,
+            continue_on_error: true,
+            watch_enabled: false,
+            schedule_enabled: false,
+            schedule_cron: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        db.save_pair(&pair).unwrap();
+        let entry = FileEntry {
+            relative_path: "f".into(),
+            size: 1,
+            modified_secs: 1,
+            modified_nanos: 0,
+            is_dir: false,
+            hash: Some("hash".into()),
+            deleted: false,
+        };
+        let snapshot = Snapshot {
+            id: "legacy".into(),
+            pair_id: pair.id.clone(),
+            captured_at: 1,
+            entries: vec![entry.clone()],
+        };
+        db.save_snapshot(&snapshot).unwrap();
+        // Simulate an existing installation upgraded without a trusted row.
+        db.conn.execute("DELETE FROM sync_baselines WHERE pair_id=?1", params![pair.id]).unwrap();
+        let roots = ["root-a".into(), "root-b".into()];
+        let view = db.load_sync_baseline(&pair, &roots).unwrap();
+        assert!(view.baseline.is_none());
+        let generation = view.generation.unwrap();
+        let entries = vec![(entry.clone(), entry)];
+        assert!(db.save_sync_baseline(&pair, &roots, &generation, None, &entries).unwrap());
+        assert!(!db.save_sync_baseline(&pair, &roots, &generation, None, &entries).unwrap());
+        let revision = db.load_sync_baseline(&pair, &roots).unwrap().baseline.unwrap().revision;
+        let mut report = RunReport {
+            run_id: "atomic-run".into(),
+            pair_id: pair.id.clone(),
+            started_at: 1,
+            finished_at: None,
+            status: RunStatus::Running,
+            files_copied: 0,
+            files_deleted: 0,
+            bytes_transferred: 0,
+            errors: vec![],
+        };
+        db.save_run(&report).unwrap();
+        report.status = RunStatus::Completed;
+        report.finished_at = Some(2);
+        assert!(!db
+            .save_sync_baseline_and_run(&pair, &roots, &generation, None, &entries, &report)
+            .unwrap());
+        assert_eq!(db.get_run("atomic-run").unwrap().unwrap().status, RunStatus::Running);
+        assert!(db
+            .save_sync_baseline_and_run(
+                &pair,
+                &roots,
+                &generation,
+                Some(&revision),
+                &entries,
+                &report
+            )
+            .unwrap());
+        assert_eq!(
+            db.load_sync_baseline(&pair, &roots).unwrap().baseline.unwrap().revision,
+            revision
+        );
+        assert_eq!(db.get_run("atomic-run").unwrap().unwrap().status, RunStatus::Completed);
+        db.conn.execute_batch("CREATE TRIGGER reject_terminal BEFORE UPDATE ON runs BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        let mut changed_entries = entries.clone();
+        changed_entries[0].0.modified_secs += 1;
+        assert!(db
+            .save_sync_baseline_and_run(
+                &pair,
+                &roots,
+                &generation,
+                Some(&revision),
+                &changed_entries,
+                &report
+            )
+            .is_err());
+        assert_eq!(
+            db.load_sync_baseline(&pair, &roots).unwrap().baseline.unwrap().revision,
+            revision
+        );
+        db.conn.execute_batch("DROP TRIGGER reject_terminal;").unwrap();
+        let mut draft = pair.clone();
+        draft.filters.exclude.push("*.tmp".into());
+        assert!(db.load_sync_baseline(&draft, &roots).unwrap().generation.is_none());
+        assert!(!db
+            .save_sync_baseline(&draft, &roots, &generation, Some(&revision), &entries)
+            .unwrap());
+        pair.filters.exclude.push("*.tmp".into());
+        db.save_pair(&pair).unwrap();
+        pair.filters.exclude.clear();
+        db.save_pair(&pair).unwrap();
+        let after = db.load_sync_baseline(&pair, &roots).unwrap();
+        assert_ne!(after.generation.as_deref(), Some(generation.as_str()));
+        assert!(after.baseline.is_none());
+        assert!(!db
+            .save_sync_baseline(&pair, &roots, &generation, Some(&revision), &entries)
+            .unwrap());
+        assert_eq!(db.latest_snapshot(&pair.id).unwrap().unwrap(), snapshot);
+        let changed_roots = ["other".into(), "root-b".into()];
+        let changed = db.load_sync_baseline(&pair, &changed_roots).unwrap();
+        let returned = db.load_sync_baseline(&pair, &roots).unwrap();
+        assert_ne!(changed.generation, returned.generation);
     }
 
     #[test]
@@ -1826,6 +2593,8 @@ mod tests {
     fn duplicate_scan_job_round_trip_and_interruption_recovery() {
         let (_dir, db) = temp_db();
         let job = DuplicateScanJob {
+            attempt: 1,
+            sequence: 0,
             id: "scan-1".into(),
             root: "/data".into(),
             mode: DuplicateMatchMode::Hash,
@@ -1847,13 +2616,406 @@ mod tests {
         db.save_duplicate_scan(&job).expect("save scan");
 
         let loaded = db.get_duplicate_scan("scan-1").expect("load scan").expect("scan");
-        assert_eq!(loaded, job);
+        assert_eq!(loaded.id, job.id);
+        assert!(loaded.sequence > 0);
 
         db.mark_duplicate_scans_interrupted().expect("interrupt scan");
         let interrupted =
             db.get_duplicate_scan("scan-1").expect("load interrupted scan").expect("scan");
         assert_eq!(interrupted.status, DuplicateScanStatus::Interrupted);
         assert!(interrupted.error.unwrap_or_default().contains("interrupted"));
+    }
+
+    #[test]
+    fn duplicate_terminal_and_attempt_transitions_reject_stale_writes() {
+        let (_dir, db) = temp_db();
+        let mut job = DuplicateScanJob {
+            attempt: 1,
+            sequence: 0,
+            id: "race".into(),
+            root: "root".into(),
+            mode: DuplicateMatchMode::Size,
+            status: DuplicateScanStatus::Running,
+            phase: None,
+            files_found: 0,
+            total_files: None,
+            hashed_files: 0,
+            hash_total: None,
+            bytes_processed: 0,
+            bytes_total: None,
+            current_path: None,
+            cancel_requested: false,
+            result: None,
+            error: None,
+            started_at: 1,
+            updated_at: 1,
+        };
+        db.save_duplicate_scan(&job).unwrap();
+        let stale = db.get_duplicate_scan("race").unwrap().unwrap();
+        job.status = DuplicateScanStatus::Completed;
+        db.save_duplicate_scan(&job).unwrap();
+        let terminal = db.get_duplicate_scan("race").unwrap().unwrap();
+        assert!(!db.request_duplicate_cancel("race", 1).unwrap());
+        assert!(db.save_duplicate_scan(&stale).is_err());
+        assert_eq!(
+            db.get_duplicate_scan("race").unwrap().unwrap().status,
+            DuplicateScanStatus::Completed
+        );
+        job.status = DuplicateScanStatus::Running;
+        job.attempt = 2;
+        db.save_duplicate_scan(&job).unwrap();
+        assert!(db.save_duplicate_scan(&stale).is_err());
+        let resumed = db.get_duplicate_scan("race").unwrap().unwrap();
+        assert!(resumed.sequence > terminal.sequence);
+        assert_eq!(resumed.attempt, 2);
+        assert!(!db.request_duplicate_cancel("race", 1).unwrap());
+        assert!(!db.get_duplicate_scan("race").unwrap().unwrap().cancel_requested);
+        assert!(db.request_duplicate_cancel("race", 2).unwrap());
+    }
+
+    #[test]
+    fn duplicate_cancel_after_barrier_observes_durable_terminal() {
+        use std::sync::{mpsc, Arc, Barrier};
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("race.sqlite");
+        let db = Database::open(&path).unwrap();
+        let job = DuplicateScanJob {
+            attempt: 1,
+            sequence: 0,
+            id: "barrier".into(),
+            root: "root".into(),
+            mode: DuplicateMatchMode::Size,
+            status: DuplicateScanStatus::Running,
+            phase: None,
+            files_found: 0,
+            total_files: None,
+            hashed_files: 0,
+            hash_total: None,
+            bytes_processed: 0,
+            bytes_total: None,
+            current_path: None,
+            cancel_requested: false,
+            result: None,
+            error: None,
+            started_at: 1,
+            updated_at: 1,
+        };
+        db.save_duplicate_scan(&job).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let (done_tx, done_rx) = mpsc::channel();
+        let path2 = path.clone();
+        let barrier2 = Arc::clone(&barrier);
+        let worker = std::thread::spawn(move || {
+            let db = Database::open(&path2).unwrap();
+            let mut terminal = db.get_duplicate_scan("barrier").unwrap().unwrap();
+            barrier2.wait();
+            terminal.status = DuplicateScanStatus::Completed;
+            db.save_duplicate_scan(&terminal).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        barrier.wait();
+        done_rx.recv().unwrap();
+        assert!(!db.request_duplicate_cancel("barrier", 1).unwrap());
+        worker.join().unwrap();
+        assert_eq!(
+            db.get_duplicate_scan("barrier").unwrap().unwrap().status,
+            DuplicateScanStatus::Completed
+        );
+    }
+
+    #[test]
+    fn duplicate_result_pages_are_bounded_and_legacy_identity_stays_absent() {
+        let (_dir, db) = temp_db();
+        let files = (0..100_001)
+            .map(|i| duplicates::DuplicateFile {
+                id: None,
+                fingerprint: None,
+                relative_path: format!("f{i}"),
+                name: format!("f{i}"),
+                size: 1,
+                hash: None,
+            })
+            .collect::<Vec<_>>();
+        let groups = (0..53)
+            .map(|i| duplicates::DuplicateGroup {
+                id: None,
+                key: format!("g{i}"),
+                files: if i == 0 { files.clone() } else { files[..2].to_vec() },
+                potential_savings_bytes: 122,
+            })
+            .collect();
+        let result = duplicates::DuplicateScanResult {
+            revision: None,
+            root_identity: None,
+            root: "root".into(),
+            mode: DuplicateMatchMode::Size,
+            scanned_files: 123,
+            hashed_files: 0,
+            skipped_files: 0,
+            potential_savings_bytes: 0,
+            groups,
+            warnings: vec![],
+        };
+        let job = DuplicateScanJob {
+            attempt: 1,
+            sequence: 0,
+            id: "legacy".into(),
+            root: "root".into(),
+            mode: DuplicateMatchMode::Size,
+            status: DuplicateScanStatus::Completed,
+            phase: None,
+            files_found: 123,
+            total_files: None,
+            hashed_files: 0,
+            hash_total: None,
+            bytes_processed: 0,
+            bytes_total: None,
+            current_path: None,
+            cancel_requested: false,
+            result: Some(result),
+            error: None,
+            started_at: 1,
+            updated_at: 1,
+        };
+        db.conn.execute("INSERT INTO duplicate_scans(id,root,mode,status,result_json,started_at,updated_at) VALUES(?1,?2,'size','completed',?3,1,1)", params![job.id,job.root,serde_json::to_string(job.result.as_ref().unwrap()).unwrap()]).unwrap();
+        let revision = db.ensure_duplicate_index("legacy").unwrap().unwrap();
+        let page = db.duplicate_groups_page("legacy", &revision, 0, 99999).unwrap();
+        assert_eq!(page.groups.len(), 50);
+        assert_eq!(page.next_cursor, Some(50));
+        let second = db.duplicate_groups_page("legacy", &revision, 50, 99999).unwrap();
+        assert_eq!(second.groups.len(), 3);
+        let members =
+            db.duplicate_members_page("legacy", &revision, &page.groups[0].id, 0, 99999).unwrap();
+        assert_eq!(members.files.len(), 50);
+        assert_eq!(members.next_cursor, Some(50));
+        assert!(members.files.iter().all(|file| file.id.is_none()));
+        assert!(db.duplicate_members_page("legacy", "old", &page.groups[0].id, 0, 50).is_err());
+        let snapshot = db.duplicate_snapshot("legacy").unwrap().unwrap();
+        assert!(snapshot.job.result.is_none());
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() < 4096);
+        assert!(!snapshot.summary.unwrap().cleanup_available);
+    }
+
+    #[test]
+    fn abandoned_attempt_recovery_is_scoped_and_repeatable() {
+        let (_dir, db) = temp_db();
+        let mut job = DuplicateScanJob {
+            attempt: 1,
+            sequence: 0,
+            id: "abandoned".into(),
+            root: "root".into(),
+            mode: DuplicateMatchMode::Size,
+            status: DuplicateScanStatus::Running,
+            phase: None,
+            files_found: 0,
+            total_files: None,
+            hashed_files: 0,
+            hash_total: None,
+            bytes_processed: 0,
+            bytes_total: None,
+            current_path: None,
+            cancel_requested: false,
+            result: None,
+            error: None,
+            started_at: 1,
+            updated_at: 1,
+        };
+        db.save_duplicate_scan(&job).unwrap();
+        assert!(db.request_duplicate_cancel("abandoned", 1).unwrap());
+        db.interrupt_abandoned_duplicate("abandoned", 1).unwrap();
+        db.interrupt_abandoned_duplicate("abandoned", 1).unwrap();
+        let recovered = db.get_duplicate_scan("abandoned").unwrap().unwrap();
+        assert_eq!(recovered.status, DuplicateScanStatus::Interrupted);
+        assert!(!recovered.cancel_requested);
+        assert!(recovered.error.unwrap().contains("before its results could be saved"));
+        job.attempt = 2;
+        db.save_duplicate_scan(&job).unwrap();
+        db.interrupt_abandoned_duplicate("abandoned", 1).unwrap();
+        let current = db.get_duplicate_scan("abandoned").unwrap().unwrap();
+        assert_eq!(current.status, DuplicateScanStatus::Running);
+        assert_eq!(current.attempt, 2);
+    }
+
+    #[test]
+    fn new_terminal_snapshot_is_indexed_without_full_json_copy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = DatabaseManager::open(&dir.path().join("db.sqlite")).unwrap();
+        let fixtures = tempfile::TempDir::new().unwrap();
+        std::fs::write(fixtures.path().join("a"), b"same").unwrap();
+        std::fs::write(fixtures.path().join("b"), b"same").unwrap();
+        let result =
+            duplicates::find_duplicates(fixtures.path(), DuplicateMatchMode::Hash).unwrap();
+        let mut job = DuplicateScanJob {
+            attempt: 1,
+            sequence: 0,
+            id: "compact".into(),
+            root: result.root.clone(),
+            mode: result.mode,
+            status: DuplicateScanStatus::Running,
+            phase: None,
+            files_found: 2,
+            total_files: None,
+            hashed_files: 2,
+            hash_total: None,
+            bytes_processed: 0,
+            bytes_total: None,
+            current_path: None,
+            cancel_requested: false,
+            result: None,
+            error: None,
+            started_at: 1,
+            updated_at: 1,
+        };
+        manager.save_duplicate_scan(&job).unwrap();
+        job.status = DuplicateScanStatus::Completed;
+        job.result = Some(result);
+        let snapshot = manager.save_duplicate_terminal(&job).unwrap();
+        let revision = snapshot.summary.unwrap().revision;
+        let raw: Option<String> = manager
+            .read(|db| {
+                db.conn
+                    .query_row(
+                        "SELECT result_json FROM duplicate_scans WHERE id='compact'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert!(raw.is_none());
+        assert_eq!(
+            manager.duplicate_groups_page("compact", &revision, 0, 50).unwrap().groups.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_index_failure_rolls_back_row_and_recovers_atomically() {
+        let (_dir, db) = temp_db();
+        let fixtures = tempfile::TempDir::new().unwrap();
+        std::fs::write(fixtures.path().join("a"), b"same").unwrap();
+        std::fs::write(fixtures.path().join("b"), b"same").unwrap();
+        let result =
+            duplicates::find_duplicates(fixtures.path(), DuplicateMatchMode::Hash).unwrap();
+        let mut job = DuplicateScanJob {
+            attempt: 1,
+            sequence: 0,
+            id: "atomic".into(),
+            root: result.root.clone(),
+            mode: result.mode,
+            status: DuplicateScanStatus::Running,
+            phase: None,
+            files_found: 2,
+            total_files: None,
+            hashed_files: 2,
+            hash_total: None,
+            bytes_processed: 0,
+            bytes_total: None,
+            current_path: None,
+            cancel_requested: false,
+            result: None,
+            error: None,
+            started_at: 1,
+            updated_at: 1,
+        };
+        db.save_duplicate_scan(&job).unwrap();
+        db.conn.execute_batch("CREATE TRIGGER reject_index BEFORE INSERT ON duplicate_group_index BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
+        job.status = DuplicateScanStatus::Completed;
+        job.result = Some(result);
+        assert!(db.save_duplicate_scan(&job).is_err());
+        let persisted = db.get_duplicate_scan("atomic").unwrap().unwrap();
+        assert_eq!(persisted.status, DuplicateScanStatus::Running);
+        assert!(persisted.result.is_none());
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM duplicate_group_index WHERE job_id='atomic'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        db.conn.execute_batch("DROP TRIGGER reject_index").unwrap();
+        db.save_duplicate_scan(&job).unwrap();
+        let saved = db.duplicate_snapshot("atomic").unwrap().unwrap();
+        assert_eq!(saved.job.status, DuplicateScanStatus::Completed);
+        assert!(saved.summary.is_some());
+        assert!(!serde_json::to_value(saved).unwrap().as_object().unwrap().contains_key("result"));
+    }
+
+    #[test]
+    fn indexed_reviewed_item_lookup_is_revision_scoped() {
+        let (_db_dir, db) = temp_db();
+        let fixtures = tempfile::TempDir::new().unwrap();
+        std::fs::write(fixtures.path().join("a"), b"same").unwrap();
+        std::fs::write(fixtures.path().join("b"), b"same").unwrap();
+        let result =
+            duplicates::find_duplicates(fixtures.path(), DuplicateMatchMode::Hash).unwrap();
+        let revision = result.revision.clone().unwrap();
+        let item = result.groups[0].files[0].clone();
+        let item_id = item.id.clone().unwrap();
+        let job = DuplicateScanJob {
+            attempt: 1,
+            sequence: 0,
+            id: "modern".into(),
+            root: result.root.clone(),
+            mode: result.mode,
+            status: DuplicateScanStatus::Completed,
+            phase: None,
+            files_found: 2,
+            total_files: None,
+            hashed_files: 2,
+            hash_total: None,
+            bytes_processed: 0,
+            bytes_total: None,
+            current_path: None,
+            cancel_requested: false,
+            result: Some(result),
+            error: None,
+            started_at: 1,
+            updated_at: 1,
+        };
+        db.save_duplicate_scan(&job).unwrap();
+        db.ensure_duplicate_index("modern").unwrap();
+        let (_, loaded) =
+            db.duplicate_member_by_id("modern", &revision, &item_id).unwrap().unwrap();
+        assert_eq!(loaded, item);
+        assert!(db.duplicate_member_by_id("modern", "old", &item_id).is_err());
+        assert!(db.duplicate_member_by_id("modern", &revision, "unknown").unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_terminal_write_does_not_create_terminal_state() {
+        let (_dir, db) = temp_db();
+        let mut job = DuplicateScanJob {
+            attempt: 1,
+            sequence: 0,
+            id: "fail".into(),
+            root: "root".into(),
+            mode: DuplicateMatchMode::Size,
+            status: DuplicateScanStatus::Running,
+            phase: None,
+            files_found: 0,
+            total_files: None,
+            hashed_files: 0,
+            hash_total: None,
+            bytes_processed: 0,
+            bytes_total: None,
+            current_path: None,
+            cancel_requested: false,
+            result: None,
+            error: None,
+            started_at: 1,
+            updated_at: 1,
+        };
+        db.save_duplicate_scan(&job).unwrap();
+        db.conn.execute_batch("CREATE TRIGGER fail_terminal BEFORE UPDATE ON duplicate_scans WHEN NEW.status='completed' BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
+        job.status = DuplicateScanStatus::Completed;
+        assert!(db.save_duplicate_scan(&job).is_err());
+        assert_eq!(
+            db.get_duplicate_scan("fail").unwrap().unwrap().status,
+            DuplicateScanStatus::Running
+        );
     }
 
     #[test]

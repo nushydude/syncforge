@@ -3,17 +3,14 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-use crate::models::{PreviewActionPage, SyncPlan};
+use crate::models::PreviewActionPage;
 use crate::persistence::{DatabaseManager, PersistenceError};
 use crate::scheduler::ScheduleService;
 use crate::sniffer::SnifferService;
 use crate::watcher::WatchService;
 
-/// Ignore watch events for this long after a pair's sync completes (self-write feedback).
-pub const WATCH_SUPPRESS_AFTER_RUN_MS: u64 = 2000;
 /// Global heavy-job concurrency cap to protect disks, shares, CPU hashing, and SQLite.
 pub const HEAVY_JOB_CAPACITY: usize = 2;
 pub const PREVIEW_PAGE_MAX: usize = 200;
@@ -26,9 +23,7 @@ struct StoredPreviewPlan {
     pair_id: String,
     config_fingerprint: String,
     created_at: i64,
-    plan: SyncPlan,
-    left_preconditions: Vec<crate::models::FileEntry>,
-    right_preconditions: Vec<crate::models::FileEntry>,
+    prepared: crate::engine::PreparedPlan,
     conflict_indexes: Vec<usize>,
     estimated_bytes: usize,
 }
@@ -36,6 +31,71 @@ struct StoredPreviewPlan {
 pub struct PreviewPlanStore {
     plans: VecDeque<StoredPreviewPlan>,
     bytes: usize,
+}
+
+// Account for allocated capacities, not serialized lengths. Saturation makes overflow
+// fail closed. The fixed node allowance conservatively covers BTreeMap allocation.
+fn retained_preview_bytes(
+    pair_id_capacity: usize,
+    fingerprint_capacity: usize,
+    prepared: &crate::engine::PreparedPlan,
+) -> usize {
+    use crate::models::{FileEntry, SyncAction};
+    fn string(s: &String) -> usize {
+        s.capacity().saturating_add(32)
+    }
+    fn entry(e: &FileEntry) -> usize {
+        string(&e.relative_path).saturating_add(e.hash.as_ref().map_or(0, string))
+    }
+    fn action(a: &SyncAction) -> usize {
+        match a {
+            SyncAction::CopyLeftToRight { path }
+            | SyncAction::CopyRightToLeft { path }
+            | SyncAction::DeleteLeft { path }
+            | SyncAction::DeleteRight { path }
+            | SyncAction::CreateDirLeft { path }
+            | SyncAction::CreateDirRight { path } => string(path),
+            SyncAction::Conflict { path, left, right } => {
+                string(path).saturating_add(entry(left)).saturating_add(entry(right))
+            }
+            SyncAction::Skip { path, reason } => string(path).saturating_add(string(reason)),
+        }
+    }
+    let plan = &prepared.plan;
+    let mut size = std::mem::size_of::<StoredPreviewPlan>()
+        .saturating_add(128) // UUID, deque allocation and allocator overhead
+        .saturating_add(pair_id_capacity.saturating_add(32))
+        .saturating_add(fingerprint_capacity.saturating_add(32))
+        .saturating_add(string(&plan.pair_id))
+        .saturating_add(plan.actions.capacity().saturating_mul(std::mem::size_of::<SyncAction>()))
+        // Conflict-index vector is allocated after this estimate; reserve an upper bound.
+        .saturating_add(
+            plan.actions.len().saturating_mul(std::mem::size_of::<usize>()).saturating_mul(2),
+        )
+        .saturating_add(
+            plan.scan_warnings.capacity().saturating_mul(std::mem::size_of::<String>()),
+        );
+    for a in &plan.actions {
+        size = size.saturating_add(action(a));
+    }
+    for warning in &plan.scan_warnings {
+        size = size.saturating_add(string(warning));
+    }
+    for (path, error) in &plan.preview_file_errors {
+        size = size.saturating_add(256).saturating_add(string(path)).saturating_add(string(error));
+    }
+    for entries in [&prepared.preconditions.left, &prepared.preconditions.right] {
+        size = size
+            .saturating_add(entries.capacity().saturating_mul(std::mem::size_of::<FileEntry>()));
+        for e in entries {
+            size = size.saturating_add(entry(e));
+        }
+    }
+    for key in &prepared.root_keys {
+        size = size.saturating_add(string(key));
+    }
+    size = size.saturating_add(prepared.baseline_generation.as_ref().map_or(0, string));
+    size.saturating_add(prepared.baseline_revision.as_ref().map_or(0, string))
 }
 
 impl PreviewPlanStore {
@@ -47,21 +107,14 @@ impl PreviewPlanStore {
         &mut self,
         pair_id: String,
         config_fingerprint: String,
-        plan: SyncPlan,
-        left_preconditions: Vec<crate::models::FileEntry>,
-        right_preconditions: Vec<crate::models::FileEntry>,
+        prepared: crate::engine::PreparedPlan,
         now: i64,
     ) -> Result<String, String> {
         self.remove_expired(now);
         let id = uuid::Uuid::new_v4().to_string();
-        let estimated_bytes = serde_json::to_vec(&plan).map(|bytes| bytes.len()).unwrap_or(0)
-            + serde_json::to_vec(&left_preconditions).map(|bytes| bytes.len()).unwrap_or(0)
-            + serde_json::to_vec(&right_preconditions).map(|bytes| bytes.len()).unwrap_or(0)
-            + plan
-                .preview_file_errors
-                .iter()
-                .map(|(path, error)| path.len() + error.len())
-                .sum::<usize>();
+        let plan = &prepared.plan;
+        let estimated_bytes =
+            retained_preview_bytes(pair_id.capacity(), config_fingerprint.capacity(), &prepared);
         if estimated_bytes > PREVIEW_PLAN_MAX_BYTES {
             return Err("preview plan exceeds the bounded storage limit".into());
         }
@@ -79,9 +132,7 @@ impl PreviewPlanStore {
             pair_id,
             config_fingerprint,
             created_at: now,
-            plan,
-            left_preconditions,
-            right_preconditions,
+            prepared,
             conflict_indexes,
             estimated_bytes,
         });
@@ -106,17 +157,21 @@ impl PreviewPlanStore {
             .plans
             .iter()
             .find(|plan| plan.id == id)
-            .ok_or_else(|| "preview plan expired or not found".to_string())?;
+            .ok_or_else(|| "Preview needs refreshing: plan expired or not found".to_string())?;
         if stored.pair_id != pair_id || stored.config_fingerprint != config_fingerprint {
-            return Err("preview plan no longer matches this pair configuration".into());
+            return Err(
+                "Preview needs refreshing: plan no longer matches this pair configuration".into()
+            );
         }
-        let cursor = cursor.min(stored.plan.actions.len());
-        let end = cursor.saturating_add(limit.min(PREVIEW_PAGE_MAX)).min(stored.plan.actions.len());
+        let cursor = cursor.min(stored.prepared.plan.actions.len());
+        let end = cursor
+            .saturating_add(limit.min(PREVIEW_PAGE_MAX))
+            .min(stored.prepared.plan.actions.len());
         Ok(PreviewActionPage {
             plan_id: stored.id.clone(),
             cursor,
-            next_cursor: (end < stored.plan.actions.len()).then_some(end),
-            actions: stored.plan.actions[cursor..end].to_vec(),
+            next_cursor: (end < stored.prepared.plan.actions.len()).then_some(end),
+            actions: stored.prepared.plan.actions[cursor..end].to_vec(),
         })
     }
 
@@ -137,16 +192,18 @@ impl PreviewPlanStore {
             .plans
             .iter()
             .find(|plan| plan.id == id)
-            .ok_or_else(|| "preview plan expired or not found".to_string())?;
+            .ok_or_else(|| "Preview needs refreshing: plan expired or not found".to_string())?;
         if stored.pair_id != pair_id || stored.config_fingerprint != config_fingerprint {
-            return Err("preview plan no longer matches this pair configuration".into());
+            return Err(
+                "Preview needs refreshing: plan no longer matches this pair configuration".into()
+            );
         }
         let page_limit = limit.min(PREVIEW_PAGE_MAX);
         let cursor = cursor.min(stored.conflict_indexes.len());
         let end = cursor.saturating_add(page_limit).min(stored.conflict_indexes.len());
         let actions = stored.conflict_indexes[cursor..end]
             .iter()
-            .map(|index| stored.plan.actions[*index].clone())
+            .map(|index| stored.prepared.plan.actions[*index].clone())
             .collect();
         Ok(PreviewActionPage {
             plan_id: stored.id.clone(),
@@ -162,21 +219,22 @@ impl PreviewPlanStore {
         pair_id: &str,
         config_fingerprint: &str,
         now: i64,
-    ) -> Result<(SyncPlan, Vec<crate::models::FileEntry>, Vec<crate::models::FileEntry>), String>
-    {
+    ) -> Result<crate::engine::PreparedPlan, String> {
         self.remove_expired(now);
         let index = self
             .plans
             .iter()
             .position(|plan| plan.id == id)
-            .ok_or_else(|| "preview plan expired or not found".to_string())?;
+            .ok_or_else(|| "Preview needs refreshing: plan expired or not found".to_string())?;
         let stored = self.plans.get(index).expect("preview index exists");
         if stored.pair_id != pair_id || stored.config_fingerprint != config_fingerprint {
-            return Err("preview plan no longer matches this pair configuration".into());
+            return Err(
+                "Preview needs refreshing: plan no longer matches this pair configuration".into()
+            );
         }
         let stored = self.plans.remove(index).expect("preview index exists");
         self.bytes = self.bytes.saturating_sub(stored.estimated_bytes);
-        Ok((stored.plan, stored.left_preconditions, stored.right_preconditions))
+        Ok(stored.prepared)
     }
 
     fn remove_expired(&mut self, now: i64) {
@@ -309,6 +367,9 @@ impl WorkCoordinator {
     pub async fn wait_for_release(self: &Arc<Self>, request: WorkRequest) {
         loop {
             let notified = self.released.notified();
+            tokio::pin!(notified);
+            // Register before examining admission, so a release cannot be lost between the check and await.
+            notified.as_mut().enable();
             let ready = self
                 .heavy_jobs
                 .lock()
@@ -390,6 +451,11 @@ pub struct AppState {
     pub sniffer: Arc<SnifferService>,
     /// Per-pair cancel flags while a sync run is active.
     pub active_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Serializes admission, pending registration and release as one transition.
+    pair_admission: Mutex<()>,
+    pub capacity_waiters: Mutex<HashSet<(String, AutomaticReason)>>,
+    pub watch_failed_fingerprints: Mutex<HashMap<String, HashMap<String, String>>>,
+    pub watch_gate: Mutex<WatchGate>,
     /// Per-pair cancel flags while a preview scan is active.
     pub preview_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Pair ids whose debounced watch sync could not start while that pair was busy.
@@ -400,8 +466,6 @@ pub struct AppState {
     pub pending_automatic_syncs: Mutex<HashSet<String>>,
     /// Pair ids currently executing sync (manual, watch, or schedule).
     pub sync_in_progress: Mutex<HashSet<String>>,
-    /// Ignore watch events for a pair until this instant (post-run suppression).
-    pub watch_suppress_until: Mutex<HashMap<String, Instant>>,
     pub watch_service: Mutex<Option<WatchService>>,
     pub schedule_service: Mutex<Option<ScheduleService>>,
     pub preview_plans: Mutex<PreviewPlanStore>,
@@ -425,12 +489,15 @@ impl AppState {
             active_duplicate_jobs: Mutex::new(HashSet::new()),
             sniffer,
             active_runs: Mutex::new(HashMap::new()),
+            pair_admission: Mutex::new(()),
+            capacity_waiters: Mutex::new(HashSet::new()),
+            watch_failed_fingerprints: Mutex::new(HashMap::new()),
+            watch_gate: Mutex::new(WatchGate::default()),
             preview_cancels: Mutex::new(HashMap::new()),
             pending_watch_syncs: Mutex::new(HashSet::new()),
             pending_schedule_syncs: Mutex::new(HashSet::new()),
             pending_automatic_syncs: Mutex::new(HashSet::new()),
             sync_in_progress: Mutex::new(HashSet::new()),
-            watch_suppress_until: Mutex::new(HashMap::new()),
             watch_service: Mutex::new(None),
             schedule_service: Mutex::new(None),
             preview_plans: Mutex::new(PreviewPlanStore::new()),
@@ -438,8 +505,95 @@ impl AppState {
     }
 }
 
+/// Registration health and deferred Watch intent share one lock so recovery
+/// cannot race with a request that observes a degraded pair.
+#[derive(Default)]
+pub struct WatchGate {
+    epoch: u64,
+    recheck: bool,
+    healthy: HashMap<String, RegisteredWatch>,
+    paused: HashSet<String>,
+}
+
+#[derive(Clone)]
+pub struct RegisteredWatch {
+    pub config_fingerprint: String,
+    pub roots: Vec<(PathBuf, String)>,
+}
+
+impl WatchGate {
+    pub fn request(&mut self, pair: &crate::models::FolderPair) -> bool {
+        self.request_with(&pair.id, &crate::commands::preview::config_fingerprint(pair), |path| {
+            crate::path_normalization::root_identity(path).ok()
+        })
+    }
+    pub(crate) fn request_with(
+        &mut self,
+        pair_id: &str,
+        config_fingerprint: &str,
+        identify: impl Fn(&std::path::Path) -> Option<String>,
+    ) -> bool {
+        let ready = self.healthy.get(pair_id).is_some_and(|registration| {
+            registration.config_fingerprint == config_fingerprint
+                && registration.roots.len() == 2
+                && registration.roots.iter().all(|(path, expected)| {
+                    path.is_dir() && identify(path).as_ref() == Some(expected)
+                })
+        });
+        if ready {
+            true
+        } else {
+            if self.healthy.remove(pair_id).is_some() {
+                self.recheck = true;
+            }
+            self.paused.insert(pair_id.to_owned());
+            false
+        }
+    }
+    pub fn publish(
+        &mut self,
+        epoch: u64,
+        healthy: HashMap<String, RegisteredWatch>,
+        configured: &HashSet<String>,
+    ) -> Vec<String> {
+        if self.epoch != epoch || self.recheck {
+            return Vec::new();
+        }
+        self.healthy = healthy;
+        self.paused.retain(|id| configured.contains(id));
+        let ready: Vec<_> =
+            self.paused.iter().filter(|id| self.healthy.contains_key(*id)).cloned().collect();
+        for id in &ready {
+            self.paused.remove(id);
+        }
+        ready
+    }
+    pub fn mark_unhealthy(&mut self, pair_id: &str) {
+        self.healthy.remove(pair_id);
+        self.paused.insert(pair_id.to_owned());
+        self.recheck = true;
+    }
+    pub fn take_recheck(&mut self) -> bool {
+        std::mem::take(&mut self.recheck)
+    }
+    pub fn invalidate(&mut self) -> u64 {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.healthy.clear();
+        self.epoch
+    }
+}
+
+pub(crate) fn watch_is_ready_or_defer(state: &AppState, pair: &crate::models::FolderPair) -> bool {
+    state.watch_gate.lock().map(|mut gate| gate.request(pair)).unwrap_or(false)
+}
+
 /// Reserves a run slot for `pair_id`. Different pairs may run concurrently.
 pub fn try_acquire_pair_run(state: &AppState, pair_id: &str) -> Result<Arc<AtomicBool>, String> {
+    let _guard = state.pair_admission.lock().map_err(|e| e.to_string())?;
+    acquire_pair_run_locked(state, pair_id)
+}
+
+fn acquire_pair_run_locked(state: &AppState, pair_id: &str) -> Result<Arc<AtomicBool>, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut runs = state.active_runs.lock().map_err(|e| e.to_string())?;
     if runs.contains_key(pair_id) {
@@ -452,13 +606,14 @@ pub fn try_acquire_pair_run(state: &AppState, pair_id: &str) -> Result<Arc<Atomi
     Ok(cancel)
 }
 
-/// Clears the run slot when it matches `slot` and arms post-run watch suppression.
+/// Clears the run slot when it matches `slot` and transfers pending reasons.
 /// Returns whether a pending watch sync and/or scheduled sync were queued for this pair.
 pub fn release_pair_run_slot(
     state: &AppState,
     pair_id: &str,
     slot: &Arc<AtomicBool>,
 ) -> Option<(bool, bool)> {
+    let _guard = state.pair_admission.lock().ok()?;
     let mut runs = state.active_runs.lock().ok()?;
     let active = runs.get(pair_id)?;
     if !Arc::ptr_eq(active, slot) {
@@ -470,13 +625,6 @@ pub fn release_pair_run_slot(
     if let Ok(mut in_progress) = state.sync_in_progress.lock() {
         in_progress.remove(pair_id);
     }
-    if let Ok(mut suppress) = state.watch_suppress_until.lock() {
-        suppress.insert(
-            pair_id.to_string(),
-            Instant::now() + Duration::from_millis(WATCH_SUPPRESS_AFTER_RUN_MS),
-        );
-    }
-
     let watch_pending =
         state.pending_watch_syncs.lock().ok().is_some_and(|mut g| g.remove(pair_id));
     let schedule_pending =
@@ -490,64 +638,106 @@ pub fn release_pair_run_slot(
     Some((watch_pending, schedule_pending))
 }
 
-pub fn should_ignore_watch_event(state: &AppState, pair_id: &str) -> bool {
-    if let Ok(in_progress) = state.sync_in_progress.lock() {
-        if in_progress.contains(pair_id) {
-            return true;
-        }
-    }
-    if let Ok(suppress) = state.watch_suppress_until.lock() {
-        if let Some(until) = suppress.get(pair_id) {
-            if Instant::now() < *until {
-                return true;
-            }
-        }
-    }
-    false
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub enum AutomaticReason {
+    Watch,
+    Schedule,
 }
 
+fn enqueue_locked(state: &AppState, pair_id: &str, reason: AutomaticReason) -> bool {
+    let target = match reason {
+        AutomaticReason::Watch => &state.pending_watch_syncs,
+        AutomaticReason::Schedule => &state.pending_schedule_syncs,
+    };
+    let inserted =
+        target.lock().map(|mut pending| pending.insert(pair_id.to_owned())).unwrap_or(false);
+    if let Ok(mut all) = state.pending_automatic_syncs.lock() {
+        all.insert(pair_id.to_owned());
+    }
+    inserted
+}
+
+fn dequeue_locked(state: &AppState, pair_id: &str, reason: AutomaticReason) {
+    let target = match reason {
+        AutomaticReason::Watch => &state.pending_watch_syncs,
+        AutomaticReason::Schedule => &state.pending_schedule_syncs,
+    };
+    if let Ok(mut pending) = target.lock() {
+        pending.remove(pair_id);
+    }
+    let watch = state.pending_watch_syncs.lock().map(|g| g.contains(pair_id)).unwrap_or(true);
+    let schedule = state.pending_schedule_syncs.lock().map(|g| g.contains(pair_id)).unwrap_or(true);
+    if !watch && !schedule {
+        if let Ok(mut all) = state.pending_automatic_syncs.lock() {
+            all.remove(pair_id);
+        }
+    }
+}
+
+/// Atomically owns a slot or records the triggering reason for its owner to drain.
+pub(crate) fn acquire_or_enqueue(
+    state: &AppState,
+    pair_id: &str,
+    reason: AutomaticReason,
+) -> Result<Option<Arc<AtomicBool>>, String> {
+    let _guard = state.pair_admission.lock().map_err(|e| e.to_string())?;
+    if state.active_runs.lock().map_err(|e| e.to_string())?.contains_key(pair_id) {
+        enqueue_locked(state, pair_id, reason);
+        return Ok(None);
+    }
+    let slot = acquire_pair_run_locked(state, pair_id)?;
+    dequeue_locked(state, pair_id, reason);
+    Ok(Some(slot))
+}
+
+/// Releases ownership and records the retry without a release/enqueue gap.
+pub(crate) fn defer_for_capacity(
+    state: &AppState,
+    pair_id: &str,
+    slot: &Arc<AtomicBool>,
+    reason: AutomaticReason,
+) -> bool {
+    let Ok(_guard) = state.pair_admission.lock() else {
+        return false;
+    };
+    let Ok(mut runs) = state.active_runs.lock() else {
+        return false;
+    };
+    if !runs.get(pair_id).is_some_and(|active| Arc::ptr_eq(active, slot)) {
+        return false;
+    }
+    runs.remove(pair_id);
+    if let Ok(mut progress) = state.sync_in_progress.lock() {
+        progress.remove(pair_id);
+    }
+    enqueue_locked(state, pair_id, reason);
+    true
+}
+
+pub(crate) fn take_pending_sync(state: &AppState, reason: AutomaticReason) -> Option<String> {
+    let _guard = state.pair_admission.lock().ok()?;
+    let target = match reason {
+        AutomaticReason::Watch => &state.pending_watch_syncs,
+        AutomaticReason::Schedule => &state.pending_schedule_syncs,
+    };
+    let id = target.lock().ok()?.iter().next().cloned()?;
+    dequeue_locked(state, &id, reason);
+    Some(id)
+}
+
+#[cfg(test)]
 pub(crate) fn enqueue_pending_watch_sync(state: &AppState, pair_id: impl Into<String>) -> bool {
-    let pair_id = pair_id.into();
-    if let Ok(mut automatic) = state.pending_automatic_syncs.lock() {
-        if !automatic.insert(pair_id.clone()) {
-            return false;
-        }
-    }
-    if let Ok(mut guard) = state.pending_watch_syncs.lock() {
-        return guard.insert(pair_id);
-    }
-    false
+    let Ok(_guard) = state.pair_admission.lock() else {
+        return false;
+    };
+    enqueue_locked(state, &pair_id.into(), AutomaticReason::Watch)
 }
-
+#[cfg(test)]
 pub(crate) fn enqueue_pending_schedule_sync(state: &AppState, pair_id: impl Into<String>) -> bool {
-    let pair_id = pair_id.into();
-    if let Ok(mut automatic) = state.pending_automatic_syncs.lock() {
-        if !automatic.insert(pair_id.clone()) {
-            return false;
-        }
-    }
-    if let Ok(mut guard) = state.pending_schedule_syncs.lock() {
-        return guard.insert(pair_id);
-    }
-    false
-}
-
-pub(crate) fn dequeue_pending_watch_sync(state: &AppState, pair_id: &str) {
-    if let Ok(mut guard) = state.pending_watch_syncs.lock() {
-        guard.remove(pair_id);
-    }
-    if let Ok(mut automatic) = state.pending_automatic_syncs.lock() {
-        automatic.remove(pair_id);
-    }
-}
-
-pub(crate) fn dequeue_pending_schedule_sync(state: &AppState, pair_id: &str) {
-    if let Ok(mut guard) = state.pending_schedule_syncs.lock() {
-        guard.remove(pair_id);
-    }
-    if let Ok(mut automatic) = state.pending_automatic_syncs.lock() {
-        automatic.remove(pair_id);
-    }
+    let Ok(_guard) = state.pair_admission.lock() else {
+        return false;
+    };
+    enqueue_locked(state, &pair_id.into(), AutomaticReason::Schedule)
 }
 
 #[cfg(test)]
@@ -679,19 +869,47 @@ mod tests {
     }
 
     #[test]
-    fn automatic_queue_has_one_entry_per_pair_across_reasons() {
+    fn automatic_queue_preserves_both_reasons_with_one_pair_entry() {
         let data_dir = TempDir::new().expect("tempdir");
         let state = AppState::new(data_dir.path().to_path_buf()).expect("app state");
         assert!(enqueue_pending_watch_sync(&state, "pair-a"));
-        assert!(!enqueue_pending_schedule_sync(&state, "pair-a"));
+        assert!(enqueue_pending_schedule_sync(&state, "pair-a"));
         assert!(enqueue_pending_schedule_sync(&state, "pair-b"));
         assert_eq!(state.pending_automatic_syncs.lock().unwrap().len(), 2);
     }
 
     #[test]
+    fn preview_accounting_uses_reserved_capacity_and_releases_it() {
+        let mut reason = String::with_capacity(1024 * 1024);
+        reason.push('x');
+        let prepared = crate::engine::PreparedPlan {
+            plan: crate::models::SyncPlan {
+                pair_id: "pair".into(),
+                actions: vec![crate::models::SyncAction::Skip { path: "file".into(), reason }],
+                scanned_left: 0,
+                scanned_right: 0,
+                scan_skipped_left: 0,
+                scan_skipped_right: 0,
+                scan_warnings: vec![],
+                requires_attention: false,
+                preview_file_errors: Default::default(),
+            },
+            preconditions: crate::engine::PlanPreconditions { left: vec![], right: vec![] },
+            root_keys: [String::new(), String::new()],
+            baseline_generation: None,
+            baseline_revision: None,
+        };
+        let mut store = PreviewPlanStore::new();
+        let id = store.insert("pair".into(), "config".into(), prepared, 100).unwrap();
+        assert!(store.bytes >= 1024 * 1024);
+        store.take(&id, "pair", "config", 101).unwrap();
+        assert_eq!(store.bytes, 0);
+    }
+
+    #[test]
     fn preview_plan_store_pages_bounds_and_validates_handles() {
         let mut store = PreviewPlanStore::new();
-        let plan = SyncPlan {
+        let plan = crate::models::SyncPlan {
             pair_id: "pair-a".into(),
             actions: (0..=PREVIEW_PAGE_MAX)
                 .map(|index| crate::models::SyncAction::Skip {
@@ -708,8 +926,23 @@ mod tests {
             preview_file_errors: Default::default(),
         };
         let id = store
-            .insert("pair-a".into(), "fingerprint-a".into(), plan, vec![], vec![], 100)
+            .insert(
+                "pair-a".into(),
+                "fingerprint-a".into(),
+                crate::engine::PreparedPlan {
+                    plan,
+                    preconditions: crate::engine::PlanPreconditions { left: vec![], right: vec![] },
+                    root_keys: [String::new(), String::new()],
+                    baseline_generation: None,
+                    baseline_revision: None,
+                },
+                100,
+            )
             .expect("store plan");
+        assert!(
+            store.bytes
+                >= (PREVIEW_PAGE_MAX + 1) * std::mem::size_of::<crate::models::SyncAction>()
+        );
         let first = store
             .get_page(&id, "pair-a", "fingerprint-a", 0, PREVIEW_PAGE_MAX + 50, 101)
             .expect("first page");
@@ -719,6 +952,7 @@ mod tests {
         assert!(store
             .get_page(&id, "pair-a", "fingerprint-a", 0, 1, 100 + PREVIEW_PLAN_TTL_MS)
             .is_err());
+        assert_eq!(store.bytes, 0);
     }
 
     #[test]
@@ -800,24 +1034,6 @@ mod tests {
     }
 
     #[test]
-    fn watch_suppression_blocks_events_until_deadline() {
-        let data_dir = TempDir::new().expect("tempdir");
-        let state = AppState::new(data_dir.path().to_path_buf()).expect("app state");
-        let slot = try_acquire_pair_run(&state, "pair-a").expect("acquire");
-
-        assert!(should_ignore_watch_event(&state, "pair-a"));
-
-        let _ = release_pair_run_slot(&state, "pair-a", &slot);
-
-        assert!(should_ignore_watch_event(&state, "pair-a"));
-        {
-            let mut suppress = state.watch_suppress_until.lock().expect("lock");
-            suppress.insert("pair-a".into(), Instant::now() - Duration::from_millis(1));
-        }
-        assert!(!should_ignore_watch_event(&state, "pair-a"));
-    }
-
-    #[test]
     fn pending_watch_and_schedule_queues_are_separate() {
         let data_dir = TempDir::new().expect("tempdir");
         let state = AppState::new(data_dir.path().to_path_buf()).expect("app state");
@@ -848,9 +1064,67 @@ mod tests {
         let slot = try_acquire_pair_run(&state, "pair-a").expect("acquire");
         let pending = release_pair_run_slot(&state, "pair-a", &slot).expect("release");
 
-        assert_eq!(pending, (true, false));
+        assert_eq!(pending, (true, true));
         assert!(state.pending_watch_syncs.lock().expect("lock").contains("pair-b"));
         assert!(state.pending_schedule_syncs.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn atomic_admission_race_never_strands_watch_or_schedule() {
+        for reason in [AutomaticReason::Watch, AutomaticReason::Schedule] {
+            for _ in 0..20 {
+                let data_dir = TempDir::new().unwrap();
+                let state = Arc::new(AppState::new(data_dir.path().to_path_buf()).unwrap());
+                let slot = try_acquire_pair_run(&state, "pair").unwrap();
+                let barrier = Arc::new(Barrier::new(3));
+                let start = Arc::clone(&barrier);
+                let dispatch_state = Arc::clone(&state);
+                let dispatch = thread::spawn(move || {
+                    start.wait();
+                    acquire_or_enqueue(&dispatch_state, "pair", reason).unwrap()
+                });
+                let start = Arc::clone(&barrier);
+                let release_state = Arc::clone(&state);
+                let release = thread::spawn(move || {
+                    start.wait();
+                    release_pair_run_slot(&release_state, "pair", &slot).unwrap()
+                });
+                barrier.wait();
+                let acquired = dispatch.join().unwrap();
+                let pending = release.join().unwrap();
+                let delivered = match reason {
+                    AutomaticReason::Watch => pending.0,
+                    AutomaticReason::Schedule => pending.1,
+                };
+                assert!(
+                    acquired.is_some() || delivered,
+                    "reason must be owned or handed to release"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dirty_events_during_active_run_coalesce_and_survive_release() {
+        let data_dir = TempDir::new().unwrap();
+        let state = AppState::new(data_dir.path().to_path_buf()).unwrap();
+        let active = try_acquire_pair_run(&state, "pair").unwrap();
+        for _ in 0..20 {
+            assert!(acquire_or_enqueue(&state, "pair", AutomaticReason::Watch).unwrap().is_none());
+        }
+        assert_eq!(state.pending_watch_syncs.lock().unwrap().len(), 1);
+        assert_eq!(release_pair_run_slot(&state, "pair", &active), Some((true, false)));
+    }
+
+    #[test]
+    fn capacity_deferral_keeps_both_reasons_until_retry_admission() {
+        let data_dir = TempDir::new().unwrap();
+        let state = AppState::new(data_dir.path().to_path_buf()).unwrap();
+        let slot = try_acquire_pair_run(&state, "pair").unwrap();
+        assert!(acquire_or_enqueue(&state, "pair", AutomaticReason::Schedule).unwrap().is_none());
+        assert!(defer_for_capacity(&state, "pair", &slot, AutomaticReason::Watch));
+        let next = acquire_or_enqueue(&state, "pair", AutomaticReason::Watch).unwrap().unwrap();
+        assert_eq!(release_pair_run_slot(&state, "pair", &next), Some((false, true)));
     }
 
     #[test]

@@ -18,6 +18,7 @@ import { getAppSettings } from "./settingsStore";
 /** Scan/preview result for a single pair — kept per pair so views stay independent. */
 export interface PairPreviewState {
   plan: PreviewSummary | null;
+  reviewRequired?: boolean;
   /** Waiting in the shared work queue, not scanning yet. */
   queued: boolean;
   loading: boolean;
@@ -113,6 +114,11 @@ const listeners = new Set<Listener>();
 
 /** Monotonic token per pair — stale preview responses are ignored when it changes. */
 const previewRequestIds = new Map<string, number>();
+const pairEditRevisions = new Map<string, number>();
+
+export function getPairEditRevision(pairId: string): number {
+  return pairEditRevisions.get(pairId) ?? 0;
+}
 
 function bumpPreviewRequest(pairId: string): number {
   const next = (previewRequestIds.get(pairId) ?? 0) + 1;
@@ -152,6 +158,31 @@ export function isPreviewLoadingForPair(
 /** Surfaces a preview-related failure against the pair it belongs to. */
 export function setPreviewError(pairId: string, message: string): void {
   setPreview(pairId, { error: message });
+  emit();
+}
+
+export function isPreviewRefreshRequired(message?: string | null): boolean {
+  return !!(
+    message?.startsWith("Preview needs refreshing:") ||
+    message?.includes("preview plan expired or not found") ||
+    message?.includes("preview plan no longer matches")
+  );
+}
+
+export function requireFreshPreview(pairId: string, message: string): void {
+  bumpPreviewRequest(pairId);
+  setPreview(pairId, {
+    ...emptyPairPreview,
+    reviewRequired: true,
+    error: message,
+  });
+  emit();
+}
+
+export function markPreviewReviewed(pairId: string, planId: string): void {
+  const current = getPairPreview(pairId);
+  if (!current.reviewRequired || current.plan?.planId !== planId) return;
+  setPreview(pairId, { reviewRequired: false });
   emit();
 }
 
@@ -363,6 +394,7 @@ export function markPreviewQueued(pairId: string): void {
   setPreview(pairId, {
     ...emptyPairPreview,
     queued: true,
+    reviewRequired: getPairPreview(pairId).reviewRequired,
   });
   emit();
 }
@@ -404,8 +436,10 @@ export async function previewPairById(pair: FolderPair): Promise<void> {
   }
   const pairId = pair.id;
   const requestId = bumpPreviewRequest(pairId);
+  const reviewRequired = getPairPreview(pairId).reviewRequired;
   setPreview(pairId, {
     ...emptyPairPreview,
+    reviewRequired,
     loading: true,
     startedAt: Date.now(),
   });
@@ -417,7 +451,15 @@ export async function previewPairById(pair: FolderPair): Promise<void> {
     if (requestId !== previewRequestIds.get(pairId)) {
       return;
     }
-    setPreview(pairId, { plan, loading: false, scanPath: null });
+    setPreview(pairId, {
+      plan,
+      reviewRequired:
+        reviewRequired &&
+        ((plan.actionCount ?? plan.actions.length) > 0 ||
+          (plan.scanWarnings?.length ?? 0) > 0),
+      loading: false,
+      scanPath: null,
+    });
   } catch (e) {
     if (requestId !== previewRequestIds.get(pairId)) {
       return;
@@ -440,13 +482,33 @@ export function updateEditing(patch: Partial<FolderPair>): void {
   if (!state.editing) {
     return;
   }
-  const editing = { ...state.editing, ...patch };
+  const previous = state.editing;
+  const editing = { ...previous, ...patch };
   state = {
     ...state,
     editing,
     validationErrors: [],
   };
-  emit();
+  const preview = getPairPreview(editing.id);
+  const editChanged = Object.keys(patch).some(
+    (key) =>
+      previous[key as keyof FolderPair] !== editing[key as keyof FolderPair],
+  );
+  if (editing.id && editChanged) {
+    pairEditRevisions.set(editing.id, getPairEditRevision(editing.id) + 1);
+  }
+  if (
+    editing.id &&
+    editChanged &&
+    (preview.plan || preview.loading || preview.queued)
+  ) {
+    requireFreshPreview(
+      editing.id,
+      "Preview needs refreshing: the pair changed. Review a new preview before syncing.",
+    );
+  } else {
+    emit();
+  }
   if (
     "watchEnabled" in patch ||
     "enabled" in patch ||
@@ -603,6 +665,7 @@ export async function deleteSelected(): Promise<boolean> {
 /** Test helper — reset module state between Vitest cases. */
 export function resetPairsStoreForTests(): void {
   previewRequestIds.clear();
+  pairEditRevisions.clear();
   watchWarningRequestId = 0;
   if (watchWarningTimer) {
     clearTimeout(watchWarningTimer);

@@ -1,118 +1,214 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { listen } from "@tauri-apps/api/event";
 import { DuplicatesView } from "../components/duplicates/DuplicatesView";
-import { getDuplicateScan, startDuplicateScan } from "../api/duplicates";
+import {
+  getDuplicateScan,
+  getDuplicateGroupsPage,
+  getDuplicateMembersPage,
+  revealDuplicate,
+} from "../api/duplicates";
+import type { DuplicateScanJob } from "../types";
 
 vi.mock("../api/duplicates", () => ({
   getDuplicateScan: vi.fn(),
   startDuplicateScan: vi.fn(),
   resumeDuplicateScan: vi.fn(),
   cancelDuplicateScan: vi.fn(),
-  removeDuplicates: vi.fn(),
+  revealDuplicate: vi.fn(),
+  getDuplicateGroupsPage: vi.fn(),
+  getDuplicateMembersPage: vi.fn(),
 }));
+vi.mock("../api/pairs", () => ({ pickFolder: vi.fn() }));
 
-vi.mock("../api/pairs", () => ({
-  pickFolder: vi.fn(),
-}));
+function job(sequence: number, revision = "r1"): DuplicateScanJob {
+  return {
+    id: "j1",
+    attempt: 1,
+    sequence,
+    root: "C:/fixtures",
+    mode: "hash",
+    status: "completed",
+    phase: null,
+    filesFound: 2,
+    totalFiles: 2,
+    hashedFiles: 2,
+    hashTotal: 8,
+    bytesProcessed: 8,
+    bytesTotal: 8,
+    currentPath: null,
+    cancelRequested: false,
+    error: null,
+    startedAt: 1,
+    updatedAt: 2,
+    summary: {
+      revision,
+      cleanupAvailable: true,
+      root: "C:/fixtures",
+      mode: "hash",
+      scannedFiles: 2,
+      hashedFiles: 2,
+      skippedFiles: 0,
+      potentialSavingsBytes: 4,
+      groupCount: 1,
+      warnings: [],
+    },
+  };
+}
 
-describe("DuplicatesView", () => {
+describe("duplicate result paging", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(getDuplicateScan).mockResolvedValue(null);
+    vi.mocked(listen).mockResolvedValue(() => {});
+    vi.mocked(getDuplicateScan).mockResolvedValue(job(2));
+    vi.mocked(getDuplicateGroupsPage).mockResolvedValue({
+      revision: "r1",
+      groups: [
+        {
+          id: "g1",
+          key: "abc",
+          fileCount: 2,
+          potentialSavingsBytes: 4,
+          firstSize: 4,
+        },
+      ],
+      nextCursor: null,
+    });
+    vi.mocked(getDuplicateMembersPage).mockResolvedValue({
+      revision: "r1",
+      groupId: "g1",
+      files: [
+        { id: "a", fingerprint: "v1", name: "a", relativePath: "a", size: 4 },
+        { id: "b", fingerprint: "v2", name: "b", relativePath: "b", size: 4 },
+      ],
+      nextCursor: 50,
+    });
   });
-
-  it("scans a folder and renders duplicate groups", async () => {
-    vi.mocked(startDuplicateScan).mockResolvedValue({
-      id: "scan-1",
-      root: "C:/Documents",
-      mode: "hash",
-      status: "completed",
-      phase: null,
-      filesFound: 3,
-      totalFiles: 3,
-      hashedFiles: 2,
-      hashTotal: 24,
-      bytesProcessed: 24,
-      bytesTotal: 24,
-      currentPath: null,
-      cancelRequested: false,
-      error: null,
-      startedAt: 1,
-      updatedAt: 2,
-      result: {
-        root: "C:/Documents",
-        mode: "hash",
-        scannedFiles: 3,
-        hashedFiles: 2,
-        skippedFiles: 0,
-        potentialSavingsBytes: 12,
-        warnings: [],
-        groups: [
-          {
-            key: "abc1234567890abc",
-            potentialSavingsBytes: 12,
-            files: [
-              { relativePath: "one.txt", name: "one.txt", size: 12 },
-              {
-                relativePath: "archive/one.txt",
-                name: "one.txt",
-                size: 12,
-              },
-            ],
-          },
-        ],
-      },
-    });
-
+  it("loads bounded pages and clears selection when switching pages", async () => {
     render(<DuplicatesView />);
-    await waitFor(() => {
-      expect(getDuplicateScan).toHaveBeenCalled();
-    });
-    fireEvent.change(screen.getByLabelText(/folder to scan/i), {
-      target: { value: "C:/Documents" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Scan folder" }));
-
-    await waitFor(() => {
-      expect(screen.getByText("archive/one.txt")).toBeInTheDocument();
-    });
-    expect(screen.getByText("duplicate groups")).toBeInTheDocument();
-    expect(startDuplicateScan).toHaveBeenCalledWith("C:/Documents", "hash");
+    const box = await screen.findByRole("radio", { name: /^b\s/i });
+    fireEvent.click(box);
+    expect(box).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Next files" }));
+    await waitFor(() =>
+      expect(getDuplicateMembersPage).toHaveBeenCalledWith(
+        "j1",
+        "r1",
+        "g1",
+        50,
+      ),
+    );
+    expect(
+      screen.queryByRole("button", { name: /open in explorer/i }),
+    ).not.toBeInTheDocument();
   });
-
-  it("offers recovery for an interrupted scan", async () => {
-    vi.mocked(getDuplicateScan).mockResolvedValue({
-      id: "scan-1",
-      root: "C:/Documents",
-      mode: "hash",
-      status: "interrupted",
-      phase: "hashing",
-      filesFound: 120,
-      totalFiles: 240,
-      hashedFiles: 80,
-      hashTotal: 1024,
-      bytesProcessed: 512,
-      bytesTotal: 1024,
-      currentPath: "nested/current.bin",
-      cancelRequested: false,
-      error: "The previous scan was interrupted. Resume it to continue.",
-      startedAt: 1,
-      updatedAt: 2,
-      result: null,
-    });
-
+  it("ignores a saved snapshot that arrives after a newer event", async () => {
+    let resolve!: (value: DuplicateScanJob) => void;
+    vi.mocked(getDuplicateScan).mockReturnValue(
+      new Promise((r) => {
+        resolve = r;
+      }),
+    );
     render(<DuplicatesView />);
-
-    await waitFor(() => {
+    const calls = vi.mocked(listen).mock.calls;
+    const callback = calls[calls.length - 1][1];
+    act(() => callback({ event: "progress", id: 1, payload: job(3) }));
+    await screen.findByText("duplicate groups");
+    act(() => resolve({ ...job(2), status: "running", summary: null }));
+    await waitFor(() =>
       expect(
-        screen.getByRole("heading", { name: "Previous scan interrupted" }),
-      ).toBeInTheDocument();
-    });
+        screen.queryByRole("heading", { name: "Finding files" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+  it("sends exactly one reviewed ID to Explorer and describes the request accurately", async () => {
+    vi.mocked(revealDuplicate).mockResolvedValue();
+    render(<DuplicatesView />);
+    fireEvent.click(await screen.findByRole("radio", { name: /^a\s/i }));
+    fireEvent.click(screen.getByRole("radio", { name: /^b\s/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Open in Explorer" }));
+    await waitFor(() =>
+      expect(revealDuplicate).toHaveBeenCalledWith("j1", "r1", "b"),
+    );
     expect(
-      screen.getByRole("button", { name: "Resume scan" }),
+      await screen.findByText(
+        "Explorer request sent. Find and review the file there before removing it.",
+      ),
     ).toBeInTheDocument();
+  });
+  it("shows opener failure without claiming the request succeeded", async () => {
+    vi.mocked(revealDuplicate).mockRejectedValue(
+      "Could not send the Explorer request: unavailable",
+    );
+    render(<DuplicatesView />);
+    fireEvent.click(await screen.findByRole("radio", { name: /^b\s/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Open in Explorer" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not send the Explorer request",
+    );
     expect(
-      screen.getByText(/The previous scan was interrupted/),
+      screen.queryByText(/Explorer request sent/i),
+    ).not.toBeInTheDocument();
+  });
+  it("refreshes a running snapshot if progress subscription fails", async () => {
+    vi.mocked(listen).mockRejectedValue(new Error("listener unavailable"));
+    vi.mocked(getDuplicateScan)
+      .mockResolvedValueOnce({ ...job(1), status: "running", summary: null })
+      .mockResolvedValue(job(2));
+    render(<DuplicatesView />);
+    expect(await screen.findByText("duplicate groups")).toBeInTheDocument();
+    expect(getDuplicateScan).toHaveBeenCalledTimes(2);
+  });
+  it("shows an attempt-scoped persistence failure without overriding a durable terminal event", async () => {
+    const running = { ...job(1), status: "running" as const, summary: null };
+    vi.mocked(getDuplicateScan).mockResolvedValue(running);
+    render(<DuplicatesView />);
+    await screen.findByRole("heading", { name: "Preparing scan" });
+    const calls = vi.mocked(listen).mock.calls;
+    const failure = calls.find(
+      ([name]) => name === "syncforge://duplicates-persistence-error",
+    )![1];
+    const progress = calls.find(
+      ([name]) => name === "syncforge://duplicates-progress",
+    )![1];
+    act(() =>
+      failure({
+        event: "failure",
+        id: 1,
+        payload: { jobId: "j1", attempt: 2, message: "wrong attempt" },
+      }),
+    );
+    expect(screen.queryByText("wrong attempt")).not.toBeInTheDocument();
+    act(() =>
+      failure({
+        event: "failure",
+        id: 1,
+        payload: {
+          jobId: "j1",
+          attempt: 1,
+          message:
+            "Scan stopped before its results could be saved. Scan again.",
+        },
+      }),
+    );
+    expect(
+      await screen.findByText(/Scan stopped before its results could be saved/),
     ).toBeInTheDocument();
+    act(() => progress({ event: "progress", id: 2, payload: job(3) }));
+    await screen.findByText("duplicate groups");
+    act(() =>
+      failure({
+        event: "failure",
+        id: 3,
+        payload: { jobId: "j1", attempt: 1, message: "late failure" },
+      }),
+    );
+    expect(screen.queryByText("late failure")).not.toBeInTheDocument();
   });
 });

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use tauri::{AppHandle, State};
 
 use crate::commands::preview::config_fingerprint;
-use crate::engine::{run_pair_impl, PlanPreconditions, RunOptions};
+use crate::engine::{run_pair_impl, RunOptions};
 use crate::models::{ConflictResolution, FolderPair, RunReport, RunStatus};
 use crate::notifications::notify_sync_report;
 use crate::progress::ProgressCoalescer;
@@ -34,8 +34,14 @@ pub struct RunPairOptions {
     #[serde(default)]
     pub conflict_resolutions: HashMap<String, ConflictResolution>,
     pub stop_on_error: Option<bool>,
-    #[serde(default)]
-    pub plan_id: Option<String>,
+    pub intent: RunIntent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum RunIntent {
+    Fresh,
+    Reviewed { plan_id: String },
 }
 
 fn default_recycle_bin() -> bool {
@@ -66,37 +72,32 @@ pub async fn run_pair(
     // never starts.
     let cancel = try_acquire_pair_run(&state, &pair_id)?;
 
-    let take_plan = || -> Result<(Option<_>, Option<PlanPreconditions>), String> {
-        let Some(plan_id) = options.plan_id.as_deref() else {
-            return Ok((None, None));
-        };
-        let fingerprint = config_fingerprint(&pair);
-        let (plan, left_preconditions, right_preconditions) = state
-            .preview_plans
-            .lock()
-            .map_err(|e| e.to_string())?
-            .take(plan_id, &pair.id, &fingerprint, current_millis())?;
-        Ok((
-            Some(plan),
-            Some(PlanPreconditions { left: left_preconditions, right: right_preconditions }),
-        ))
-    };
-    let (plan, plan_preconditions) = match take_plan() {
-        Ok(taken) => taken,
-        Err(e) => {
+    let prepared = match &options.intent {
+        RunIntent::Fresh if !options.conflict_resolutions.is_empty() => {
             release_sync_slot(app.clone(), &state, &pair_id, &cancel);
-            return Err(e);
+            return Err("Preview needs refreshing: conflict choices require a reviewed plan".into());
+        }
+        RunIntent::Fresh => None,
+        RunIntent::Reviewed { plan_id } => {
+            let result =
+                state.preview_plans.lock().map_err(|e| e.to_string()).and_then(|mut plans| {
+                    plans.take(plan_id, &pair.id, &config_fingerprint(&pair), current_millis())
+                });
+            match result {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    release_sync_slot(app.clone(), &state, &pair_id, &cancel);
+                    return Err(error);
+                }
+            }
         }
     };
-
     let run_options = RunOptions {
         verify_hashes: options.verify_hashes,
         use_recycle_bin: options.use_recycle_bin,
         conflict_resolutions: options.conflict_resolutions,
         stop_on_error: options.stop_on_error,
-        plan,
-        plan_preconditions,
-        ..Default::default()
+        prepared,
     };
 
     let pair_name = pair.name.clone();

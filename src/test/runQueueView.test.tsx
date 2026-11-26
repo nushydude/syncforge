@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as pairsApi from "../api/pairs";
 import * as runApi from "../api/run";
 import * as historyApi from "../api/history";
+import * as previewApi from "../api/preview";
 import {
   resetHistoryStoreForTests,
   setPairFilter,
@@ -18,6 +19,7 @@ import type { FolderPair } from "../types";
 
 vi.mock("../api/pairs", () => ({
   listPairs: vi.fn(),
+  getWatchHealth: vi.fn().mockResolvedValue([]),
   getLastSyncedAtByPair: vi.fn().mockResolvedValue({}),
   savePair: vi.fn(),
   deletePair: vi.fn(),
@@ -71,7 +73,158 @@ describe("sync queue view", () => {
     resetSettingsForTests();
     updateAppSettings({ confirmBeforeRun: false });
     vi.mocked(pairsApi.listPairs).mockResolvedValue([basePair, photosPair]);
+    vi.mocked(pairsApi.getWatchHealth).mockResolvedValue([]);
     vi.mocked(runApi.runPair).mockImplementation(() => new Promise(() => {}));
+  });
+
+  it("shows the degraded Watch pair while a healthy pair remains watching", async () => {
+    vi.mocked(pairsApi.listPairs).mockResolvedValue([
+      { ...basePair, watchEnabled: true },
+      { ...photosPair, watchEnabled: true },
+    ]);
+    vi.mocked(pairsApi.getWatchHealth).mockResolvedValue([
+      {
+        pairId: basePair.id,
+        status: "degraded",
+        issues: ["Right folder is unavailable."],
+      },
+      { pairId: photosPair.id, status: "watching", issues: [] },
+    ]);
+    render(<PairsPanel />);
+    expect(
+      await screen.findByText("Watch paused for Docs"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Right folder is unavailable."),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Photos/ }));
+    expect(
+      screen.getByText("Watching", { selector: "dd" }),
+    ).toBeInTheDocument();
+  });
+
+  it("associates a rejected draft's root error with both folder fields", async () => {
+    vi.mocked(runApi.runPair).mockRejectedValueOnce(
+      "Invalid folder pair: one folder is inside the other.",
+    );
+
+    render(<PairsPanel />);
+    fireEvent.click(await screen.findByRole("button", { name: /^Docs/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit pair" }));
+    const leftFolder = screen.getByPlaceholderText("C:\\Users\\you\\Documents");
+    const rightFolder = screen.getByPlaceholderText("D:\\Backup\\Documents");
+    fireEvent.change(rightFolder, { target: { value: "C:\\left\\Backup" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run sync" }));
+
+    const message = await screen.findByText(
+      "Invalid folder pair: one folder is inside the other.",
+    );
+    expect(message).toHaveAttribute("role", "alert");
+    expect(leftFolder).toHaveAccessibleDescription(message.textContent!);
+    expect(rightFolder).toHaveAccessibleDescription(message.textContent!);
+    fireEvent.change(rightFolder, { target: { value: "D:\\Separate" } });
+    expect(rightFolder).not.toHaveAttribute("aria-describedby");
+  });
+
+  it("opens the pending conflict from History and restores workspace focus on Escape", async () => {
+    const pair = {
+      ...basePair,
+      mode: "synchronize" as const,
+      conflictPolicy: "ask" as const,
+    };
+    const entry = {
+      relativePath: "both.txt",
+      size: 4,
+      modifiedSecs: 2,
+      isDir: false,
+    };
+    let finishPreview!: (
+      plan: Awaited<ReturnType<typeof previewApi.previewPair>>,
+    ) => void;
+    vi.mocked(pairsApi.listPairs).mockResolvedValue([pair]);
+    vi.mocked(previewApi.previewPair).mockImplementationOnce(
+      () => new Promise((resolve) => (finishPreview = resolve)),
+    );
+
+    render(<PairsPanel />);
+    fireEvent.click(await screen.findByRole("button", { name: /^Docs/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Run sync" }));
+    const historyTab = screen.getByRole("tab", { name: "Sync history" });
+    fireEvent.click(historyTab);
+    finishPreview({
+      pairId: pair.id,
+      planId: "history-conflict",
+      scannedLeft: 1,
+      scannedRight: 1,
+      actions: [
+        { kind: "conflict", path: "both.txt", left: entry, right: entry },
+      ],
+    });
+
+    const resolve = await screen.findByRole("button", { name: "Resolve" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    resolve.focus();
+    fireEvent.click(resolve);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Resolve conflicts",
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: "Use left" })).toHaveFocus(),
+    );
+    fireEvent(dialog, new Event("cancel", { cancelable: true }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(historyTab).toHaveFocus();
+    expect(runApi.runPair).not.toHaveBeenCalled();
+  });
+
+  it("stops a reviewed queued run when its pair draft changes", async () => {
+    let finishFirst!: (
+      report: Awaited<ReturnType<typeof runApi.runPair>>,
+    ) => void;
+    vi.mocked(runApi.runPair).mockImplementationOnce(
+      () => new Promise((resolve) => (finishFirst = resolve)),
+    );
+    vi.mocked(previewApi.previewPair).mockResolvedValueOnce({
+      pairId: photosPair.id,
+      planId: "reviewed-photos",
+      scannedLeft: 0,
+      scannedRight: 1,
+      actions: [{ kind: "deleteRight", path: "old.jpg" }],
+    });
+
+    render(<PairsPanel />);
+    fireEvent.click(await screen.findByRole("button", { name: /^Photos/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview sync" }));
+    await screen.findByRole("button", { name: "View results" });
+    fireEvent.click(screen.getByRole("button", { name: /^Docs/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Run sync" }));
+    await waitFor(() => expect(runApi.runPair).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: /^Photos/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit pair" }));
+    fireEvent.click(screen.getByRole("button", { name: "Run sync" }));
+    fireEvent.change(screen.getByPlaceholderText("D:\\Backup\\Documents"), {
+      target: { value: "D:\\Other" },
+    });
+    finishFirst({
+      runId: "first",
+      pairId: basePair.id,
+      startedAt: 1,
+      finishedAt: 2,
+      status: "completed",
+      filesCopied: 0,
+      filesDeleted: 0,
+      bytesTransferred: 0,
+      errors: [],
+    });
+
+    await screen.findByText(
+      "Preview needs refreshing: the pair changed after this run was queued.",
+    );
+    expect(runApi.runPair).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole("button", { name: "Refresh preview" }),
+    ).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Run sync" })).toBeDisabled();
   });
 
   it("shows a run that continues past a file error as completed with errors", async () => {

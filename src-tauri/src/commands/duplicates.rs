@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 use crate::duplicates::{
-    self, DuplicateCleanupResult, DuplicateMatchMode, DuplicateScanJob, DuplicateScanPhase,
+    self, DuplicateJobSnapshot, DuplicateMatchMode, DuplicateScanJob, DuplicateScanPhase,
     DuplicateScanResult, DuplicateScanStatus,
 };
 use crate::run_coordinator::retry_pending_syncs;
@@ -17,6 +17,28 @@ use crate::state::{
 
 const PROGRESS_EVENT: &str = "syncforge://duplicates-progress";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
+
+const PERSISTENCE_ERROR_EVENT: &str = "syncforge://duplicates-persistence-error";
+const PERSISTENCE_ERROR_MESSAGE: &str =
+    "Scan stopped before its results could be saved. Scan again.";
+static PENDING_FAILURE: OnceLock<Mutex<Option<(String, u64)>>> = OnceLock::new();
+fn pending_failure() -> &'static Mutex<Option<(String, u64)>> {
+    PENDING_FAILURE.get_or_init(|| Mutex::new(None))
+}
+fn worker_key(id: &str, attempt: u64) -> String {
+    format!("{id}:{attempt}")
+}
+fn recover_pending_failure(state: &Arc<AppState>) -> Result<(), String> {
+    let mut pending = pending_failure().lock().map_err(|e| e.to_string())?;
+    if let Some((id, attempt)) = pending.as_ref() {
+        state
+            .db
+            .interrupt_abandoned_duplicate(id, *attempt)
+            .map_err(|_| PERSISTENCE_ERROR_MESSAGE.to_string())?;
+        *pending = None;
+    }
+    Ok(())
+}
 
 pub(crate) fn admit_duplicate(
     coordinator: &Arc<WorkCoordinator>,
@@ -32,12 +54,21 @@ fn current_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn save_job(state: &Arc<AppState>, job: &DuplicateScanJob) -> Result<(), String> {
-    state.db.save_duplicate_scan(job).map_err(|error| error.to_string())
+fn save_job(state: &Arc<AppState>, job: &mut DuplicateScanJob) -> Result<(), String> {
+    state.db.save_duplicate_scan(job).map_err(|error| error.to_string())?;
+    if job.result.is_some() {
+        state.db.ensure_duplicate_index(&job.id).map_err(|e| e.to_string())?;
+    }
+    *job = state
+        .db
+        .get_duplicate_scan(&job.id)
+        .map_err(|error| error.to_string())?
+        .ok_or("Saved scan disappeared")?;
+    Ok(())
 }
 
 fn publish_job(app: &AppHandle, job: &DuplicateScanJob) {
-    let _ = app.emit(PROGRESS_EVENT, job);
+    let _ = app.emit(PROGRESS_EVENT, DuplicateJobSnapshot::from_job(job.clone()));
 }
 
 fn save_and_publish(
@@ -51,9 +82,9 @@ fn save_and_publish(
         return Ok(());
     }
     job.updated_at = current_millis();
+    *last_progress = Instant::now();
     save_job(state, job)?;
     publish_job(app, job);
-    *last_progress = Instant::now();
     Ok(())
 }
 
@@ -70,6 +101,8 @@ fn canonical_root(root: &str) -> Result<String, String> {
 fn new_job(root: String, mode: DuplicateMatchMode) -> DuplicateScanJob {
     let now = current_millis();
     DuplicateScanJob {
+        attempt: 1,
+        sequence: 0,
         id: Uuid::new_v4().to_string(),
         root,
         mode,
@@ -93,7 +126,7 @@ fn new_job(root: String, mode: DuplicateMatchMode) -> DuplicateScanJob {
 fn launch_scan(
     app: AppHandle,
     state: Arc<AppState>,
-    job: DuplicateScanJob,
+    mut job: DuplicateScanJob,
 ) -> Result<DuplicateScanJob, String> {
     let active_root = Path::new(&job.root).to_path_buf();
     {
@@ -104,12 +137,17 @@ fn launch_scan(
         jobs.insert(active_root);
     }
     let cancel = Arc::new(AtomicBool::new(false));
-    state
-        .duplicate_scan_cancels
-        .lock()
-        .map_err(|error| error.to_string())?
-        .insert(job.id.clone(), cancel.clone());
-    if let Err(error) = save_job(&state, &job) {
+    match state.duplicate_scan_cancels.lock() {
+        Ok(mut flags) => {
+            flags.insert(worker_key(&job.id, job.attempt), cancel.clone());
+        }
+        Err(error) => {
+            release_duplicate_job(&state, &job.root);
+            return Err(error.to_string());
+        }
+    }
+    if let Err(error) = save_job(&state, &mut job) {
+        close_cancellation(&state, &job.id, job.attempt);
         release_duplicate_job(&state, &job.root);
         return Err(error);
     }
@@ -135,14 +173,47 @@ fn persist_progress(
     save_and_publish(app, state, &mut progress.job, &mut progress.last_progress, force)
 }
 
-fn run_scan(app: AppHandle, state: Arc<AppState>, job: DuplicateScanJob, cancel: Arc<AtomicBool>) {
-    let active_root = job.root.clone();
+struct ScanRegistration {
+    app: AppHandle,
+    state: Arc<AppState>,
+    job: DuplicateScanJob,
+    finished: bool,
+}
+impl Drop for ScanRegistration {
+    fn drop(&mut self) {
+        if !self.finished {
+            finish_job(
+                &self.app,
+                &self.state,
+                &mut self.job,
+                DuplicateScanStatus::Failed,
+                None,
+                Some("The duplicate scan stopped unexpectedly. Scan again.".into()),
+            );
+        }
+        release_duplicate_job(&self.state, &self.job.root);
+        retry_pending_syncs(self.app.clone(), &self.state);
+    }
+}
+
+fn run_scan(
+    app: AppHandle,
+    state: Arc<AppState>,
+    mut job: DuplicateScanJob,
+    cancel: Arc<AtomicBool>,
+) {
+    let mut registration = ScanRegistration {
+        app: app.clone(),
+        state: Arc::clone(&state),
+        job: job.clone(),
+        finished: false,
+    };
     let roots = canonical_job_roots(&[&job.root]);
     let _permit = match admit_duplicate(&state.work_coordinator, roots) {
         Ok(permit) => permit,
-        Err(_error) => {
-            remove_cancel_flag(&state, &job.id);
-            release_duplicate_job(&state, &active_root);
+        Err(error) => {
+            finish_job(&app, &state, &mut job, DuplicateScanStatus::Failed, None, Some(error));
+            registration.finished = true;
             return;
         }
     };
@@ -155,14 +226,19 @@ fn run_scan(app: AppHandle, state: Arc<AppState>, job: DuplicateScanJob, cancel:
     {
         let mut current = match progress.lock() {
             Ok(current) => current,
-            Err(_) => {
-                release_duplicate_job(&state, &active_root);
-                return;
-            }
+            Err(_) => return,
         };
-        if persist_progress(&app, &state, &mut current, true).is_err() {
-            remove_cancel_flag(&state, &current.job.id);
-            release_duplicate_job(&state, &active_root);
+        if let Err(error) = persist_progress(&app, &state, &mut current, true) {
+            drop(_permit);
+            finish_job(
+                &app,
+                &state,
+                &mut current.job,
+                DuplicateScanStatus::Failed,
+                None,
+                Some(error),
+            );
+            registration.finished = true;
             return;
         }
     }
@@ -171,10 +247,7 @@ fn run_scan(app: AppHandle, state: Arc<AppState>, job: DuplicateScanJob, cancel:
     let scan_mode = progress.lock().map(|current| current.job.mode);
     let (scan_root, scan_mode) = match (scan_root, scan_mode) {
         (Ok(scan_root), Ok(scan_mode)) => (scan_root, scan_mode),
-        _ => {
-            release_duplicate_job(&state, &active_root);
-            return;
-        }
+        _ => return,
     };
 
     let file_progress = Arc::clone(&progress);
@@ -236,11 +309,12 @@ fn run_scan(app: AppHandle, state: Arc<AppState>, job: DuplicateScanJob, cancel:
         Err(_) => return,
     };
 
+    drop(_permit);
     match result {
         Ok(result) => {
             finish_job(&app, &state, &mut job, DuplicateScanStatus::Completed, Some(result), None)
         }
-        Err(error) if error == "cancelled" || cancel.load(Ordering::Relaxed) => finish_job(
+        Err(error) if error == "cancelled" => finish_job(
             &app,
             &state,
             &mut job,
@@ -253,10 +327,7 @@ fn run_scan(app: AppHandle, state: Arc<AppState>, job: DuplicateScanJob, cancel:
         }
     }
 
-    remove_cancel_flag(&state, &job.id);
-    release_duplicate_job(&state, &active_root);
-    drop(_permit);
-    retry_pending_syncs(app, &state);
+    registration.finished = true;
 }
 
 fn finish_job(
@@ -267,6 +338,12 @@ fn finish_job(
     result: Option<DuplicateScanResult>,
     error: Option<String>,
 ) {
+    // Stop accepting cancellations and honor any that won the same lock first.
+    let (status, result, error) = if close_cancellation(state, &job.id, job.attempt) {
+        (DuplicateScanStatus::Cancelled, None, Some("Scan cancelled.".into()))
+    } else {
+        (status, result, error)
+    };
     job.status = status;
     job.phase = None;
     job.cancel_requested = false;
@@ -274,14 +351,27 @@ fn finish_job(
     job.error = error;
     job.current_path = None;
     job.updated_at = current_millis();
-    let _ = save_job(state, job);
-    publish_job(app, job);
+    for _ in 0..3 {
+        if let Ok(saved) = state.db.save_duplicate_terminal(job) {
+            let _ = app.emit(PROGRESS_EVENT, saved);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Retain only compact recovery metadata, never the full failed result.
+    if let Ok(mut pending) = pending_failure().lock() {
+        *pending = Some((job.id.clone(), job.attempt));
+    }
+    let _ = app.emit(PERSISTENCE_ERROR_EVENT, serde_json::json!({"jobId":job.id,"attempt":job.attempt,"message":PERSISTENCE_ERROR_MESSAGE}));
 }
 
-fn remove_cancel_flag(state: &Arc<AppState>, id: &str) {
-    if let Ok(mut flags) = state.duplicate_scan_cancels.lock() {
-        flags.remove(id);
-    }
+fn close_cancellation(state: &AppState, id: &str, attempt: u64) -> bool {
+    state
+        .duplicate_scan_cancels
+        .lock()
+        .ok()
+        .and_then(|mut flags| flags.remove(&worker_key(id, attempt)))
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 fn release_duplicate_job(state: &Arc<AppState>, root: &str) {
@@ -296,21 +386,28 @@ pub async fn start_duplicate_scan(
     mode: DuplicateMatchMode,
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
-) -> Result<DuplicateScanJob, String> {
+) -> Result<DuplicateJobSnapshot, String> {
     let state = state.inner().clone();
+    recover_pending_failure(&state)?;
     let root = canonical_root(&root)?;
-    let current = state.db.latest_duplicate_scan().map_err(|error| error.to_string())?;
-    if current.is_some_and(|job| job.status == DuplicateScanStatus::Running) {
+    let current = state.db.latest_duplicate_snapshot().map_err(|error| error.to_string())?;
+    if current.is_some_and(|snapshot| snapshot.job.status == DuplicateScanStatus::Running) {
         return Err("A duplicate scan is already running.".into());
     }
-    launch_scan(app, state, new_job(root, mode))
+    launch_scan(app, state, new_job(root, mode)).map(DuplicateJobSnapshot::from_job)
 }
 
 #[tauri::command]
-pub fn get_duplicate_scan(
+pub async fn get_duplicate_scan(
     state: State<'_, Arc<AppState>>,
-) -> Result<Option<DuplicateScanJob>, String> {
-    state.db.latest_duplicate_scan().map_err(|error| error.to_string())
+) -> Result<Option<DuplicateJobSnapshot>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        recover_pending_failure(&state)?;
+        state.db.latest_duplicate_snapshot().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Could not load duplicate scan: {error}"))?
 }
 
 #[tauri::command]
@@ -318,19 +415,22 @@ pub async fn resume_duplicate_scan(
     id: String,
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
-) -> Result<DuplicateScanJob, String> {
+) -> Result<DuplicateJobSnapshot, String> {
     let state = state.inner().clone();
+    recover_pending_failure(&state)?;
     let mut job = state
         .db
-        .get_duplicate_scan(&id)
+        .duplicate_snapshot(&id)
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "Duplicate scan was not found.".to_string())?;
+        .ok_or_else(|| "Duplicate scan was not found.".to_string())?
+        .job;
     if job.status == DuplicateScanStatus::Running {
         return Err("That duplicate scan is already running.".into());
     }
     let root = canonical_root(&job.root)?;
     let now = current_millis();
     job.root = root;
+    job.attempt += 1;
     job.status = DuplicateScanStatus::Running;
     job.phase = Some(DuplicateScanPhase::Collecting);
     job.files_found = 0;
@@ -345,75 +445,94 @@ pub async fn resume_duplicate_scan(
     job.error = None;
     job.started_at = now;
     job.updated_at = now;
-    launch_scan(app, state, job)
+    launch_scan(app, state, job).map(DuplicateJobSnapshot::from_job)
 }
 
 #[tauri::command]
 pub fn cancel_duplicate_scan(
     id: String,
+    attempt: u64,
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
-) -> Result<Option<DuplicateScanJob>, String> {
+) -> Result<Option<DuplicateJobSnapshot>, String> {
     let state = state.inner().clone();
-    if let Ok(flags) = state.duplicate_scan_cancels.lock() {
-        if let Some(flag) = flags.get(&id) {
-            flag.store(true, Ordering::Relaxed);
-        }
-    }
-    let mut job = state.db.get_duplicate_scan(&id).map_err(|error| error.to_string())?;
-    if let Some(job) = job.as_mut() {
-        if job.status == DuplicateScanStatus::Running {
-            job.cancel_requested = true;
-            job.updated_at = current_millis();
-            state.db.save_duplicate_scan(job).map_err(|error| error.to_string())?;
-            publish_job(&app, job);
+    recover_pending_failure(&state)?;
+    let changed = request_active_cancel(&state, &id, attempt)?;
+    let job = state.db.duplicate_snapshot(&id).map_err(|error| error.to_string())?;
+    if changed {
+        if let Some(job) = &job {
+            let _ = app.emit(PROGRESS_EVENT, job);
         }
     }
     Ok(job)
 }
 
-#[tauri::command]
-pub async fn find_duplicates(
-    root: String,
-    mode: DuplicateMatchMode,
-    state: State<'_, Arc<AppState>>,
-) -> Result<DuplicateScanResult, String> {
-    let work_coordinator = Arc::clone(&state.work_coordinator);
-    let job_root =
-        Path::new(&root).canonicalize().map_err(|e| format!("could not open folder: {e}"))?;
-    {
-        let mut jobs = state.active_duplicate_jobs.lock().map_err(|e| e.to_string())?;
-        if !jobs.is_empty() {
-            return Err("a duplicate operation is already queued".into());
-        }
-        jobs.insert(job_root.clone());
+fn request_active_cancel(state: &AppState, id: &str, attempt: u64) -> Result<bool, String> {
+    let flags = state.duplicate_scan_cancels.lock().map_err(|e| e.to_string())?;
+    let Some(flag) = flags.get(&worker_key(id, attempt)) else {
+        return Ok(false);
+    };
+    let changed = state.db.request_duplicate_cancel(id, attempt).map_err(|e| e.to_string())?;
+    if changed {
+        flag.store(true, Ordering::Relaxed);
     }
-    let active_jobs = Arc::clone(&*state);
-    tauri::async_runtime::spawn_blocking(move || {
-        let _permit = work_coordinator.acquire_manual(WorkRequest::new(
-            Vec::new(),
-            false,
-            HeavyJobKind::Duplicate,
-        ))?;
-        let result = duplicates::find_duplicates(Path::new(&root), mode);
-        if let Ok(mut jobs) = active_jobs.active_duplicate_jobs.lock() {
-            jobs.remove(&job_root);
-        }
-        result
-    })
-    .await
-    .map_err(|error| format!("duplicate scan task failed: {error}"))?
+    Ok(changed)
 }
 
 #[tauri::command]
-pub async fn remove_duplicates(
-    root: String,
-    paths: Vec<String>,
+pub fn duplicate_groups_page(
+    job_id: String,
+    revision: String,
+    cursor: usize,
+    limit: usize,
     state: State<'_, Arc<AppState>>,
-) -> Result<DuplicateCleanupResult, String> {
-    let work_coordinator = Arc::clone(&state.work_coordinator);
-    let job_root =
-        Path::new(&root).canonicalize().map_err(|e| format!("could not open folder: {e}"))?;
+) -> Result<duplicates::DuplicateGroupsPage, String> {
+    state.db.duplicate_groups_page(&job_id, &revision, cursor, limit).map_err(|e| e.to_string())
+}
+#[tauri::command]
+pub fn duplicate_members_page(
+    job_id: String,
+    revision: String,
+    group_id: String,
+    cursor: usize,
+    limit: usize,
+    state: State<'_, Arc<AppState>>,
+) -> Result<duplicates::DuplicateMembersPage, String> {
+    state
+        .db
+        .duplicate_members_page(&job_id, &revision, &group_id, cursor, limit)
+        .map_err(|e| e.to_string())
+}
+
+struct HandoffRegistration {
+    app: AppHandle,
+    state: Arc<AppState>,
+    root: PathBuf,
+}
+impl Drop for HandoffRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut jobs) = self.state.active_duplicate_jobs.lock() {
+            jobs.remove(&self.root);
+        }
+        retry_pending_syncs(self.app.clone(), &self.state);
+    }
+}
+
+#[tauri::command]
+pub async fn reveal_duplicate(
+    job_id: String,
+    result_revision: String,
+    item_id: String,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let snapshot = state
+        .db
+        .duplicate_snapshot(&job_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("This scan is no longer available. Scan again.")?;
+    let job_root = Path::new(&snapshot.job.root).to_path_buf();
     {
         let mut jobs = state.active_duplicate_jobs.lock().map_err(|e| e.to_string())?;
         if !jobs.is_empty() {
@@ -421,20 +540,95 @@ pub async fn remove_duplicates(
         }
         jobs.insert(job_root.clone());
     }
-    let active_jobs = Arc::clone(&*state);
-    let roots = canonical_job_roots(&[&root]);
+    let roots = canonical_job_roots(&[&snapshot.job.root]);
+    let registration =
+        HandoffRegistration { app: app.clone(), state: Arc::clone(&state), root: job_root };
     tauri::async_runtime::spawn_blocking(move || {
-        let _permit = work_coordinator.acquire_manual(WorkRequest::new(
-            roots,
-            true,
-            HeavyJobKind::Duplicate,
-        ))?;
-        let result = duplicates::remove_duplicates(Path::new(&root), &paths);
-        if let Ok(mut jobs) = active_jobs.active_duplicate_jobs.lock() {
-            jobs.remove(&job_root);
-        }
-        result
+        let registration = registration;
+        let operation = (|| {
+            let _permit = state.work_coordinator.acquire_manual(WorkRequest::new(
+                roots,
+                false,
+                HeavyJobKind::Duplicate,
+            ))?;
+            let snapshot = state
+                .db
+                .duplicate_snapshot(&job_id)
+                .map_err(|e| e.to_string())?
+                .ok_or("This scan is no longer available. Scan again.")?;
+            let summary =
+                snapshot.summary.ok_or("This scan is no longer available. Scan again.")?;
+            if snapshot.job.status != DuplicateScanStatus::Completed
+                || summary.revision != result_revision
+                || !summary.cleanup_available
+                || summary.root != snapshot.job.root
+                || summary.mode != snapshot.job.mode
+            {
+                return Err(
+                    "These scan results changed. Scan again before opening the file.".into()
+                );
+            }
+            let root_identity =
+                summary.root_identity.ok_or("This saved scan is too old. Scan again.")?;
+            let (group_id, file) = state
+                .db
+                .duplicate_member_by_id(&job_id, &result_revision, &item_id)
+                .map_err(|e| e.to_string())?
+                .ok_or("This item is no longer in the scan. Scan again.")?;
+            duplicates::handoff_reviewed_with(
+                Path::new(&snapshot.job.root),
+                &root_identity,
+                snapshot.job.mode,
+                &file,
+                |cursor| {
+                    state
+                        .db
+                        .duplicate_members_page(
+                            &job_id,
+                            &result_revision,
+                            &group_id,
+                            cursor,
+                            duplicates::DUPLICATE_PAGE_LIMIT,
+                        )
+                        .map_err(|e| e.to_string())
+                },
+                |path| tauri_plugin_opener::reveal_item_in_dir(path).map_err(|e| e.to_string()),
+            )
+        })();
+        drop(registration);
+        operation
     })
     .await
-    .map_err(|error| format!("duplicate cleanup task failed: {error}"))?
+    .map_err(|e| format!("Could not send the Explorer request: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_is_rejected_after_worker_closes_registration_before_terminal_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).unwrap();
+        for cancel_before_cutoff in [false, true] {
+            let job = new_job("fixture".into(), DuplicateMatchMode::Hash);
+            state.db.save_duplicate_scan(&job).unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            state
+                .duplicate_scan_cancels
+                .lock()
+                .unwrap()
+                .insert(worker_key(&job.id, job.attempt), Arc::clone(&cancel));
+
+            if cancel_before_cutoff {
+                assert!(request_active_cancel(&state, &job.id, job.attempt).unwrap());
+            }
+            assert_eq!(close_cancellation(&state, &job.id, job.attempt), cancel_before_cutoff);
+            assert!(!request_active_cancel(&state, &job.id, job.attempt).unwrap());
+            let stored = state.db.get_duplicate_scan(&job.id).unwrap().unwrap();
+            assert_eq!(stored.status, DuplicateScanStatus::Running);
+            assert_eq!(stored.cancel_requested, cancel_before_cutoff);
+            assert_eq!(cancel.load(Ordering::Relaxed), cancel_before_cutoff);
+        }
+    }
 }

@@ -3,6 +3,7 @@ mod diff;
 mod duplicates;
 mod engine;
 mod hashing;
+mod history_export;
 mod models;
 mod notifications;
 mod path_normalization;
@@ -90,7 +91,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            refresh_watch_service(app.handle(), &app_state)?;
+            let _ = refresh_watch_service(app.handle(), &app_state);
             refresh_schedule_service(app.handle(), &app_state)?;
 
             #[cfg(desktop)]
@@ -123,10 +124,11 @@ pub fn run() {
             commands::dialog::paths_equal,
             commands::duplicates::start_duplicate_scan,
             commands::duplicates::get_duplicate_scan,
+            commands::duplicates::duplicate_groups_page,
+            commands::duplicates::duplicate_members_page,
             commands::duplicates::resume_duplicate_scan,
             commands::duplicates::cancel_duplicate_scan,
-            commands::duplicates::find_duplicates,
-            commands::duplicates::remove_duplicates,
+            commands::duplicates::reveal_duplicate,
             commands::pairs::list_pairs,
             commands::pairs::get_last_synced_at_by_pair,
             commands::pairs::save_pair,
@@ -138,7 +140,9 @@ pub fn run() {
             commands::run::run_pair,
             commands::run::cancel_run,
             commands::history::get_history,
+            watcher::get_watch_health,
             commands::history::get_run_detail,
+            commands::history::export_history_run,
             commands::schedule::set_schedule,
             commands::sniffer::start_sniffer_scan,
             commands::sniffer::get_sniffer_scan,

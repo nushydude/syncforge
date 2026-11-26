@@ -3,7 +3,7 @@ import type { FolderPair, RunPairOptions, RunReport } from "../types";
 
 export function runPair(
   pair: FolderPair,
-  options: RunPairOptions = {},
+  options: RunPairOptions = { intent: { kind: "fresh" } },
 ): Promise<RunReport> {
   return invoke<RunReport>("run_pair", { pair, options });
 }

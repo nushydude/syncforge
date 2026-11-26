@@ -1,13 +1,25 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ConflictDialog } from "../conflicts/ConflictDialog";
 import { HistoryView } from "../history/HistoryView";
 import { usePairsStore } from "../../hooks/usePairsStore";
 import { useRunStore } from "../../hooks/useRunStore";
-import { loadPairs, startNewPair } from "../../store/pairsStore";
+import {
+  isPreviewRefreshRequired,
+  loadPairs,
+  selectPair,
+  startNewPair,
+} from "../../store/pairsStore";
 import type { PairsStoreState } from "../../store/pairsStore";
 import {
   dismissWatchSkipped,
+  cancelConflictResolution,
+  confirmConflictResolutionAndRun,
   ensureWatchSkippedListener,
+  ensureWatchHealthListener,
   ensureProgressListener,
+  loadConflictPage,
+  refreshStaleConflictPreview,
+  setConflictResolution,
 } from "../../store/runStore";
 import type { RunStoreState } from "../../store/runStore";
 import { RunQueuePanel } from "../run/RunQueuePanel";
@@ -25,21 +37,53 @@ const selectPairsPanel = (s: PairsStoreState) => ({
 });
 
 const selectWatchSkipped = (s: RunStoreState) => s.watchSkipped;
+const selectWatchHealth = (s: RunStoreState) => s.watchHealth;
+const selectStalePairId = (s: PairsStoreState) =>
+  s.pairs.find((pair) => isPreviewRefreshRequired(s.previews[pair.id]?.error))
+    ?.id;
 
-export function PairsPanel() {
+export function PairsPanel({ active = true }: { active?: boolean }) {
   const [section, setSection] = useState<"pairs" | "history">("pairs");
   const [reportRunId, setReportRunId] = useState<string>();
+  const [openConflictPlan, setOpenConflictPlan] = useState<string>();
+  const pairsTab = useRef<HTMLButtonElement>(null);
+  const historyTab = useRef<HTMLButtonElement>(null);
   const openRunReport = useCallback((runId: string) => {
     setReportRunId(runId);
     setSection("history");
   }, []);
   const { pairs, editing, editorOpen, selectedId, loading, error } =
     usePairsStore(selectPairsPanel);
+  const stalePairId = usePairsStore(selectStalePairId);
   const watchSkipped = useRunStore(selectWatchSkipped);
+  const watchHealth = useRunStore(selectWatchHealth);
+  const pendingConflicts = useRunStore((state) => state.pendingConflicts);
+  const conflictResolutions = useRunStore((state) => state.conflictResolutions);
+  const showConflict =
+    active &&
+    pendingConflicts &&
+    (pendingConflicts.planId === openConflictPlan ||
+      (section === "pairs" && selectedId === pendingConflicts.pair.id));
+  const stalePair =
+    section === "history"
+      ? pairs.find((pair) => pair.id === stalePairId)
+      : undefined;
+  const restoreWorkspaceFocus = useCallback(() => {
+    const currentTab =
+      historyTab.current?.getAttribute("aria-selected") === "true"
+        ? historyTab.current
+        : pairsTab.current;
+    currentTab?.focus();
+  }, []);
+  const showPairForRefresh = (pairId: string) => {
+    if (selectedId !== pairId) selectPair(pairId);
+    setSection("pairs");
+  };
 
   useEffect(() => {
     void loadPairs();
     void ensureWatchSkippedListener();
+    void ensureWatchHealthListener();
     void ensureProgressListener();
   }, []);
 
@@ -48,6 +92,12 @@ export function PairsPanel() {
   const skippedPairName =
     watchSkipped && pairs.find((p) => p.id === watchSkipped.pairId)?.name;
   const selectedPair = pairs.find((pair) => pair.id === selectedId);
+  const pausedPairs = pairs.filter(
+    (pair) =>
+      pair.enabled &&
+      pair.watchEnabled &&
+      watchHealth[pair.id]?.status === "degraded",
+  );
 
   return (
     <>
@@ -57,6 +107,7 @@ export function PairsPanel() {
         aria-label="Sync folder pairs"
       >
         <button
+          ref={pairsTab}
           type="button"
           role="tab"
           aria-selected={section === "pairs"}
@@ -66,6 +117,7 @@ export function PairsPanel() {
           Folder pairs
         </button>
         <button
+          ref={historyTab}
           type="button"
           role="tab"
           aria-selected={section === "history"}
@@ -79,11 +131,37 @@ export function PairsPanel() {
         </button>
       </div>
       {/* Visible on both tabs so a parked queue is never a mystery. */}
-      <RunQueuePanel />
+      <RunQueuePanel onResolveConflict={setOpenConflictPlan} />
+      {stalePair && (
+        <div className="watch-skipped-banner" role="alert">
+          <p>Preview needs refreshing for “{stalePair.name}”.</p>
+          <button
+            type="button"
+            onClick={() => showPairForRefresh(stalePair.id)}
+          >
+            Open folder pair
+          </button>
+        </div>
+      )}
       {section === "history" ? (
         <HistoryView active initialRunId={reportRunId} />
       ) : (
         <>
+          {pausedPairs.length > 0 && (
+            <aside aria-label="Watch status" role="status">
+              {pausedPairs.map((pair) => (
+                <div className="watch-skipped-banner" key={pair.id}>
+                  <div>
+                    <p>
+                      <strong>Watch paused for {pair.name}</strong>
+                    </p>
+                    <p>{watchHealth[pair.id].issues.join(" ")}</p>
+                    <p>Watching will resume when both folders are available.</p>
+                  </div>
+                </div>
+              ))}
+            </aside>
+          )}
           {watchSkipped && (
             <div className="watch-skipped-banner" role="alert">
               <p>
@@ -137,6 +215,38 @@ export function PairsPanel() {
             </section>
           </div>
         </>
+      )}
+      {showConflict && pendingConflicts && (
+        <ConflictDialog
+          key={pendingConflicts.planId}
+          conflicts={pendingConflicts.conflicts}
+          resolutions={conflictResolutions}
+          onChoose={setConflictResolution}
+          onConfirm={() => void confirmConflictResolutionAndRun()}
+          onCancel={cancelConflictResolution}
+          page={Math.floor(pendingConflicts.cursor / 200) + 1}
+          total={pendingConflicts.total}
+          hasNextPage={pendingConflicts.nextCursor != null}
+          hasPreviousPage={pendingConflicts.cursor > 0}
+          loading={pendingConflicts.loading}
+          onNextPage={() =>
+            void loadConflictPage(pendingConflicts.nextCursor ?? 0)
+          }
+          onPreviousPage={() =>
+            void loadConflictPage(Math.max(0, pendingConflicts.cursor - 200))
+          }
+          pageError={pendingConflicts.pageError}
+          onRetryPage={() => {
+            if (pendingConflicts.pageError) {
+              void loadConflictPage(pendingConflicts.pageError.cursor);
+            }
+          }}
+          onRefresh={() => {
+            const pairId = refreshStaleConflictPreview();
+            if (pairId) showPairForRefresh(pairId);
+          }}
+          onFocusFallback={restoreWorkspaceFocus}
+        />
       )}
     </>
   );

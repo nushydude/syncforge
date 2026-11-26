@@ -59,3 +59,38 @@ pub async fn get_run_detail(
     .await
     .map_err(|e| format!("history detail task failed: {e}"))?
 }
+
+#[tauri::command]
+pub async fn export_history_run(
+    app: tauri::AppHandle,
+    run_id: String,
+    format: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    use tauri_plugin_dialog::DialogExt;
+    if format != "json" && format != "csv" {
+        return Err("Unsupported history export format".into());
+    }
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = db.get_run(&run_id).map_err(|e| e.to_string())?.ok_or("Run not found")?;
+        if report.status == crate::models::RunStatus::Running {
+            return Err("Wait for the run to finish before exporting".into());
+        }
+        let filename = format!("syncforge-run-{}.{}", report.run_id, format);
+        let Some(path) = app
+            .dialog()
+            .file()
+            .set_file_name(&filename)
+            .add_filter(format.to_uppercase(), &[&format])
+            .blocking_save_file()
+        else {
+            return Ok(false);
+        };
+        let path = path.into_path().map_err(|e| e.to_string())?;
+        crate::history_export::export_to_path(&db, &run_id, &format, &path)?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| format!("history export task failed: {e}"))?
+}

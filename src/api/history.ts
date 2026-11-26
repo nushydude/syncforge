@@ -18,3 +18,10 @@ export function getRunDetail(
     actionFilter,
   });
 }
+
+export function exportHistoryRun(
+  runId: string,
+  format: "json" | "csv",
+): Promise<boolean> {
+  return invoke<boolean>("export_history_run", { runId, format });
+}

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as previewApi from "../api/preview";
 import * as runApi from "../api/run";
+import * as pairsApi from "../api/pairs";
 import type { FolderPair, RunReport } from "../types";
 import {
   cancelConflictResolution,
@@ -14,6 +15,7 @@ import {
   enqueuePairRun,
   enqueuePairRuns,
   ensureWatchSkippedListener,
+  ensureWatchHealthListener,
   getPairRun,
   getRunState,
   isPairBusy,
@@ -90,6 +92,7 @@ const sampleReport: RunReport = {
 
 const conflictPlan = {
   pairId: "pair-1",
+  planId: "ask-reviewed",
   scannedLeft: 1,
   scannedRight: 1,
   actions: [
@@ -123,6 +126,7 @@ function queueIds() {
 describe("runStore", () => {
   beforeEach(() => {
     resetRunStoreForTests();
+    pairsStore.resetPairsStoreForTests();
     resetSettingsForTests();
     vi.clearAllMocks();
     vi.restoreAllMocks();
@@ -230,6 +234,7 @@ describe("runStore", () => {
     vi.mocked(runApi.runPair).mockImplementation(() => new Promise(() => {}));
     vi.mocked(runApi.cancelRun).mockResolvedValue(undefined);
     enqueuePairRun(samplePair);
+    await vi.waitFor(() => expect(runApi.runPair).toHaveBeenCalled());
 
     await cancelPairRun("pair-1");
 
@@ -242,11 +247,22 @@ describe("runStore", () => {
     vi.mocked(runApi.runPair).mockImplementation(() => new Promise(() => {}));
     vi.mocked(runApi.cancelRun).mockRejectedValue(new Error("not running"));
     enqueuePairRun(samplePair);
+    await vi.waitFor(() => expect(runApi.runPair).toHaveBeenCalled());
 
     await cancelPairRun("pair-1");
 
     expect(runOf("pair-1")?.status).toBe("running");
     expect(runOf("pair-1")?.error).toBe("not running");
+  });
+
+  it("cancels a manual start before it can call an unrelated backend run", async () => {
+    enqueuePairRun(samplePair);
+    await cancelPairRun(samplePair.id);
+    await vi.waitFor(() =>
+      expect(runOf(samplePair.id)?.status).toBe("cancelled"),
+    );
+    expect(runApi.cancelRun).not.toHaveBeenCalled();
+    expect(runApi.runPair).not.toHaveBeenCalled();
   });
 
   it("starts the next pair after a failed run", async () => {
@@ -283,6 +299,30 @@ describe("runStore", () => {
     });
     dismissWatchSkipped();
     expect(getRunState().watchSkipped).toBeNull();
+  });
+
+  it("keeps a live Watch health event when the initial request resolves later", async () => {
+    let finishHealth!: (
+      health: Awaited<ReturnType<typeof pairsApi.getWatchHealth>>,
+    ) => void;
+    vi.spyOn(pairsApi, "getWatchHealth").mockImplementation(
+      () => new Promise((resolve) => (finishHealth = resolve)),
+    );
+
+    const listening = ensureWatchHealthListener();
+    await vi.waitFor(() => expect(finishHealth).toBeDefined());
+    const watching = { pairId: samplePair.id, status: "watching", issues: [] };
+    listenHandlers["watch://health"]({ payload: [watching] });
+    finishHealth([
+      {
+        pairId: samplePair.id,
+        status: "degraded",
+        issues: ["Right unavailable"],
+      },
+    ]);
+    await listening;
+
+    expect(getRunState().watchHealth[samplePair.id]).toEqual(watching);
   });
 
   it("ignores progress when no UI run is active", async () => {
@@ -476,28 +516,54 @@ describe("runStore", () => {
     await vi.waitFor(() => expect(runOf("pair-2")?.status).toBe("completed"));
   });
 
-  it("rescans instead of failing when the cached plan handle is gone", async () => {
-    vi.spyOn(pairsStore, "getPairPreview").mockReturnValue({
+  it("requires a new preview instead of executing with an expired plan", async () => {
+    const previewSpy = vi.spyOn(pairsStore, "getPairPreview").mockReturnValue({
       ...pairsStore.emptyPairPreview,
       plan: { ...conflictPlan, planId: "plan-stale", actions: [] },
       queued: false,
       loading: false,
       error: null,
     });
-    vi.mocked(runApi.runPair)
-      .mockRejectedValueOnce(new Error("preview plan expired or not found"))
-      .mockResolvedValueOnce(sampleReport);
+    vi.mocked(runApi.runPair).mockRejectedValueOnce(
+      new Error("Preview needs refreshing: preview plan expired or not found"),
+    );
 
     const report = await runSelectedPair(samplePair);
 
-    expect(report).toEqual(sampleReport);
-    expect(runOf("pair-1")?.status).toBe("completed");
-    expect(runApi.runPair).toHaveBeenCalledTimes(2);
-    // The retry drops the consumed handle and asks for a fresh scan.
-    expect(vi.mocked(runApi.runPair).mock.calls[0][1]?.planId).toBe(
-      "plan-stale",
+    expect(report).toBeNull();
+    expect(runOf("pair-1")?.status).toBe("failed");
+    expect(runApi.runPair).toHaveBeenCalledExactlyOnceWith(
+      samplePair,
+      expect.objectContaining({
+        intent: { kind: "reviewed", planId: "plan-stale" },
+      }),
     );
-    expect(vi.mocked(runApi.runPair).mock.calls[1][1]?.planId).toBeUndefined();
+    expect(previewApi.previewPair).not.toHaveBeenCalled();
+    previewSpy.mockRestore();
+    expect(pairsStore.getPairPreview(samplePair.id).reviewRequired).toBe(true);
+  });
+
+  it("holds a replacement preview until its results have been reviewed", async () => {
+    pairsStore.requireFreshPreview(
+      samplePair.id,
+      "Preview needs refreshing: changed",
+    );
+    vi.mocked(previewApi.previewPair).mockResolvedValue(conflictPlan);
+    vi.mocked(runApi.runPair).mockResolvedValue(sampleReport);
+    expect(enqueuePairRun(samplePair)).toBe(false);
+    expect(enqueuePairPreview(samplePair)).toBe(true);
+    await vi.waitFor(() =>
+      expect(pairsStore.getPairPreview(samplePair.id).plan).not.toBeNull(),
+    );
+    expect(enqueuePairRun(samplePair)).toBe(false);
+    pairsStore.markPreviewReviewed(samplePair.id, conflictPlan.planId);
+    await runSelectedPair(samplePair);
+    expect(runApi.runPair).toHaveBeenCalledExactlyOnceWith(
+      samplePair,
+      expect.objectContaining({
+        intent: { kind: "reviewed", planId: conflictPlan.planId },
+      }),
+    );
   });
 
   it("cancels a pair that is still scanning before its backend run exists", async () => {
@@ -539,6 +605,43 @@ describe("runStore", () => {
       // The pair went back to the queue and started again instead of failing.
       await vi.waitFor(() => expect(runOf("pair-1")?.status).toBe("completed"));
       expect(runApi.runPair).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the accepted conflict choices and recycle option during a busy retry", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(previewApi.previewPair).mockResolvedValue(conflictPlan);
+      vi.mocked(runApi.runPair)
+        .mockRejectedValueOnce(new Error("sync run already in progress"))
+        .mockResolvedValueOnce(sampleReport);
+      const pair = { ...samplePair, conflictPolicy: "ask" as const };
+      updateAppSettings({ moveDeletesToRecycleBin: true });
+      enqueuePairRun(pair);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getRunState().pendingConflicts?.planId).toBe(conflictPlan.planId);
+      setConflictResolution("both.txt", "left");
+      updateAppSettings({ moveDeletesToRecycleBin: false });
+      await confirmConflictResolutionAndRun();
+      await vi.advanceTimersByTimeAsync(1500);
+      const options = {
+        intent: { kind: "reviewed", planId: conflictPlan.planId },
+        conflictResolutions: { "both.txt": "left" },
+        useRecycleBin: true,
+      };
+      expect(runApi.runPair).toHaveBeenNthCalledWith(
+        1,
+        pair,
+        expect.objectContaining(options),
+      );
+      expect(runApi.runPair).toHaveBeenNthCalledWith(
+        2,
+        pair,
+        expect.objectContaining(options),
+      );
+      expect(previewApi.previewPair).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }

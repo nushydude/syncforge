@@ -7,6 +7,7 @@ import {
   loadHistory,
   resetHistoryStoreForTests,
   selectRun,
+  retryRunItemsPage,
   setPairFilter,
 } from "../store/historyStore";
 
@@ -155,10 +156,10 @@ describe("historyStore", () => {
       2,
       runA.runId,
       1,
-      undefined,
+      200,
       "deletions",
     );
-    expect(getHistoryState().detail?.items).toHaveLength(2);
+    expect(getHistoryState().detail?.items).toHaveLength(1);
     await selectRun(runA.runId, "copyLeftToRight");
     expect(historyApi.getRunDetail).toHaveBeenLastCalledWith(
       runA.runId,
@@ -167,5 +168,28 @@ describe("historyStore", () => {
       "copyLeftToRight",
     );
     expect(getHistoryState().detail).toEqual(detail);
+  });
+  it("keeps the current page and retries the failed cursor with its filter", async () => {
+    vi.mocked(historyApi.getRunDetail)
+      .mockResolvedValueOnce({ ...detail, nextCursor: 200 })
+      .mockRejectedValueOnce(new Error("Temporary error"))
+      .mockResolvedValueOnce({
+        ...detail,
+        items: [{ ...detail.items[0], id: "next" }],
+        nextCursor: 400,
+      });
+    await selectRun(runA.runId, "deletions");
+    await loadMoreRunItems();
+    expect(getHistoryState().detail?.items[0].id).toBe("item-1");
+    expect(getHistoryState().pageError).toBe("Temporary error");
+    await retryRunItemsPage();
+    expect(historyApi.getRunDetail).toHaveBeenLastCalledWith(
+      runA.runId,
+      200,
+      200,
+      "deletions",
+    );
+    expect(getHistoryState().detail?.items[0].id).toBe("next");
+    expect(getHistoryState().pageError).toBeNull();
   });
 });

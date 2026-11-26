@@ -178,6 +178,19 @@ pub enum ConflictResolution {
     Skip,
 }
 
+/// Trusted, side-specific evidence for one saved synchronization scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncBaseline {
+    pub revision: String,
+    pub entries: Vec<(FileEntry, FileEntry)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncBaselineView {
+    pub generation: Option<String>,
+    pub baseline: Option<SyncBaseline>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {

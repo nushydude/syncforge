@@ -1,4 +1,3 @@
-import { ConflictDialog } from "../conflicts/ConflictDialog";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PreviewResults } from "../preview/PreviewResults";
 import { PreviewScanProgress } from "../preview/PreviewScanProgress";
@@ -6,17 +5,18 @@ import { RunProgress } from "../run/RunProgress";
 import { usePairsStore } from "../../hooks/usePairsStore";
 import { useRunStore } from "../../hooks/useRunStore";
 import type { PairsStoreState } from "../../store/pairsStore";
-import { beginEdit, emptyPairPreview } from "../../store/pairsStore";
 import {
-  cancelConflictResolution,
+  beginEdit,
+  emptyPairPreview,
+  isPreviewRefreshRequired,
+  markPreviewReviewed,
+} from "../../store/pairsStore";
+import {
   cancelPairPreview,
-  confirmConflictResolutionAndRun,
   enqueuePairPreview,
   enqueuePairRun,
   isPairBusy,
-  loadConflictPage,
   queuePosition,
-  setConflictResolution,
 } from "../../store/runStore";
 import type { RunStoreState } from "../../store/runStore";
 import type { ConflictPolicy, FolderPair, SyncMode } from "../../types";
@@ -63,6 +63,7 @@ export function PairDetails({ pair, onViewReport }: PairDetailsProps) {
   const resultsTriggerRef = useRef<HTMLButtonElement>(null);
   const {
     plan: previewPlan,
+    reviewRequired: previewReviewRequired,
     queued: previewQueued,
     loading: previewLoading,
     error: previewError,
@@ -76,25 +77,23 @@ export function PairDetails({ pair, onViewReport }: PairDetailsProps) {
       [pair.id],
     ),
   );
-  const { busy, scanPosition, pendingConflicts, conflictResolutions } =
-    useRunStore(
-      useCallback(
-        (s: RunStoreState) => ({
-          busy: isPairBusy(s, pair.id),
-          scanPosition: queuePosition(s, pair.id, "preview"),
-          pendingConflicts: s.pendingConflicts,
-          conflictResolutions: s.conflictResolutions,
-        }),
-        [pair.id],
-      ),
-    );
+  const { busy, scanPosition, watchStatus } = useRunStore(
+    useCallback(
+      (s: RunStoreState) => ({
+        busy: isPairBusy(s, pair.id),
+        scanPosition: queuePosition(s, pair.id, "preview"),
+        watchStatus: s.watchHealth[pair.id]?.status,
+      }),
+      [pair.id],
+    ),
+  );
   const lastSyncedAt = usePairsStore(
     useCallback(
       (s: PairsStoreState) => s.lastSyncedAtByPair[pair.id],
       [pair.id],
     ),
   );
-  const hasPendingConflicts = pendingConflicts?.pair.id === pair.id;
+  const previewNeedsRefresh = isPreviewRefreshRequired(previewError);
   const scanBusy = previewLoading || previewQueued;
   // Warnings still deserve a look, so only a warning-free empty plan is "clean".
   const previewIsClean =
@@ -132,12 +131,12 @@ export function PairDetails({ pair, onViewReport }: PairDetailsProps) {
               className="btn-primary"
               onClick={() => enqueuePairPreview(pair)}
             >
-              Preview sync
+              {previewNeedsRefresh ? "Refresh preview" : "Preview sync"}
             </button>
             <button
               type="button"
               className="btn-primary"
-              disabled={busy}
+              disabled={busy || previewNeedsRefresh || previewReviewRequired}
               onClick={() => enqueuePairRun(pair)}
             >
               {busy ? "Queued…" : "Run sync"}
@@ -207,9 +206,15 @@ export function PairDetails({ pair, onViewReport }: PairDetailsProps) {
                 <button
                   ref={resultsTriggerRef}
                   type="button"
-                  onClick={() => setShowResults(true)}
+                  onClick={() => {
+                    if (previewPlan?.planId)
+                      markPreviewReviewed(pair.id, previewPlan.planId);
+                    setShowResults(true);
+                  }}
                 >
-                  View results
+                  {previewReviewRequired
+                    ? "Review refreshed preview"
+                    : "View results"}
                 </button>
               )}
             </section>
@@ -248,7 +253,15 @@ export function PairDetails({ pair, onViewReport }: PairDetailsProps) {
             </div>
             <div>
               <dt>Watch for changes</dt>
-              <dd>{pair.watchEnabled ? "Enabled" : "Disabled"}</dd>
+              <dd>
+                {!pair.watchEnabled || !pair.enabled
+                  ? "Disabled"
+                  : watchStatus === "watching"
+                    ? "Watching"
+                    : watchStatus === "degraded"
+                      ? "Paused"
+                      : "Enabled"}
+              </dd>
             </div>
             <div>
               <dt>Scheduled sync</dt>
@@ -271,27 +284,6 @@ export function PairDetails({ pair, onViewReport }: PairDetailsProps) {
             </p>
           )}
         </>
-      )}
-
-      {hasPendingConflicts && pendingConflicts && (
-        <ConflictDialog
-          conflicts={pendingConflicts.conflicts}
-          resolutions={conflictResolutions}
-          onChoose={setConflictResolution}
-          onConfirm={() => void confirmConflictResolutionAndRun()}
-          onCancel={cancelConflictResolution}
-          page={Math.floor(pendingConflicts.cursor / 200) + 1}
-          total={pendingConflicts.total}
-          hasNextPage={pendingConflicts.nextCursor != null}
-          hasPreviousPage={pendingConflicts.cursor > 0}
-          loading={pendingConflicts.loading}
-          onNextPage={() =>
-            void loadConflictPage(pendingConflicts.nextCursor ?? 0)
-          }
-          onPreviousPage={() =>
-            void loadConflictPage(Math.max(0, pendingConflicts.cursor - 200))
-          }
-        />
       )}
     </section>
   );
