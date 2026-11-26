@@ -11,6 +11,14 @@ These instructions apply to any agent working in this repository. More specific 
 
 ## Validation
 
+- After a completed test or validation task in a disposable worktree, inspect
+  generated caches with `pnpm run clean:preview` and remove them with
+  `pnpm run clean:apply` once no build, test, or development server uses that
+  checkout. Keep cleanup scoped to that checkout; use `-AllWorktrees` only when
+  the user requests repository-wide cleanup and other checkout jobs are stopped.
+- Do not delete whole worktrees, commits, `.codex` files, application data, or
+  unrelated global temporary folders as part of cache cleanup.
+
 For code changes, run the narrowest relevant checks while iterating. Before handing off a broad change or opening a PR, run:
 
 ```powershell

@@ -19,6 +19,29 @@ Thank you for your interest in contributing.
    pnpm tauri dev
    ```
 
+## Cleaning generated files on Windows
+
+Preview regenerable build caches in the current checkout:
+
+```powershell
+pnpm run clean:preview
+```
+
+Add `-AllWorktrees` to include every registered Git worktree of this repository,
+including agent checkouts. The script only considers `src-tauri/target`, `dist`,
+`dist-ssr`, and `node_modules/.vite`. It refuses tracked files, non-ignored targets,
+and junctions or symlinks, and validates every candidate before starting removal.
+
+After reviewing the preview, stop development servers, builds, and tests in the
+selected checkouts, then run `pnpm run clean:apply` with the same options. Use
+`-WhatIf` with `clean:apply` for an additional preview. The next build regenerates
+these files and may take longer. The script leaves project sources, Git commits,
+installed dependencies, `.codex` files, logs, application databases, and global
+temporary folders intact. Files created in global temp folders require separate
+inspection because they may belong to active applications or tests.
+
+Run `pnpm run test:cleanup` to check cleanup behavior in disposable Git fixtures.
+
 ## Quality gates
 
 Before opening a pull request for a broad change, run the same checks as CI:
